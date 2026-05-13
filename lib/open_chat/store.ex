@@ -464,6 +464,7 @@ defmodule OpenChat.Store do
         PersistenceOps.user_groups(state, member_uids) ++ conversation_ops ++ message_ops
     )
 
+    notify_membership_changed(member_uids)
     {:reply, {:ok, %{"success" => true, "guid" => guid}}, state}
   end
 
@@ -520,6 +521,7 @@ defmodule OpenChat.Store do
                 PersistenceOps.next_id(state)
             )
 
+            notify_membership_changed([uid])
             {:reply, {:ok, group}, state}
         end
     end
@@ -545,6 +547,7 @@ defmodule OpenChat.Store do
         PersistenceOps.next_id(state)
     )
 
+    notify_membership_changed([uid])
     {:reply, {:ok, %{"success" => true}}, state}
   end
 
@@ -577,6 +580,7 @@ defmodule OpenChat.Store do
           PersistenceOps.unread_counts(state, touched_uids)
       )
 
+      notify_membership_changed(touched_uids)
       {:reply, {:ok, %{"success" => result, "group" => group}}, state}
     else
       :error -> {:reply, {:error, Errors.group_not_found(guid)}, state}
@@ -668,6 +672,8 @@ defmodule OpenChat.Store do
             PersistenceOps.unread_counts(state, touched_uids)
         )
 
+        notify_membership_changed(touched_uids)
+
         payload =
           %{
             "success" => map_size(failed) == 0,
@@ -705,6 +711,8 @@ defmodule OpenChat.Store do
         PersistenceOps.user_groups(state, [uid]) ++
         PersistenceOps.unread_counts(state, [uid])
     )
+
+    notify_membership_changed([uid])
 
     {:reply,
      {:ok, %{"success" => true, "message" => "User banned.", "uid" => uid, "guid" => guid}},
@@ -895,7 +903,7 @@ defmodule OpenChat.Store do
   def handle_call({:find_message_by_muid, muid}, _from, state) do
     result =
       case get_in(state, ["message_muids", muid]) do
-        nil -> Enum.find(Map.values(state["messages"]), fn m -> to_s(m["muid"]) == muid end)
+        nil -> nil
         id -> get_in(state, ["messages", to_s(id)])
       end
 
@@ -905,7 +913,7 @@ defmodule OpenChat.Store do
   def handle_call({:find_message_by_muid_for, uid, muid, opts}, _from, state) do
     result =
       case get_in(state, ["message_muids", muid]) do
-        nil -> Enum.find(Map.values(state["messages"]), fn m -> to_s(m["muid"]) == muid end)
+        nil -> nil
         id -> get_in(state, ["messages", to_s(id)])
       end
 
@@ -1726,6 +1734,22 @@ defmodule OpenChat.Store do
     }
 
     OpenChat.PubSub.broadcast(keys, event)
+  end
+
+  defp notify_membership_changed(uids) do
+    keys =
+      uids
+      |> List.wrap()
+      |> Enum.map(&to_s/1)
+      |> Enum.reject(&blank?/1)
+      |> Enum.uniq()
+      |> Enum.map(&{:user, &1})
+
+    if keys != [] do
+      OpenChat.PubSub.broadcast_system(keys, %{"type" => "membership_changed"})
+    end
+
+    :ok
   end
 
   defp group_recipient_keys(state, guid, opts) do

@@ -32,6 +32,37 @@ defmodule OpenChatWeb.WSHandlerTest do
     assert reply["body"] == %{"status" => "OK", "code" => "200"}
   end
 
+  test "authenticated sockets resync group subscriptions after join and leave" do
+    assert {:ok, _group} = Store.upsert_group(%{"guid" => "ws-sync-room", "type" => "public"})
+
+    {:reply, {:text, _json}, state} =
+      WSHandler.websocket_handle(
+        {:text,
+         Jason.encode!(%{
+           "type" => "auth",
+           "body" => %{"auth" => "uid:alice"}
+         })},
+        %{uid: nil, token: nil, device_id: nil}
+      )
+
+    refute subscribed?({:group, "ws-sync-room"})
+    assert state.groups == MapSet.new()
+
+    assert {:ok, _joined} = Store.join_group("ws-sync-room", "alice", %{})
+    assert_receive {:open_chat_system_event, %{"type" => "membership_changed"} = event}
+    assert {:ok, state} = WSHandler.websocket_info({:open_chat_system_event, event}, state)
+
+    assert subscribed?({:group, "ws-sync-room"})
+    assert state.groups == MapSet.new(["ws-sync-room"])
+
+    assert {:ok, _left} = Store.leave_group("ws-sync-room", "alice")
+    assert_receive {:open_chat_system_event, %{"type" => "membership_changed"} = event}
+    assert {:ok, state} = WSHandler.websocket_info({:open_chat_system_event, event}, state)
+
+    refute subscribed?({:group, "ws-sync-room"})
+    assert state.groups == MapSet.new()
+  end
+
   test "auth event returns an error payload for invalid tokens" do
     {:reply, {:text, json}, state} =
       WSHandler.websocket_handle(
@@ -151,5 +182,11 @@ defmodule OpenChatWeb.WSHandlerTest do
 
     assert {:ok, [%{"entityId" => "bob", "count" => 1}]} =
              Store.unread_counts("alice", %{"receiverType" => "user"})
+  end
+
+  defp subscribed?(key) do
+    OpenChat.PubSub
+    |> Registry.lookup(key)
+    |> Enum.any?(fn {pid, _meta} -> pid == self() end)
   end
 end

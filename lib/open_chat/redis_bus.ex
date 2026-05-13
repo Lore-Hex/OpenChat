@@ -16,6 +16,14 @@ defmodule OpenChat.RedisBus do
     :ok
   end
 
+  def publish_system(keys, event) do
+    if pid = Process.whereis(__MODULE__) do
+      GenServer.cast(pid, {:publish_system, List.wrap(keys), event})
+    end
+
+    :ok
+  end
+
   @impl true
   def init(_opts) do
     state = %{
@@ -47,17 +55,28 @@ defmodule OpenChat.RedisBus do
 
   @impl true
   def handle_cast({:publish, _keys, _event}, %{pubsub: nil} = state), do: {:noreply, state}
+  def handle_cast({:publish_system, _keys, _event}, %{pubsub: nil} = state), do: {:noreply, state}
 
   def handle_cast({:publish, keys, event}, state) do
+    publish_event(state, keys, event, false)
+    {:noreply, state}
+  end
+
+  def handle_cast({:publish_system, keys, event}, state) do
+    publish_event(state, keys, event, true)
+    {:noreply, state}
+  end
+
+  defp publish_event(state, keys, event, system?) do
     payload =
       Jason.encode!(%{
         "origin" => state.origin,
         "keys" => Enum.map(keys, &encode_key/1),
-        "event" => event
+        "event" => event,
+        "system" => system?
       })
 
     publish_to_redis(state.channel, payload)
-    {:noreply, state}
   end
 
   @impl true
@@ -65,12 +84,16 @@ defmodule OpenChat.RedisBus do
         {:redix_pubsub, _pubsub, _ref, :message, %{channel: channel, payload: payload}},
         %{channel: channel} = state
       ) do
-    with {:ok, %{"origin" => origin, "keys" => keys, "event" => event}} <- Jason.decode(payload),
+    with {:ok, %{"origin" => origin, "keys" => keys, "event" => event} = decoded} <-
+           Jason.decode(payload),
          false <- origin == state.origin do
-      keys
-      |> Enum.map(&decode_key/1)
-      |> Enum.reject(&is_nil/1)
-      |> OpenChat.PubSub.local_broadcast(event)
+      keys = keys |> Enum.map(&decode_key/1) |> Enum.reject(&is_nil/1)
+
+      if decoded["system"] == true do
+        OpenChat.PubSub.local_system_broadcast(keys, event)
+      else
+        OpenChat.PubSub.local_broadcast(keys, event)
+      end
     end
 
     {:noreply, state}

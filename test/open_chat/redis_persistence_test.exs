@@ -629,6 +629,34 @@ defmodule OpenChat.RedisPersistenceTest do
     end)
   end
 
+  test "muid lookups are index-only and do not scan loaded messages", context do
+    with_redis(context, fn ->
+      assert {:ok, message} =
+               Store.send_message("muid-index-a", %{
+                 "receiver" => "muid-index-b",
+                 "receiverType" => "user",
+                 "muid" => "muid-index-only",
+                 "data" => %{"text" => "indexed"}
+               })
+
+      assert {:ok, indexed} = Store.find_message_by_muid("muid-index-only")
+      assert indexed["id"] == message["id"]
+
+      Redix.command!(context.redis, [
+        "DEL",
+        redis_key(context, "message_muids", "muid-index-only")
+      ])
+
+      Redix.command!(context.redis, [
+        "SREM",
+        redis_key(context, "index", "message_muids"),
+        "muid-index-only"
+      ])
+
+      assert :error = Store.find_message_by_muid("muid-index-only")
+    end)
+  end
+
   test "conversation reads use the latest-message index without loading full histories",
        context do
     with_redis(context, fn ->

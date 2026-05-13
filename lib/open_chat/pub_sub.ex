@@ -2,6 +2,7 @@ defmodule OpenChat.PubSub do
   @moduledoc false
 
   def subscribe(key), do: Registry.register(__MODULE__, key, %{})
+  def unsubscribe(key), do: Registry.unregister(__MODULE__, key)
 
   def broadcast(keys, event) when is_list(keys) do
     keys = Enum.uniq(keys)
@@ -12,6 +13,15 @@ defmodule OpenChat.PubSub do
 
   def broadcast(key, event), do: broadcast([key], event)
 
+  def broadcast_system(keys, event) when is_list(keys) do
+    keys = Enum.uniq(keys)
+    local_system_broadcast(keys, event)
+    OpenChat.RedisBus.publish_system(keys, event)
+    :ok
+  end
+
+  def broadcast_system(key, event), do: broadcast_system([key], event)
+
   def local_broadcast(keys, event) when is_list(keys) do
     Enum.each(Enum.uniq(keys), &local_broadcast(&1, event))
   end
@@ -19,6 +29,18 @@ defmodule OpenChat.PubSub do
   def local_broadcast(key, event) do
     Registry.dispatch(__MODULE__, key, fn entries ->
       for {pid, _meta} <- entries, do: send(pid, {:comet_event, event})
+    end)
+
+    :ok
+  end
+
+  def local_system_broadcast(keys, event) when is_list(keys) do
+    Enum.each(Enum.uniq(keys), &local_system_broadcast(&1, event))
+  end
+
+  def local_system_broadcast(key, event) do
+    Registry.dispatch(__MODULE__, key, fn entries ->
+      for {pid, _meta} <- entries, do: send(pid, {:open_chat_system_event, event})
     end)
 
     :ok

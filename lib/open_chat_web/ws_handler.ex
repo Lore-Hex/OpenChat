@@ -5,9 +5,8 @@ defmodule OpenChatWeb.WSHandler do
   alias OpenChat.{Config, Store, Time}
 
   @impl true
-  def init(req, _state) do
-    {:cowboy_websocket, req, %{uid: nil, token: nil, device_id: nil}}
-  end
+  def init(req, _state),
+    do: {:cowboy_websocket, req, %{uid: nil, token: nil, device_id: nil, groups: MapSet.new()}}
 
   @impl true
   def websocket_init(state), do: {:ok, state}
@@ -39,6 +38,9 @@ defmodule OpenChatWeb.WSHandler do
   def websocket_handle(_frame, state), do: {:ok, state}
 
   @impl true
+  def websocket_info({:open_chat_system_event, %{"type" => "membership_changed"}}, state),
+    do: {:ok, sync_group_subscriptions(state)}
+
   def websocket_info({:comet_event, event}, state),
     do: {:reply, {:text, Jason.encode!(event)}, state}
 
@@ -55,15 +57,8 @@ defmodule OpenChatWeb.WSHandler do
     case Store.authenticate(token) do
       {:ok, user} ->
         uid = user["uid"]
-        OpenChat.PubSub.subscribe({:user, uid})
-
-        case Store.groups_for_user(uid) do
-          {:ok, groups} ->
-            Enum.each(groups, fn group -> OpenChat.PubSub.subscribe({:group, group["guid"]}) end)
-
-          _ ->
-            :ok
-        end
+        state = replace_user_subscription(state, uid)
+        state = sync_group_subscriptions(%{state | uid: uid})
 
         reply = %{
           "appId" => event["appId"] || Config.app_id(),
@@ -125,4 +120,49 @@ defmodule OpenChatWeb.WSHandler do
   end
 
   defp handle_receipt(_event, state), do: {:ok, state}
+
+  defp replace_user_subscription(state, uid) do
+    case Map.get(state, :uid) do
+      previous_uid when is_binary(previous_uid) and previous_uid != "" and previous_uid != uid ->
+        OpenChat.PubSub.unsubscribe({:user, previous_uid})
+
+      _other ->
+        :ok
+    end
+
+    OpenChat.PubSub.unsubscribe({:user, uid})
+    subscribe({:user, uid})
+    state
+  end
+
+  defp sync_group_subscriptions(%{uid: uid} = state) when is_binary(uid) and uid != "" do
+    current = Map.get(state, :groups) || MapSet.new()
+
+    case Store.groups_for_user(uid) do
+      {:ok, groups} ->
+        desired = groups |> Enum.map(& &1["guid"]) |> MapSet.new()
+
+        desired
+        |> MapSet.difference(current)
+        |> Enum.each(&subscribe({:group, &1}))
+
+        current
+        |> MapSet.difference(desired)
+        |> Enum.each(&OpenChat.PubSub.unsubscribe({:group, &1}))
+
+        Map.put(state, :groups, desired)
+
+      _other ->
+        state
+    end
+  end
+
+  defp sync_group_subscriptions(state), do: state
+
+  defp subscribe(key) do
+    case OpenChat.PubSub.subscribe(key) do
+      {:ok, _pid} -> :ok
+      {:error, {:already_registered, _pid}} -> :ok
+    end
+  end
 end

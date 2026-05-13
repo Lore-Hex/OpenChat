@@ -57,6 +57,16 @@ defmodule OpenChat.CoreTest do
     assert_receive {:comet_event, ^room_event}
   end
 
+  test "PubSub system events are separate from client events" do
+    assert {:ok, _} = OpenChat.PubSub.subscribe({:user, "system-core-a"})
+
+    event = %{"type" => "membership_changed"}
+    assert :ok = OpenChat.PubSub.broadcast_system({:user, "system-core-a"}, event)
+
+    assert_receive {:open_chat_system_event, ^event}
+    refute_receive {:comet_event, ^event}, 20
+  end
+
   test "time helpers return monotonic wall-clock shaped values" do
     seconds = OpenChat.Time.now()
     millis = OpenChat.Time.now_ms()
