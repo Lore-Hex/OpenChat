@@ -1,6 +1,8 @@
-FROM elixir:1.17-otp-27-alpine
+FROM elixir:1.17-otp-27-slim
 
-RUN apk add --no-cache build-base git openssl ca-certificates
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential git openssl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 ENV MIX_ENV=prod
 
