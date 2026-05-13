@@ -149,10 +149,21 @@ defmodule OpenChat.Store.Conversations do
   def group_conversation_id(guid), do: "group_#{to_s(guid)}"
 
   defp uids_with_conversations(state, bucket, conv_ids) do
+    conv_ids = MapSet.new(conv_ids)
+
     state
     |> Map.get(bucket, %{})
     |> Enum.filter(fn {_uid, conversations} ->
-      Enum.any?(conv_ids, &Map.has_key?(conversations || %{}, &1))
+      cond do
+        is_map(conversations) ->
+          Enum.any?(conv_ids, &Map.has_key?(conversations, &1))
+
+        is_list(conversations) ->
+          Enum.any?(conversations, &(to_s(&1) in conv_ids))
+
+        true ->
+          false
+      end
     end)
     |> Enum.map(fn {uid, _conversations} -> uid end)
   end
@@ -162,14 +173,31 @@ defmodule OpenChat.Store.Conversations do
       rows
       |> Kernel.||(%{})
       |> Enum.reduce(%{}, fn {uid, conversations}, acc ->
-        conversations = Enum.reduce(conv_ids, conversations || %{}, &Map.delete(&2, &1))
+        conversations = remove_conversation_ids(conversations, conv_ids)
 
-        if map_size(conversations) == 0,
+        if empty_conversations?(conversations),
           do: acc,
           else: Map.put(acc, uid, conversations)
       end)
     end)
   end
+
+  defp remove_conversation_ids(conversations, conv_ids) when is_map(conversations) do
+    Enum.reduce(conv_ids, conversations, &Map.delete(&2, &1))
+  end
+
+  defp remove_conversation_ids(conversations, conv_ids) when is_list(conversations) do
+    conv_ids = MapSet.new(conv_ids)
+    Enum.reject(conversations, &(to_s(&1) in conv_ids))
+  end
+
+  defp remove_conversation_ids(_conversations, _conv_ids), do: %{}
+
+  defp empty_conversations?(conversations) when is_map(conversations),
+    do: map_size(conversations) == 0
+
+  defp empty_conversations?(conversations) when is_list(conversations), do: conversations == []
+  defp empty_conversations?(_conversations), do: true
 
   defp blank?(value), do: value in [nil, "", false]
 

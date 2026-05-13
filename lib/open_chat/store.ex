@@ -14,6 +14,9 @@ defmodule OpenChat.Store do
   alias OpenChat.Store.{
     AuthTokens,
     Conversations,
+    Entities,
+    GroupPermissions,
+    Indexes,
     MessagePermissions,
     PersistenceOps,
     RedisPersistence,
@@ -34,6 +37,10 @@ defmodule OpenChat.Store do
     "reactions" => %{},
     "blocks" => %{},
     "banned" => %{},
+    "message_muids" => %{},
+    "user_conversations" => %{},
+    "conversation_users" => %{},
+    "user_groups" => %{},
     "next_id" => 1,
     "next_reaction_id" => 1
   }
@@ -75,16 +82,16 @@ defmodule OpenChat.Store do
   def leave_group(guid, uid),
     do: call({:leave_group, to_s(guid), to_s(uid)})
 
-  def add_group_members(guid, uids, scope \\ "participant"),
-    do: call({:add_group_members, to_s(guid), uids, scope})
+  def add_group_members(guid, uids, scope \\ "participant", opts \\ []),
+    do: call({:add_group_members, to_s(guid), uids, scope, opts})
 
   def group_members(guid, params \\ %{}),
     do: call({:group_members, to_s(guid), params})
 
   def groups_for_user(uid), do: call({:groups_for_user, to_s(uid)})
 
-  def set_group_scopes(guid, scope_map),
-    do: call({:set_group_scopes, to_s(guid), scope_map})
+  def set_group_scopes(guid, scope_map, opts \\ []),
+    do: call({:set_group_scopes, to_s(guid), scope_map, opts})
 
   def ban_group_member(guid, uid),
     do: call({:ban_group_member, to_s(guid), to_s(uid)})
@@ -411,6 +418,8 @@ defmodule OpenChat.Store do
 
     {state, conversation_ops} = delete_conversation_indexes(state, [conv_id])
     {state, message_ops} = delete_message_records(state, message_ids)
+    member_uids = state |> get_in(["members", guid]) |> map_keys()
+    state = Indexes.remove_group(state, guid)
 
     state =
       state
@@ -423,7 +432,8 @@ defmodule OpenChat.Store do
         RedisPersistence.delete("groups", guid),
         RedisPersistence.delete("members", guid),
         RedisPersistence.delete("banned", guid)
-      ] ++ conversation_ops ++ message_ops
+      ] ++
+        PersistenceOps.user_groups(state, member_uids) ++ conversation_ops ++ message_ops
     )
 
     {:reply, {:ok, %{"success" => true, "guid" => guid}}, state}
@@ -454,14 +464,19 @@ defmodule OpenChat.Store do
 
             action = group_action(state, uid, group, uid, "joined")
             publish_to_group(state, guid, action, except: uid)
-            persist_ops(PersistenceOps.user(state, [uid]) ++ PersistenceOps.members(state, guid))
+
+            persist_ops(
+              PersistenceOps.user(state, [uid]) ++
+                PersistenceOps.members(state, guid) ++ PersistenceOps.user_groups(state, [uid])
+            )
+
             {:reply, {:ok, group}, state}
         end
     end
   end
 
   def handle_call({:leave_group, guid, uid}, _from, state) do
-    state = update_in(state, ["members", guid], fn members -> Map.delete(members || %{}, uid) end)
+    state = remove_member_from_state(state, guid, uid)
     group = state["groups"][guid]
 
     if group do
@@ -469,12 +484,13 @@ defmodule OpenChat.Store do
       publish_to_group(state, guid, action, except: uid)
     end
 
-    persist_ops(PersistenceOps.members(state, guid))
+    persist_ops(PersistenceOps.members(state, guid) ++ PersistenceOps.user_groups(state, [uid]))
     {:reply, {:ok, %{"success" => true}}, state}
   end
 
-  def handle_call({:add_group_members, guid, uids, scope}, _from, state) do
-    with {:ok, group} <- Map.fetch(state["groups"], guid) do
+  def handle_call({:add_group_members, guid, uids, scope, opts}, _from, state) do
+    with {:ok, group} <- Map.fetch(state["groups"], guid),
+         :ok <- authorize_group_moderation(state, guid, opts) do
       {state, result} =
         Enum.reduce(List.wrap(uids), {state, %{}}, fn uid, {st, acc} ->
           uid = to_s(uid)
@@ -486,12 +502,15 @@ defmodule OpenChat.Store do
       group = with_members_count(group, state)
 
       persist_ops(
-        PersistenceOps.user(state, Map.keys(result)) ++ PersistenceOps.members(state, guid)
+        PersistenceOps.user(state, Map.keys(result)) ++
+          PersistenceOps.members(state, guid) ++
+          PersistenceOps.user_groups(state, Map.keys(result))
       )
 
       {:reply, {:ok, %{"success" => result, "group" => group}}, state}
     else
       :error -> {:reply, {:error, Errors.group_not_found(guid)}, state}
+      {:error, error} -> {:reply, {:error, error}, state}
     end
   end
 
@@ -529,47 +548,56 @@ defmodule OpenChat.Store do
     end
   end
 
-  def handle_call({:set_group_scopes, guid, scope_map}, _from, state) do
+  def handle_call({:set_group_scopes, guid, scope_map, opts}, _from, state) do
     scope_map = stringify_keys(scope_map || %{})
     state = ensure_group_in_state(state, guid)
 
-    assignments = [
-      {"participant", scope_map["participants"] || scope_map["members"] || []},
-      {"moderator", scope_map["moderators"] || []},
-      {"admin", scope_map["admins"] || []},
-      {scope_map["scope"] || "participant", scope_map["uids"] || []}
-    ]
+    case authorize_group_moderation(state, guid, opts) do
+      :ok ->
+        assignments = [
+          {"participant", scope_map["participants"] || scope_map["members"] || []},
+          {"moderator", scope_map["moderators"] || []},
+          {"admin", scope_map["admins"] || []},
+          {scope_map["scope"] || "participant", scope_map["uids"] || []}
+        ]
 
-    {state, touched} =
-      Enum.reduce(assignments, {state, []}, fn {scope, uids}, {st, acc} ->
-        Enum.reduce(List.wrap(uids), {st, acc}, fn uid, {st2, acc2} ->
-          uid = to_s(uid)
-          {_user, st2} = ensure_user_in_state(st2, uid)
-          st2 = add_member_to_state(st2, guid, uid, scope)
+        {state, touched} =
+          Enum.reduce(assignments, {state, []}, fn {scope, uids}, {st, acc} ->
+            Enum.reduce(List.wrap(uids), {st, acc}, fn uid, {st2, acc2} ->
+              uid = to_s(uid)
+              {_user, st2} = ensure_user_in_state(st2, uid)
+              st2 = add_member_to_state(st2, guid, uid, scope)
 
-          {st2,
-           [
-             %{
-               "uid" => uid,
-               "scope" => normalise_scope(scope),
-               "guid" => guid,
-               "joinedAt" => Time.now()
-             }
-             | acc2
-           ]}
-        end)
-      end)
+              {st2,
+               [
+                 %{
+                   "uid" => uid,
+                   "scope" => normalise_scope(scope),
+                   "guid" => guid,
+                   "joinedAt" => Time.now()
+                 }
+                 | acc2
+               ]}
+            end)
+          end)
 
-    first = List.first(Enum.reverse(touched)) || %{"guid" => guid}
+        first = List.first(Enum.reverse(touched)) || %{"guid" => guid}
 
-    persist_ops(
-      PersistenceOps.group(state, guid) ++
-        PersistenceOps.members(state, guid) ++
-        PersistenceOps.user(state, Enum.map(touched, & &1["uid"]))
-    )
+        touched_uids = Enum.map(touched, & &1["uid"])
 
-    {:reply, {:ok, Map.merge(%{"success" => true, "members" => Enum.reverse(touched)}, first)},
-     state}
+        persist_ops(
+          PersistenceOps.group(state, guid) ++
+            PersistenceOps.members(state, guid) ++
+            PersistenceOps.user(state, touched_uids) ++
+            PersistenceOps.user_groups(state, touched_uids)
+        )
+
+        {:reply,
+         {:ok, Map.merge(%{"success" => true, "members" => Enum.reverse(touched)}, first)}, state}
+
+      {:error, error} ->
+        {:reply, {:error, error}, state}
+    end
   end
 
   def handle_call({:ban_group_member, guid, uid}, _from, state) do
@@ -584,12 +612,13 @@ defmodule OpenChat.Store do
         &Map.put(&1 || %{}, uid, %{"uid" => uid, "guid" => guid, "bannedAt" => now})
       )
 
-    state = update_in(state, ["members", guid], &Map.delete(&1 || %{}, uid))
+    state = remove_member_from_state(state, guid, uid)
 
     persist_ops(
       PersistenceOps.group(state, guid) ++
         PersistenceOps.user(state, [uid]) ++
-        PersistenceOps.banned(state, guid) ++ PersistenceOps.members(state, guid)
+        PersistenceOps.banned(state, guid) ++
+        PersistenceOps.members(state, guid) ++ PersistenceOps.user_groups(state, [uid])
     )
 
     {:reply,
@@ -627,9 +656,10 @@ defmodule OpenChat.Store do
 
   def handle_call({:groups_for_user, uid}, _from, state) do
     groups =
-      state["members"]
-      |> Enum.filter(fn {_guid, members} -> Map.has_key?(members, uid) end)
-      |> Enum.map(fn {guid, _members} -> state["groups"][guid] end)
+      state
+      |> get_in(["user_groups", uid])
+      |> List.wrap()
+      |> Enum.map(fn guid -> state["groups"][guid] end)
       |> Enum.reject(&is_nil/1)
       |> Enum.map(&with_members_count(&1, state))
 
@@ -750,7 +780,12 @@ defmodule OpenChat.Store do
   end
 
   def handle_call({:find_message_by_muid, muid}, _from, state) do
-    result = Enum.find(Map.values(state["messages"]), fn m -> to_s(m["muid"]) == muid end)
+    result =
+      case get_in(state, ["message_muids", muid]) do
+        nil -> Enum.find(Map.values(state["messages"]), fn m -> to_s(m["muid"]) == muid end)
+        id -> get_in(state, ["messages", to_s(id)])
+      end
+
     {:reply, if(result, do: {:ok, result}, else: :error), state}
   end
 
@@ -941,7 +976,13 @@ defmodule OpenChat.Store do
   # Loading/persistence
 
   defp load_or_seed_state do
-    RedisPersistence.load_or_seed(@default_state, &seed_state/0)
+    state =
+      @default_state
+      |> RedisPersistence.load_or_seed(&seed_state/0)
+      |> Indexes.rebuild()
+
+    persist_ops(PersistenceOps.secondary_indexes(state))
+    state
   end
 
   defp persist(state) do
@@ -982,11 +1023,14 @@ defmodule OpenChat.Store do
         |> maybe_store_embedded_token(user)
       end)
 
-    Enum.reduce(groups, state, fn group, st ->
-      st
-      |> put_in(["groups", group["guid"]], group)
-      |> ensure_group_member_map(group["guid"])
-    end)
+    state =
+      Enum.reduce(groups, state, fn group, st ->
+        st
+        |> put_in(["groups", group["guid"]], group)
+        |> ensure_group_member_map(group["guid"])
+      end)
+
+    Indexes.rebuild(state)
   end
 
   # Message and conversation helpers
@@ -1062,6 +1106,7 @@ defmodule OpenChat.Store do
       state
       |> put_in(["messages", id_key], message)
       |> update_in(["conversation_messages", conv_id], fn ids -> (ids || []) ++ [id_key] end)
+      |> Indexes.link_message(message)
 
     if parent_id = message["parentId"] || message["parentMessageId"] do
       update_in(state, ["thread_messages", to_s(parent_id)], fn ids ->
@@ -1281,45 +1326,69 @@ defmodule OpenChat.Store do
 
   defp delete_conversation_indexes(state, conv_ids) do
     {state, %{conversation_ids: conv_ids, touched_user_buckets: touched}} =
-      Conversations.delete_indexes(state, conv_ids, ["reads", "delivered", "hidden_conversations"])
+      Conversations.delete_indexes(state, conv_ids, [
+        "reads",
+        "delivered",
+        "hidden_conversations",
+        "user_conversations"
+      ])
+
+    conversation_user_uids =
+      conv_ids
+      |> Enum.flat_map(fn conv_id -> get_in(state, ["conversation_users", conv_id]) || [] end)
+      |> Enum.uniq()
+
+    state = Indexes.remove_conversations(state, conv_ids)
+
+    touched_user_conversation_uids =
+      ((touched["user_conversations"] || []) ++ conversation_user_uids)
+      |> Enum.uniq()
 
     ops =
       Enum.map(conv_ids, &RedisPersistence.delete("conversation_messages", &1)) ++
+        Enum.map(conv_ids, &RedisPersistence.delete("conversation_users", &1)) ++
         Enum.flat_map(touched["reads"], &PersistenceOps.reads(state, &1)) ++
         Enum.flat_map(touched["delivered"], &PersistenceOps.delivered(state, &1)) ++
         Enum.flat_map(
           touched["hidden_conversations"],
           &PersistenceOps.hidden_conversations(state, &1)
-        )
+        ) ++
+        PersistenceOps.user_conversations(state, touched_user_conversation_uids)
 
     {state, ops}
   end
 
   defp delete_message_records(state, message_ids) do
+    messages =
+      message_ids
+      |> List.wrap()
+      |> Enum.map(&to_s/1)
+      |> Enum.map(&state["messages"][&1])
+      |> Enum.reject(&is_nil/1)
+
+    state = Indexes.remove_messages(state, messages)
+
     {state, %{message_ids: message_ids, thread_ids: thread_ids}} =
       Conversations.delete_message_records(state, message_ids)
 
     ops =
       Enum.map(message_ids, &RedisPersistence.delete("messages", &1)) ++
         Enum.map(message_ids, &RedisPersistence.delete("reactions", &1)) ++
+        Enum.flat_map(messages, &delete_message_muid_ops/1) ++
         Enum.map(thread_ids, &RedisPersistence.delete("thread_messages", &1))
 
     {state, ops}
   end
 
   defp all_conversation_ids_for_user(state, uid) do
-    direct =
+    indexed = Indexes.conversation_ids_for_user(state, uid)
+
+    legacy_direct =
       state["conversation_messages"]
       |> Map.keys()
       |> Enum.filter(&user_conversation_for?(state, uid, &1))
 
-    groups =
-      state["members"]
-      |> Enum.filter(fn {_guid, members} -> Map.has_key?(members, uid) end)
-      |> Enum.map(fn {guid, _} -> group_conversation_id(guid) end)
-      |> Enum.filter(&Map.has_key?(state["conversation_messages"], &1))
-
-    (direct ++ groups)
+    (indexed ++ legacy_direct)
     |> Enum.uniq()
     |> Enum.reject(&conversation_hidden?(state, uid, &1))
   end
@@ -1739,29 +1808,10 @@ defmodule OpenChat.Store do
   end
 
   defp normalise_user(attrs) do
-    attrs = stringify_keys(attrs)
-    uid = to_s(attrs["uid"] || attrs["id"])
-
-    %{
-      "uid" => uid,
-      "name" => to_s(attrs["name"] || uid),
-      "avatar" => attrs["avatar"],
-      "link" => attrs["link"],
-      "metadata" => normalise_data(attrs["metadata"] || %{}),
-      "role" => attrs["role"] || "default",
-      "status" => attrs["status"] || "available",
-      "statusMessage" => attrs["statusMessage"],
-      "lastActiveAt" => attrs["lastActiveAt"] || Time.now(),
-      "tags" => attrs["tags"] || [],
-      "deactivatedAt" => attrs["deactivatedAt"],
-      "authToken" => attrs["authToken"]
-    }
-    |> Enum.reject(fn {_k, v} -> is_nil(v) end)
-    |> Map.new()
+    Entities.user(attrs)
   end
 
-  defp public_user(nil), do: nil
-  defp public_user(user), do: Map.drop(user, ["authToken"])
+  defp public_user(user), do: Entities.public_user(user)
 
   defp public_user_with_block_state(_state, nil, user), do: public_user(user)
 
@@ -1775,25 +1825,7 @@ defmodule OpenChat.Store do
   end
 
   defp normalise_group(attrs) do
-    attrs = stringify_keys(attrs)
-    guid = to_s(attrs["guid"] || attrs["id"])
-
-    %{
-      "guid" => guid,
-      "name" => to_s(attrs["name"] || guid),
-      "type" => attrs["type"] || "public",
-      "password" => attrs["password"],
-      "icon" => attrs["icon"],
-      "description" => attrs["description"],
-      "owner" => attrs["owner"] || attrs["ownerUid"] || attrs["ownerUuid"] || "system",
-      "metadata" => normalise_data(attrs["metadata"] || %{}),
-      "tags" => attrs["tags"] || [],
-      "createdAt" => attrs["createdAt"] || Time.now(),
-      "hasJoined" => attrs["hasJoined"] || false,
-      "membersCount" => attrs["membersCount"] || 0
-    }
-    |> Enum.reject(fn {_k, v} -> is_nil(v) end)
-    |> Map.new()
+    Entities.group(attrs)
   end
 
   defp ensure_group_member_map(state, guid), do: update_in(state, ["members", guid], &(&1 || %{}))
@@ -1812,16 +1844,30 @@ defmodule OpenChat.Store do
   end
 
   defp add_member_to_state(state, guid, uid, scope) do
-    state = ensure_group_member_map(state, guid)
-    scope = normalise_scope(scope)
+    state
+    |> ensure_group_member_map(guid)
+    |> Indexes.put_member(guid, uid, scope)
+  end
 
-    put_in(state, ["members", guid, uid], %{
-      "uid" => uid,
-      "scope" => scope,
-      "role" => scope,
-      "joinedAt" => Time.now(),
-      "guid" => guid
-    })
+  defp remove_member_from_state(state, guid, uid), do: Indexes.remove_member(state, guid, uid)
+
+  defp authorize_group_moderation(_state, _guid, opts) when opts in [nil, []], do: :ok
+
+  defp authorize_group_moderation(state, guid, opts) do
+    if Keyword.get(opts, :admin?, false) do
+      :ok
+    else
+      actor_uid = Keyword.get(opts, :actor_uid) || Keyword.get(opts, :uid)
+
+      if GroupPermissions.can_moderate?(state, guid, actor_uid) do
+        :ok
+      else
+        {:error,
+         Errors.forbidden(
+           "Only group owners, admins, moderators, and coOwners can manage members."
+         )}
+      end
+    end
   end
 
   defp member?(state, guid, uid), do: Map.has_key?(get_in(state, ["members", guid]) || %{}, uid)
@@ -1829,22 +1875,11 @@ defmodule OpenChat.Store do
   defp blocked?(state, blocker_uid, blocked_uid),
     do: get_in(state, ["blocks", blocker_uid, blocked_uid]) == true
 
-  defp normalise_scope("participants"), do: "participant"
-  defp normalise_scope("members"), do: "participant"
-
-  defp normalise_scope(scope) when scope in ["owner", "admin", "moderator", "participant"],
-    do: scope
-
-  defp normalise_scope("coOwner"), do: "coOwner"
-  defp normalise_scope(_scope), do: "participant"
-
-  defp with_members_count(nil, _state), do: nil
-
   defp with_members_count(group, state) do
-    guid = group["guid"]
-    count = state["members"] |> Map.get(guid, %{}) |> map_size()
-    group |> Map.put("membersCount", count)
+    Entities.with_members_count(group, state)
   end
+
+  defp normalise_scope(scope), do: Entities.scope(scope)
 
   # Generic helpers
 
@@ -1879,6 +1914,16 @@ defmodule OpenChat.Store do
   defp clamp(value, lo, hi), do: value |> Kernel.max(lo) |> Kernel.min(hi)
 
   defp sort_by_key(rows, key), do: Enum.sort_by(rows, &to_s(&1[key]))
+
+  defp map_keys(map) when is_map(map), do: Map.keys(map)
+  defp map_keys(_other), do: []
+
+  defp delete_message_muid_ops(message) do
+    case to_s(message["muid"]) do
+      "" -> []
+      muid -> [RedisPersistence.delete("message_muids", muid)]
+    end
+  end
 
   defp paginate(rows, params, default_limit, max_limit) do
     params = stringify_keys(params)

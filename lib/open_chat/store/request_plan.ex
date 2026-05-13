@@ -21,7 +21,7 @@ defmodule OpenChat.Store.RequestPlan do
     mutate(user_scope(uid), user_record_keys(uid))
   end
 
-  def build({:list_users, _params}), do: read([:all])
+  def build({:list_users, _params}), do: read([{:bucket, "users"}])
   def build({:delete_user, uid}), do: mutate(user_scope(uid), [{"users", uid}])
 
   def build({:reactivate_users, uids}) do
@@ -39,7 +39,7 @@ defmodule OpenChat.Store.RequestPlan do
   end
 
   def build({:unblock_users, uid, _uids}), do: mutate(user_scope(uid), [{"blocks", uid}])
-  def build({:blocked_users, _uid, _params}), do: read([:all])
+  def build({:blocked_users, uid, params}), do: read(blocked_user_keys(uid, params))
   def build({:create_auth_token, uid}), do: mutate(user_scope(uid), [{"users", uid}])
   def build({:revoke_auth_token, token}), do: mutate(token_scope(token), [{"tokens", token}])
   def build({:authenticate, token}), do: mutate(token_scopes(token), token_refresh_keys(token))
@@ -52,33 +52,43 @@ defmodule OpenChat.Store.RequestPlan do
   end
 
   def build({:get_group, guid}), do: read(group_keys(guid))
-  def build({:list_groups, _params}), do: read([:all])
-  def build({:delete_group, _guid}), do: mutate([:global], [:all])
+  def build({:list_groups, _params}), do: read([{:bucket, "groups"}, {:bucket, "members"}])
+  def build({:delete_group, guid}), do: mutate(group_scope(guid), group_delete_keys(guid))
 
   def build({:join_group, guid, uid, _params}),
     do: mutate(group_scope(guid), group_keys(guid) ++ user_record_keys(uid))
 
   def build({:leave_group, guid, _uid}), do: mutate(group_scope(guid), group_keys(guid))
 
-  def build({:add_group_members, guid, uids, _scope}) do
+  def build({:add_group_members, guid, uids, _scope, opts}) do
     mutate(
       group_scope(guid),
-      group_keys(guid) ++ Enum.flat_map(List.wrap(uids), &user_record_keys/1)
+      group_keys(guid) ++
+        actor_user_keys(opts) ++
+        Enum.flat_map(List.wrap(uids), &user_record_keys/1) ++
+        Enum.map(List.wrap(uids), &{"user_groups", &1})
     )
   end
 
   def build({:group_members, guid, _params}), do: read(group_keys(guid))
-  def build({:groups_for_user, _uid}), do: read([:all])
+  def build({:groups_for_user, uid}), do: read([{"user_groups", uid}])
 
-  def build({:set_group_scopes, guid, scope_map}) do
+  def build({:set_group_scopes, guid, scope_map, opts}) do
     mutate(
       group_scope(guid),
-      group_keys(guid) ++ Enum.flat_map(uids_from_scope_map(scope_map), &user_record_keys/1)
+      group_keys(guid) ++
+        actor_user_keys(opts) ++
+        Enum.flat_map(uids_from_scope_map(scope_map), &user_record_keys/1) ++
+        Enum.map(uids_from_scope_map(scope_map), &{"user_groups", &1})
     )
   end
 
   def build({:ban_group_member, guid, uid}),
-    do: mutate(group_scope(guid), group_keys(guid) ++ user_record_keys(uid))
+    do:
+      mutate(
+        group_scope(guid),
+        group_keys(guid) ++ user_record_keys(uid) ++ [{"user_groups", uid}]
+      )
 
   def build({:unban_group_member, guid, _uid}), do: mutate(group_scope(guid), [{"banned", guid}])
   def build({:banned_group_members, guid, _params}), do: read([{"banned", guid}])
@@ -103,7 +113,7 @@ defmodule OpenChat.Store.RequestPlan do
     do: mutate(message_scope(id), [{"messages", id}, {:counter, "next_id"}])
 
   def build({:delete_conversation, conversation_id}),
-    do: mutate([{:conversation, conversation_id}], [:all])
+    do: mutate([{:conversation, conversation_id}], conversation_delete_keys(conversation_id))
 
   def build({:hide_conversation, uid, receiver_type, receiver_id}) do
     mutate(
@@ -113,7 +123,7 @@ defmodule OpenChat.Store.RequestPlan do
   end
 
   def build({:get_message, id}), do: read([{"messages", id}, {"reactions", id}])
-  def build({:find_message_by_muid, _muid}), do: read([:all])
+  def build({:find_message_by_muid, muid}), do: read([{"message_muids", muid}])
 
   def build({:messages_for_user, uid, peer_uid, _params}),
     do: read([{"conversation_messages", Conversations.user_conversation_id(uid, peer_uid)}])
@@ -142,8 +152,8 @@ defmodule OpenChat.Store.RequestPlan do
     )
   end
 
-  def build({:unread_counts, _uid, _params}), do: read([:all])
-  def build({:conversations, _uid, _params}), do: read([:all])
+  def build({:unread_counts, uid, _params}), do: read(user_conversation_keys(uid))
+  def build({:conversations, uid, _params}), do: read(user_conversation_keys(uid))
 
   def build({:conversation, uid, receiver_type, receiver_id}) do
     refresh =
@@ -175,7 +185,7 @@ defmodule OpenChat.Store.RequestPlan do
   end
 
   def build({:reactions, _uid, id, _reaction}), do: read([{"messages", id}, {"reactions", id}])
-  def build(_request), do: read([:all])
+  def build(_request), do: read([])
 
   def followup_refresh({request, token}, state) when request in [:authenticate, :me] do
     token
@@ -278,6 +288,53 @@ defmodule OpenChat.Store.RequestPlan do
         "user" -> user_record_keys(message["receiver"])
         _other -> []
       end
+  end
+
+  defp blocked_user_keys(uid, params) do
+    params = stringify_keys(params || %{})
+
+    case params["direction"] do
+      "blockedByMe" -> [{"blocks", uid}]
+      _other -> [{"blocks", uid}, {:bucket, "blocks"}]
+    end
+  end
+
+  defp group_delete_keys(guid) do
+    conv_id = Conversations.group_conversation_id(guid)
+    group_keys(guid) ++ [{"conversation_messages", conv_id}, {"conversation_users", conv_id}]
+  end
+
+  defp conversation_delete_keys(conversation_id) do
+    conversation_id = to_s(conversation_id)
+
+    extra_ids =
+      if String.starts_with?(conversation_id, "group_"),
+        do: [],
+        else: [Conversations.group_conversation_id(conversation_id)]
+
+    [conversation_id]
+    |> Kernel.++(extra_ids)
+    |> Enum.uniq()
+    |> Enum.flat_map(fn conv_id ->
+      [{"conversation_messages", conv_id}, {"conversation_users", conv_id}]
+    end)
+  end
+
+  defp user_conversation_keys(uid) do
+    [
+      {"user_conversations", uid},
+      {"user_groups", uid},
+      {"reads", uid},
+      {"delivered", uid},
+      {"hidden_conversations", uid}
+    ]
+  end
+
+  defp actor_user_keys(opts) do
+    opts
+    |> List.wrap()
+    |> Keyword.get(:actor_uid)
+    |> user_record_keys()
   end
 
   defp user_record_keys(value), do: if(blank?(value), do: [], else: [{"users", value}])

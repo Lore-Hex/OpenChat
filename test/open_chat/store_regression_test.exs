@@ -229,6 +229,37 @@ defmodule OpenChat.StoreRegressionTest do
     assert co_owner_deleted["data"]["action"] == "deleted"
   end
 
+  test "actor-aware group member management blocks participant escalation" do
+    guid = "member-security-room"
+
+    assert {:ok, _group} =
+             Store.upsert_group(%{"guid" => guid, "type" => "public", "ownerUid" => "owner"})
+
+    assert {:ok, _members} = Store.add_group_members(guid, ["participant"], "participant")
+    assert {:ok, _moderator} = Store.add_group_members(guid, ["moderator"], "moderator")
+    assert {:ok, _co_owner} = Store.add_group_members(guid, ["co-owner"], "coOwner")
+
+    assert {:error, %{"code" => "ERR_FORBIDDEN"}} =
+             Store.add_group_members(guid, ["victim"], "admin", actor_uid: "participant")
+
+    assert {:ok, members} = Store.group_members(guid)
+    refute Enum.any?(members, &(&1["uid"] == "victim"))
+
+    assert {:ok, _owner_added} =
+             Store.add_group_members(guid, ["owner-added"], "participant", actor_uid: "owner")
+
+    assert {:ok, _moderator_added} =
+             Store.add_group_members(guid, ["mod-added"], "participant", actor_uid: "moderator")
+
+    assert {:ok, _co_owner_added} =
+             Store.add_group_members(guid, ["co-added"], "participant", actor_uid: "co-owner")
+
+    assert {:ok, members} = Store.group_members(guid)
+    assert Enum.any?(members, &(&1["uid"] == "owner-added"))
+    assert Enum.any?(members, &(&1["uid"] == "mod-added"))
+    assert Enum.any?(members, &(&1["uid"] == "co-added"))
+  end
+
   test "server-side admin option can moderate without message ownership" do
     assert {:ok, direct} =
              Store.send_message("alice", %{

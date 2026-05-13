@@ -268,6 +268,49 @@ defmodule OpenChat.LoadPerfTest do
     end)
   end
 
+  test "concurrent Redis secondary-index reads stay consistent under write-through load" do
+    with_redis(fn context ->
+      concurrency = env_int("OPENCHAT_LOAD_REDIS_INDEX_CONCURRENCY", 8)
+      messages = env_int("OPENCHAT_LOAD_REDIS_INDEX_MESSAGES", 240)
+      minimum = env_int("OPENCHAT_MIN_REDIS_INDEX_OP_PER_SEC", 20)
+
+      {sent, write_seconds} =
+        timed(fn ->
+          concurrent_map(1..messages, concurrency, fn i ->
+            assert {:ok, message} =
+                     Store.send_message("redis-index-a", %{
+                       "receiver" => "redis-index-b",
+                       "receiverType" => "user",
+                       "muid" => "redis-index-muid-#{i}",
+                       "type" => "text",
+                       "data" => %{"text" => "redis index #{i}"}
+                     })
+
+            message
+          end)
+        end)
+
+      assert length(sent) == messages
+      assert_rate("Redis indexed writes", messages, write_seconds, minimum)
+
+      {lookups, read_seconds} =
+        timed(fn ->
+          concurrent_map(sent, concurrency, fn message ->
+            assert {:ok, fetched} = Store.find_message_by_muid(message["muid"])
+            assert fetched["id"] == message["id"]
+
+            assert {:ok, [_ | _]} = Store.conversations("redis-index-a", %{"limit" => 20})
+            fetched["id"]
+          end)
+        end)
+
+      assert lookups |> MapSet.new() |> MapSet.size() == messages
+      assert "redis-index-a" in redis_members(context, "index", "user_conversations")
+      assert "redis-index-b" in redis_members(context, "index", "user_conversations")
+      assert_rate("Redis indexed reads", messages * 2, read_seconds, minimum)
+    end)
+  end
+
   defp with_redis(fun) do
     redis_url = System.get_env("REDIS_TEST_URL") || "redis://localhost:6379/15"
 

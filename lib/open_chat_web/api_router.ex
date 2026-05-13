@@ -3,7 +3,7 @@ defmodule OpenChatWeb.ApiRouter do
   use Plug.Router
   import Plug.Conn
   alias OpenChat.{Config, Errors, Store, Time}
-  alias OpenChatWeb.JSON
+  alias OpenChatWeb.{Auth, JSON}
 
   plug(:match)
   plug(:dispatch)
@@ -234,14 +234,11 @@ defmodule OpenChatWeb.ApiRouter do
       conn,
       fn conn -> set_group_scopes_response(conn, guid) end,
       fn conn ->
-        with_user(conn, fn conn, _user, _token ->
+        with_user(conn, fn conn, user, _token ->
           uids = conn.body_params["uids"] || conn.body_params["participants"] || []
           scope = conn.body_params["scope"] || "participant"
 
-          case Store.add_group_members(guid, uids, scope) do
-            {:ok, data} -> JSON.ok(conn, data)
-            {:error, e} -> JSON.error(conn, e, 400)
-          end
+          store_response(conn, Store.add_group_members(guid, uids, scope, actor_uid: user["uid"]))
         end)
       end
     )
@@ -614,54 +611,18 @@ defmodule OpenChatWeb.ApiRouter do
   end
 
   defp with_user(conn, fun) do
-    token = auth_token(conn)
-
-    case Store.authenticate(token) do
-      {:ok, user} -> fun.(conn, user, token)
-      {:error, e} -> JSON.error(conn, e, 401)
-    end
+    Auth.with_user(conn, fun)
   end
 
   defp with_admin_or_open(conn, fun) do
-    api_key = header(conn, "apikey") || header(conn, "apiKey")
-    configured = Config.api_key()
-
-    if api_key == configured or (blank?(configured) and blank?(api_key)) do
-      fun.(conn)
-    else
-      JSON.error(conn, Errors.forbidden("Invalid apiKey."), 403)
-    end
+    Auth.with_admin(conn, fun)
   end
 
   defp with_admin_or_user(conn, admin_fun, user_fun) do
-    api_key = header(conn, "apikey") || header(conn, "apiKey")
-
-    cond do
-      blank?(api_key) ->
-        user_fun.(conn)
-
-      api_key == Config.api_key() ->
-        admin_fun.(conn)
-
-      true ->
-        JSON.error(conn, Errors.forbidden("Invalid apiKey."), 403)
-    end
+    Auth.with_admin_or_user(conn, admin_fun, user_fun)
   end
 
-  defp auth_token(conn),
-    do:
-      header(conn, "authtoken") || header(conn, "authToken") || bearer_token(conn) ||
-        conn.params["authToken"]
-
-  defp bearer_token(conn) do
-    case header(conn, "authorization") do
-      "Bearer " <> token -> token
-      "bearer " <> token -> token
-      _other -> nil
-    end
-  end
-
-  defp header(conn, key), do: conn |> get_req_header(String.downcase(key)) |> List.first()
+  defp auth_token(conn), do: Auth.token(conn)
 
   defp uploads_from_params(params) do
     [

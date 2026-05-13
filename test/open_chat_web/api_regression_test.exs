@@ -28,6 +28,23 @@ defmodule OpenChatWeb.ApiRegressionTest do
     assert Plug.Conn.get_resp_header(conn, "access-control-allow-origin") == ["*"]
   end
 
+  test "blank configured admin api key does not open admin routes" do
+    old_api_key = Application.get_env(:open_chat, :api_key)
+    Application.put_env(:open_chat, :api_key, "")
+
+    on_exit(fn ->
+      Application.put_env(:open_chat, :api_key, old_api_key)
+    end)
+
+    conn =
+      conn(:post, "/v3/users", Jason.encode!(%{"uid" => "blank-key-admin"}))
+      |> Plug.Conn.put_req_header("content-type", "application/json")
+      |> OpenChatWeb.Endpoint.call([])
+
+    assert conn.status == 403
+    assert json(conn)["error"]["code"] == "ERR_FORBIDDEN"
+  end
+
   test "user admin and client routes support search, pagination, update, delete, and reactivation" do
     for uid <- ["test-a", "test-b", "test-c"] do
       assert admin_conn(:post, "/v3/users", %{"uid" => uid, "name" => "Search #{uid}"}).status ==
@@ -133,6 +150,58 @@ defmodule OpenChatWeb.ApiRegressionTest do
     conn = auth_conn(:get, "/v3.0/groups/api-delete/messages", %{}, "uid:alice")
     assert conn.status == 400
     assert json(conn)["error"]["code"] == "ERR_NOT_A_MEMBER"
+  end
+
+  test "group member write APIs require owner or moderator privileges for user tokens" do
+    assert admin_conn(:post, "/v3/groups", %{
+             "guid" => "api-member-security",
+             "type" => "public",
+             "ownerUid" => "api-owner"
+           }).status == 201
+
+    assert admin_conn(:post, "/v3/groups/api-member-security/members", %{
+             "participants" => ["api-participant"],
+             "moderators" => ["api-moderator"]
+           }).status == 200
+
+    conn =
+      auth_conn(
+        :put,
+        "/v3.0/groups/api-member-security/members",
+        %{"uids" => ["api-victim"], "scope" => "admin"},
+        "uid:api-participant"
+      )
+
+    assert conn.status == 403
+    assert json(conn)["error"]["code"] == "ERR_FORBIDDEN"
+
+    conn = admin_conn(:get, "/v3/groups/api-member-security/members?scope=admin")
+    refute Enum.any?(json(conn)["data"], &(&1["uid"] == "api-victim"))
+
+    conn =
+      auth_conn(
+        :put,
+        "/v3.0/groups/api-member-security/members",
+        %{"uids" => ["api-owner-added"], "scope" => "participant"},
+        "uid:api-owner"
+      )
+
+    assert conn.status == 200
+
+    conn =
+      auth_conn(
+        :put,
+        "/v3.0/groups/api-member-security/members",
+        %{"uids" => ["api-mod-added"], "scope" => "participant"},
+        "uid:api-moderator"
+      )
+
+    assert conn.status == 200
+
+    conn = admin_conn(:get, "/v3/groups/api-member-security/members")
+    uids = Enum.map(json(conn)["data"], & &1["uid"])
+    assert "api-owner-added" in uids
+    assert "api-mod-added" in uids
   end
 
   test "message APIs cover errors, thread fetches, muid lookup, cursor metadata, and unread rewind" do

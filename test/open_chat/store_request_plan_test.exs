@@ -75,4 +75,32 @@ defmodule OpenChat.StoreRequestPlanTest do
              {"banned", "room"}
            ]
   end
+
+  test "broad store requests use indexed refreshes instead of whole-state refreshes" do
+    requests = [
+      {:list_users, %{}},
+      {:blocked_users, "alice", %{"direction" => "hasBlockedMe"}},
+      {:list_groups, %{}},
+      {:delete_group, "room"},
+      {:groups_for_user, "alice"},
+      {:find_message_by_muid, "client-id"},
+      {:unread_counts, "alice", %{}},
+      {:conversations, "alice", %{}},
+      {:delete_conversation, "user_alice_bob"}
+    ]
+
+    for request <- requests do
+      plan = RequestPlan.build(request)
+      refute :all in plan.refresh
+      refute plan.refresh == []
+    end
+
+    assert RequestPlan.build({:conversations, "alice", %{}}).refresh == [
+             {"user_conversations", "alice"},
+             {"user_groups", "alice"},
+             {"reads", "alice"},
+             {"delivered", "alice"},
+             {"hidden_conversations", "alice"}
+           ]
+  end
 end

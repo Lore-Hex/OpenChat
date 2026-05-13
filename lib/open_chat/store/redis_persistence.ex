@@ -18,11 +18,15 @@ defmodule OpenChat.Store.RedisPersistence do
     "hidden_conversations",
     "reactions",
     "blocks",
-    "banned"
+    "banned",
+    "message_muids",
+    "user_conversations",
+    "conversation_users",
+    "user_groups"
   ]
 
   @counters ["next_id", "next_reaction_id"]
-  @version "4"
+  @version "5"
   @lock_ttl_ms 60_000
   @lock_attempts 600
 
@@ -62,7 +66,6 @@ defmodule OpenChat.Store.RedisPersistence do
 
       cond do
         keys == [] -> fallback_state
-        :all in keys -> refresh(default_state, fallback_state)
         true -> refresh_records(default_state, fallback_state, keys)
       end
     else
@@ -285,22 +288,40 @@ defmodule OpenChat.Store.RedisPersistence do
   end
 
   defp refresh_records(default_state, state, keys) do
-    {record_keys, counter_keys} =
-      Enum.reduce(keys, {[], []}, fn
-        {:record, bucket, id}, {records, counters} -> {[{bucket, id} | records], counters}
-        {:counter, counter}, {records, counters} -> {records, [counter | counters]}
-        _other, acc -> acc
+    {record_keys, counter_keys, bucket_keys} =
+      Enum.reduce(keys, {[], [], []}, fn
+        {:record, bucket, id}, {records, counters, buckets} ->
+          {[{bucket, id} | records], counters, buckets}
+
+        {:counter, counter}, {records, counters, buckets} ->
+          {records, [counter | counters], buckets}
+
+        {:bucket, bucket}, {records, counters, buckets} ->
+          {records, counters, [bucket | buckets]}
+
+        _other, acc ->
+          acc
       end)
 
     record_keys = Enum.uniq(record_keys)
+    bucket_keys = Enum.uniq(bucket_keys)
+
+    state =
+      state
+      |> read_records(record_keys)
+      |> read_buckets(bucket_keys)
+
+    related_keys = Enum.uniq(record_keys ++ bucket_record_keys(state, bucket_keys))
 
     state
-    |> read_records(record_keys)
-    |> read_related_token_users(record_keys)
-    |> read_related_member_users(record_keys)
-    |> read_related_messages(record_keys)
-    |> read_related_message_participants(record_keys)
-    |> read_related_conversations(record_keys)
+    |> read_related_token_users(related_keys)
+    |> read_related_member_users(related_keys)
+    |> read_related_membership_indexes(related_keys)
+    |> read_related_user_groups(related_keys)
+    |> read_related_conversation_indexes(related_keys)
+    |> read_related_messages(related_keys)
+    |> read_related_message_participants(related_keys)
+    |> read_related_conversations(related_keys)
     |> read_counters(default_state, Enum.uniq(counter_keys))
   end
 
@@ -323,11 +344,29 @@ defmodule OpenChat.Store.RedisPersistence do
     end
   end
 
+  defp read_buckets(state, []), do: state
+
+  defp read_buckets(state, buckets) do
+    Enum.reduce(buckets, state, fn bucket, acc ->
+      Map.put(acc, bucket, read_bucket(bucket))
+    end)
+  end
+
+  defp bucket_record_keys(state, buckets) do
+    buckets
+    |> Enum.flat_map(fn bucket ->
+      state
+      |> Map.get(bucket, %{})
+      |> Map.keys()
+      |> Enum.map(&{bucket, &1})
+    end)
+  end
+
   defp read_related_messages(state, record_keys) do
     message_keys =
       record_keys
       |> Enum.filter(fn {bucket, _id} ->
-        bucket in ["conversation_messages", "thread_messages"]
+        bucket in ["conversation_messages", "thread_messages", "message_muids"]
       end)
       |> Enum.flat_map(fn {bucket, id} -> state |> get_in([bucket, id]) |> List.wrap() end)
       |> Enum.map(&{"messages", to_s(&1)})
@@ -335,7 +374,10 @@ defmodule OpenChat.Store.RedisPersistence do
       |> Enum.reject(&(&1 in record_keys))
       |> Enum.uniq()
 
-    read_records(state, message_keys)
+    state
+    |> read_records(message_keys)
+    |> read_related_message_participants(message_keys)
+    |> read_related_conversations(message_keys)
   end
 
   defp read_related_token_users(state, record_keys) do
@@ -370,6 +412,114 @@ defmodule OpenChat.Store.RedisPersistence do
     read_records(state, user_keys)
   end
 
+  defp read_related_membership_indexes(state, record_keys) do
+    user_group_keys =
+      record_keys
+      |> Enum.filter(fn {bucket, _id} -> bucket == "members" end)
+      |> Enum.flat_map(fn {_bucket, guid} ->
+        state
+        |> get_in(["members", guid])
+        |> case do
+          map when is_map(map) -> Map.keys(map)
+          _other -> []
+        end
+      end)
+      |> Enum.map(&{"user_groups", to_s(&1)})
+      |> Enum.reject(fn {_bucket, uid} -> uid == "" end)
+      |> Enum.reject(&(&1 in record_keys))
+      |> Enum.uniq()
+
+    read_records(state, user_group_keys)
+  end
+
+  defp read_related_user_groups(state, record_keys) do
+    group_keys =
+      record_keys
+      |> Enum.filter(fn {bucket, _id} -> bucket == "user_groups" end)
+      |> Enum.flat_map(fn {_bucket, uid} ->
+        state |> get_in(["user_groups", uid]) |> List.wrap()
+      end)
+      |> Enum.flat_map(fn guid ->
+        guid = to_s(guid)
+
+        [
+          {"groups", guid},
+          {"members", guid},
+          {"banned", guid},
+          {"conversation_messages", "group_#{guid}"},
+          {"conversation_users", "group_#{guid}"}
+        ]
+      end)
+      |> Enum.reject(fn {_bucket, id} -> id == "" end)
+      |> Enum.reject(&(&1 in record_keys))
+      |> Enum.uniq()
+
+    state =
+      state
+      |> read_records(group_keys)
+      |> read_related_membership_indexes(group_keys)
+
+    state
+    |> read_related_messages(group_keys)
+    |> read_related_conversation_indexes(group_keys)
+  end
+
+  defp read_related_conversation_indexes(state, record_keys) do
+    conversation_ids =
+      record_keys
+      |> Enum.flat_map(fn
+        {"user_conversations", uid} ->
+          state |> get_in(["user_conversations", uid]) |> List.wrap()
+
+        {"conversation_users", conv_id} ->
+          [conv_id]
+
+        _other ->
+          []
+      end)
+      |> Enum.map(&to_s/1)
+      |> Enum.reject(&(&1 == ""))
+      |> Enum.uniq()
+
+    conversation_keys =
+      conversation_ids
+      |> Enum.flat_map(fn conv_id ->
+        [
+          {"conversation_messages", conv_id},
+          {"conversation_users", conv_id}
+        ]
+      end)
+      |> Enum.reject(&(&1 in record_keys))
+      |> Enum.uniq()
+
+    state =
+      state
+      |> read_records(conversation_keys)
+      |> read_related_messages(conversation_keys)
+
+    user_keys =
+      conversation_ids
+      |> Enum.flat_map(fn conv_id ->
+        state |> get_in(["conversation_users", conv_id]) |> List.wrap()
+      end)
+      |> Enum.map(&to_s/1)
+      |> Enum.reject(&(&1 == ""))
+      |> Enum.uniq()
+      |> Enum.flat_map(fn uid ->
+        [
+          {"users", uid},
+          {"reads", uid},
+          {"delivered", uid},
+          {"hidden_conversations", uid},
+          {"user_conversations", uid}
+        ]
+      end)
+      |> Enum.reject(&(&1 in record_keys))
+      |> Enum.uniq()
+
+    read_records(state, user_keys)
+  end
+
   defp read_related_message_participants(state, record_keys) do
     participant_keys =
       record_keys
@@ -398,7 +548,12 @@ defmodule OpenChat.Store.RedisPersistence do
       |> Enum.filter(fn {bucket, _id} -> bucket == "messages" end)
       |> Enum.map(fn {_bucket, id} -> get_in(state, ["messages", id, "conversationId"]) end)
       |> Enum.reject(&(&1 in [nil, ""]))
-      |> Enum.map(&{"conversation_messages", to_s(&1)})
+      |> Enum.flat_map(fn conversation_id ->
+        [
+          {"conversation_messages", to_s(conversation_id)},
+          {"conversation_users", to_s(conversation_id)}
+        ]
+      end)
       |> Enum.reject(&(&1 in record_keys))
       |> Enum.uniq()
 
@@ -606,11 +761,11 @@ defmodule OpenChat.Store.RedisPersistence do
     keys
     |> List.wrap()
     |> Enum.flat_map(fn
-      :all ->
-        [:all]
-
       {:counter, counter} ->
         [{:counter, to_s(counter)}]
+
+      {:bucket, bucket} ->
+        normalize_bucket_key(bucket)
 
       {:record, bucket, id} ->
         normalize_record_key(bucket, id)
@@ -630,6 +785,16 @@ defmodule OpenChat.Store.RedisPersistence do
 
     if bucket in @buckets and id != "" do
       [{:record, bucket, id}]
+    else
+      []
+    end
+  end
+
+  defp normalize_bucket_key(bucket) do
+    bucket = to_s(bucket)
+
+    if bucket in @buckets do
+      [{:bucket, bucket}]
     else
       []
     end

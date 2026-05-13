@@ -2,8 +2,7 @@ defmodule OpenChat.Store.MessagePermissions do
   @moduledoc false
 
   alias OpenChat.Errors
-
-  @moderator_scopes MapSet.new(["owner", "admin", "moderator", "coOwner"])
+  alias OpenChat.Store.GroupPermissions
 
   def authorize(state, actor_uid, message, action, opts \\ []) do
     actor_uid = to_s(actor_uid)
@@ -47,25 +46,10 @@ defmodule OpenChat.Store.MessagePermissions do
   defp message_sender?(message, uid), do: to_s(message["sender"]) == uid
 
   defp group_moderator?(state, %{"receiverType" => "group", "receiver" => guid}, uid) do
-    group = get_in(state, ["groups", to_s(guid)]) || %{}
-    group_owner?(group, uid) or member_scope(state, guid, uid) in @moderator_scopes
+    GroupPermissions.can_moderate?(state, guid, uid)
   end
 
   defp group_moderator?(_state, _message, _uid), do: false
-
-  defp group_owner?(group, uid) do
-    [
-      group["owner"],
-      group["ownerUid"],
-      group["ownerUuid"]
-    ]
-    |> Enum.any?(&(to_s(&1) == uid))
-  end
-
-  defp member_scope(state, guid, uid) do
-    member = get_in(state, ["members", to_s(guid), uid]) || %{}
-    to_s(member["scope"] || member["role"])
-  end
 
   defp blank?(value), do: value in [nil, "", false]
 

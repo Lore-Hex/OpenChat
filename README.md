@@ -14,7 +14,7 @@ OpenChat is a BEAM/Elixir replacement for the covered subset of CometChat. It is
 | Local JWT and sessions | SDK session/JWT compatibility payloads | `POST /me/jwt`, `POST /user_sessions` | Covered by ExUnit API tests. These are local compatibility payloads, not CometChat-issued credentials. |
 | Users | List, search, paginate, create, update, deactivate, reactivate, fetch with block state | `GET /users`, `POST /users`, `PUT /users`, `GET /users/:uid`, `PUT /users/:uid`, `DELETE /users/:uid` | Covered by store and API regression tests. |
 | Blocks | Block, unblock, list blocked users, `blockedByMe`, `hasBlockedMe` | `GET /blockedusers`, `POST /blockedusers`, `DELETE /blockedusers` | Covered by ExUnit API tests and Playwright SDK contract tests. |
-| Groups and membership | List, search, paginate, create, update, fetch, delete, join public/password groups, member list, add/remove members, update scopes | `GET /groups`, `POST /groups`, `GET /groups/:guid`, `PUT /groups/:guid`, `DELETE /groups/:guid`, `GET /groups/:guid/members`, `POST /groups/:guid/members`, `PUT /groups/:guid/members`, `DELETE /groups/:guid/members`, `PUT /groups/:guid/members/:uid`, `DELETE /groups/:guid/members/:uid` | Covered by store/API/Redis tests and SDK group join contract tests. |
+| Groups and membership | List, search, paginate, create, update, fetch, delete, join public/password groups, member list, add/remove members, update scopes, owner/moderator member management | `GET /groups`, `POST /groups`, `GET /groups/:guid`, `PUT /groups/:guid`, `DELETE /groups/:guid`, `GET /groups/:guid/members`, `POST /groups/:guid/members`, `PUT /groups/:guid/members`, `DELETE /groups/:guid/members`, `PUT /groups/:guid/members/:uid`, `DELETE /groups/:guid/members/:uid` | Covered by store/API/Redis tests and SDK group join contract tests. User-token member writes require group owner/admin/moderator/coOwner privileges. |
 | Group bans | Ban, unban, list/search banned users | `GET /groups/:guid/bannedusers`, `POST /groups/:guid/bannedusers/:uid`, `DELETE /groups/:guid/bannedusers/:uid` | Covered by API regression and Redis cleanup tests. |
 | Messages | Text, custom, media-shaped messages, multipart media upload, admin sends, validation, deterministic pagination, cursor metadata | `POST /messages`, `GET /users/:uid/messages`, `GET /groups/:guid/messages`, `GET /messages/:messageId`, `GET /user/messages/:muid` | Covered by store tests, API tests, media upload tests, and Playwright SDK contract tests. |
 | Threads | Send replies and fetch thread messages | `POST /messages/:parentId/thread`, `GET /messages/:parentId/thread` | Covered by API regression tests. |
@@ -96,7 +96,7 @@ For a literal zero-code swizzle, deploy TLS and DNS so the SDK's existing CometC
 | `PUBLIC_HOST` | `localhost` | Host returned to SDK in `/me.settings.CHAT_HOST` |
 | `PUBLIC_WS_PORT` | `PORT` | Port returned as `/me.settings.CHAT_WSS_PORT` |
 | `COMETCHAT_APP_ID` | `local-app` | App ID accepted/reported by the clone |
-| `COMETCHAT_API_KEY` | `local-api-key` | Optional admin API key if you choose to enforce it |
+| `COMETCHAT_API_KEY` | `local-api-key` | Admin API key for server-side routes. Blank disables admin API-key access rather than opening routes. |
 | `COMETCHAT_REGION` | `us` | Region returned to SDK settings |
 | `EXTENSION_DOMAIN` | `PUBLIC_HOST` | Extension domain used by `callExtension` URL generation |
 | `REDIS_URL` | unset | Optional Redis URL for durable per-record storage |
@@ -126,7 +126,9 @@ curl -X DELETE "$OPENCHAT_URL/v3/messages/$MESSAGE_ID" \
 
 User-token requests keep SDK-style permissions: direct messages can be edited or
 deleted only by their sender; group messages can be edited or deleted by their sender
-or by a group `owner`, `admin`, `moderator`, or `coOwner`.
+or by a group `owner`, `admin`, `moderator`, or `coOwner`. User-token member
+management has the same group moderator boundary, so participants cannot add
+members or escalate scopes.
 
 ## Persistence strategy
 
@@ -145,6 +147,10 @@ By default all state is in one OTP GenServer. If `REDIS_URL` is set, each mutati
 - `open_chat:reactions:<messageId>`
 - `open_chat:blocks:<uid>`
 - `open_chat:banned:<guid>`
+- `open_chat:message_muids:<muid>` for client message-id lookup
+- `open_chat:user_conversations:<uid>` for conversation list and unread fanout
+- `open_chat:conversation_users:<conversationId>` for participant-scoped cleanup
+- `open_chat:user_groups:<uid>` for group conversation discovery
 - `open_chat:counter:<counterName>`
 - `open_chat:index:<bucket>` sets for reloadable key discovery
 
@@ -156,8 +162,10 @@ When Redis is enabled, Store behaves as a local read-through/write-through cache
 - writes persist only touched records and index entries;
 - message and reaction IDs are allocated through Redis-backed monotonic counters so separate nodes do not race stale local counters;
 - targeted read-through refresh pulls only records a request can touch, such as a conversation message list plus its messages, a token plus its user, or a group plus its members;
-- broad scan paths such as user/group lists, unread count aggregation, and destructive group deletion still full-refresh before scanning because they depend on cross-bucket indexes;
+- broad query paths use Redis index sets or secondary indexes rather than whole-state request refreshes: user/group lists read only their bucket indexes, unread and conversation lists read `user_conversations`/`user_groups`, MUID lookup reads `message_muids`, and destructive cleanup reads `conversation_users`;
 - reset and legacy imports remain namespace-wide operations.
+
+This keeps Redis as a high-scale write-through/read-through record store for the current API surface. PostgreSQL is not required for the covered CometChat-compatible paths; it would become useful for long-term analytics, audit retention, ad hoc moderation search, or relational reporting outside the hot chat path.
 
 WebSocket events are also fanned out through Redis Pub/Sub so instances behind a load balancer can notify each other's connected clients.
 
@@ -198,7 +206,8 @@ REDIS_URL=redis://<elasticache-endpoint>:6379/0
 - Conversations, unread counts, and delivered cursors
 - Read/unread/delivered transitions
 - Native reactions
-- Redis per-key persistence, targeted refresh, scoped write preservation, and monotonic Redis counters
+- Owner/moderator-only member and message moderation
+- Redis per-key persistence, secondary indexes, targeted refresh, scoped write preservation, and monotonic Redis counters
 
 ### Load and performance tests
 
@@ -218,6 +227,7 @@ Useful knobs:
 | `OPENCHAT_LOAD_GROUP_MESSAGES` | `600` | Group messages |
 | `OPENCHAT_LOAD_HTTP_MESSAGES` | `500` | Plug HTTP message sends |
 | `OPENCHAT_LOAD_REDIS_MESSAGES` | `300` | Redis-backed message sends |
+| `OPENCHAT_LOAD_REDIS_INDEX_MESSAGES` | `240` | Redis secondary-index write/read checks |
 | `OPENCHAT_LOAD_CONCURRENCY` | `16` | Concurrent Store writer tasks |
 | `OPENCHAT_LOAD_WORKER_MESSAGES` | `150` | Messages per concurrent Store writer |
 | `OPENCHAT_LOAD_HTTP_CONCURRENCY` | `12` | Concurrent Plug HTTP writer tasks |
