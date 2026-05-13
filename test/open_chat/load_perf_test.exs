@@ -170,6 +170,83 @@ defmodule OpenChat.LoadPerfTest do
     assert conversation["lastReadMessageId"] == to_string(last_id)
   end
 
+  test "top public room load keeps transient visits, fanout, and history bounded" do
+    durable_members = env_int("OPENCHAT_LOAD_TOP_ROOM_DURABLE_MEMBERS", 80)
+    visitors = env_int("OPENCHAT_LOAD_TOP_ROOM_VISITORS", 1_000)
+    messages = env_int("OPENCHAT_LOAD_TOP_ROOM_MESSAGES", 800)
+    retained = env_int("OPENCHAT_LOAD_TOP_ROOM_RETAINED_MESSAGES", 120)
+    fanout_limit = env_int("OPENCHAT_LOAD_TOP_ROOM_FANOUT_LIMIT", 20)
+    concurrency = env_int("OPENCHAT_LOAD_TOP_ROOM_CONCURRENCY", 32)
+    minimum = env_int("OPENCHAT_MIN_TOP_ROOM_OP_PER_SEC", 150)
+    guid = "top-public-room"
+    member_uids = Enum.map(1..durable_members, &"top-room-member-#{&1}")
+    visitor_uids = Enum.map(1..visitors, &"top-room-visitor-#{&1}")
+
+    with_open_chat_env(
+      %{
+        group_max_members: durable_members,
+        group_max_messages: retained,
+        group_message_retention_days: 365,
+        group_unread_fanout_limit: fanout_limit,
+        public_group_reads_enabled: true
+      },
+      fn ->
+        assert {:ok, _group} = Store.upsert_group(%{"guid" => guid, "type" => "public"})
+        assert {:ok, _members} = Store.add_group_members(guid, member_uids)
+
+        {_visits, visit_seconds} =
+          timed(fn ->
+            concurrent_map(visitor_uids, concurrency, fn uid ->
+              assert {:ok, view} = Store.join_group(guid, uid, %{"transient" => true})
+              assert view["transient"] == true
+              view["membersCount"]
+            end)
+          end)
+
+        assert_rate("top room transient visits", visitors, visit_seconds, minimum)
+
+        assert {:ok, members} = Store.group_members(guid)
+        assert length(members) == durable_members
+        assert {:ok, []} = Store.groups_for_user(List.first(visitor_uids))
+
+        {sent, message_seconds} =
+          timed(fn ->
+            concurrent_map(1..messages, concurrency, fn i ->
+              sender = Enum.at(member_uids, rem(i, durable_members))
+
+              assert {:ok, message} =
+                       Store.send_message(sender, %{
+                         "receiver" => guid,
+                         "receiverType" => "group",
+                         "type" => "text",
+                         "data" => %{"text" => "top room #{i}"}
+                       })
+
+              message
+            end)
+          end)
+
+        assert_rate("top room bounded messages", messages, message_seconds, minimum)
+
+        first = Enum.min_by(sent, & &1["id"])
+        latest = Enum.max_by(sent, & &1["id"])
+
+        if messages > retained do
+          assert :error = Store.get_message(first["id"])
+        end
+
+        assert {:ok, messages_page} = Store.messages_for_group(List.first(visitor_uids), guid)
+        assert length(messages_page) == min(retained, 30)
+        assert List.first(messages_page)["id"] == latest["id"]
+
+        if durable_members > fanout_limit do
+          assert {:ok, []} =
+                   Store.unread_counts(List.last(member_uids), %{"receiverType" => "group"})
+        end
+      end
+    )
+  end
+
   test "HTTP endpoint sustains message send and fetch load through Plug" do
     messages = env_int("OPENCHAT_LOAD_HTTP_MESSAGES", 500)
     minimum = env_int("OPENCHAT_MIN_HTTP_MSG_PER_SEC", 100)
@@ -521,6 +598,29 @@ defmodule OpenChat.LoadPerfTest do
       {:exit, reason} ->
         flunk("concurrent load task failed: #{Exception.format_exit(reason)}")
     end)
+  end
+
+  defp with_open_chat_env(overrides, fun) do
+    previous =
+      Map.new(overrides, fn {key, _value} ->
+        {key, Application.get_env(:open_chat, key)}
+      end)
+
+    Enum.each(overrides, fn {key, value} ->
+      Application.put_env(:open_chat, key, value)
+    end)
+
+    try do
+      Store.reset!()
+      fun.()
+    after
+      Enum.each(previous, fn
+        {key, nil} -> Application.delete_env(:open_chat, key)
+        {key, value} -> Application.put_env(:open_chat, key, value)
+      end)
+
+      Store.reset!()
+    end
   end
 
   defp env_int(name, default) do

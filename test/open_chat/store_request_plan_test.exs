@@ -1,5 +1,5 @@
 defmodule OpenChat.StoreRequestPlanTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   alias OpenChat.Store.{AuthTokens, Conversations, RequestPlan}
 
@@ -250,5 +250,46 @@ defmodule OpenChat.StoreRequestPlanTest do
              {"unread_counts", "bob"},
              {"unread_counts", "carol"}
            ]
+  end
+
+  test "large group send follow-up refreshes cap unread buckets to the sender" do
+    with_open_chat_env(%{group_unread_fanout_limit: 2}, fn ->
+      state = %{
+        "members" => %{
+          "room" => %{
+            "alice" => %{"uid" => "alice"},
+            "bob" => %{"uid" => "bob"},
+            "carol" => %{"uid" => "carol"}
+          }
+        }
+      }
+
+      assert RequestPlan.followup_refresh(
+               {:send_message, "alice",
+                %{"receiver" => "room", "receiverType" => "group", "data" => %{"text" => "hi"}},
+                [], []},
+               state
+             ) == [{"unread_counts", "alice"}]
+    end)
+  end
+
+  defp with_open_chat_env(overrides, fun) do
+    previous =
+      Map.new(overrides, fn {key, _value} ->
+        {key, Application.get_env(:open_chat, key)}
+      end)
+
+    Enum.each(overrides, fn {key, value} ->
+      Application.put_env(:open_chat, key, value)
+    end)
+
+    try do
+      fun.()
+    after
+      Enum.each(previous, fn
+        {key, nil} -> Application.delete_env(:open_chat, key)
+        {key, value} -> Application.put_env(:open_chat, key, value)
+      end)
+    end
   end
 end

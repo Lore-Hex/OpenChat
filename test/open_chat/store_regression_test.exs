@@ -167,6 +167,12 @@ defmodule OpenChat.StoreRegressionTest do
     assert {:ok, _data} = Store.ban_group_member("scoped-room", "bob")
     assert {:ok, [%{"uid" => "bob"}]} = Store.banned_group_members("scoped-room")
 
+    assert {:error, %{"code" => "ERR_FORBIDDEN"}} =
+             Store.join_group("scoped-room", "bob", %{})
+
+    assert {:error, %{"code" => "ERR_NOT_A_MEMBER"}} =
+             Store.messages_for_group("bob", "scoped-room")
+
     assert {:ok, members} = Store.group_members("scoped-room")
     refute Enum.any?(members, &(&1["uid"] == "bob"))
 
@@ -225,6 +231,160 @@ defmodule OpenChat.StoreRegressionTest do
 
     assert {:ok, messages} = Store.messages_for_group("bob", guid, %{"limit" => 10})
     assert Enum.map(messages, & &1["id"]) == [second["id"], first["id"]]
+  end
+
+  test "popular public rooms keep visitors transient and cap durable members" do
+    with_open_chat_env(
+      %{
+        group_max_members: 2,
+        group_unread_fanout_limit: 2,
+        public_group_reads_enabled: true
+      },
+      fn ->
+        guid = "popular-room"
+
+        assert {:ok, _group} = Store.upsert_group(%{"guid" => guid, "type" => "public"})
+        assert {:ok, _members} = Store.add_group_members(guid, ["alice", "bob"])
+
+        assert {:ok, %{"success" => %{"carol" => %{"success" => false, "code" => code}}}} =
+                 Store.add_group_members(guid, ["carol"])
+
+        assert code == "ERR_LIMIT_EXCEEDED"
+
+        assert {:error, %{"code" => "ERR_LIMIT_EXCEEDED"}} =
+                 Store.join_group(guid, "durable-visitor", %{"durable" => true})
+
+        assert {:ok,
+                %{"success" => false, "failed" => %{"dave" => %{"code" => "ERR_LIMIT_EXCEEDED"}}}} =
+                 Store.set_group_scopes(guid, %{"uids" => ["dave"]})
+
+        assert {:ok, visitor_view} =
+                 Store.join_group(guid, "visitor-1", %{"transient" => true})
+
+        assert visitor_view["hasJoined"] == true
+        assert visitor_view["transient"] == true
+        assert visitor_view["membersCount"] == 2
+
+        assert {:ok, members} = Store.group_members(guid)
+        assert Enum.map(members, & &1["uid"]) == ["alice", "bob"]
+
+        assert {:ok, []} = Store.groups_for_user("visitor-1")
+
+        assert {:ok, message} =
+                 Store.send_message("alice", %{
+                   "receiver" => guid,
+                   "receiverType" => "group",
+                   "data" => %{"text" => "bounded room"}
+                 })
+
+        assert {:ok, [%{"entityId" => ^guid, "count" => 1}]} =
+                 Store.unread_counts("bob", %{"receiverType" => "group"})
+
+        assert {:ok, []} = Store.unread_counts("visitor-1", %{"receiverType" => "group"})
+
+        assert {:ok, [^message]} = Store.messages_for_group("visitor-1", guid, %{"limit" => 1})
+
+        assert {:error, %{"code" => "ERR_NOT_A_MEMBER"}} =
+                 Store.send_message("visitor-1", %{
+                   "receiver" => guid,
+                   "receiverType" => "group",
+                   "data" => %{"text" => "no durable membership"}
+                 })
+      end
+    )
+  end
+
+  test "large public groups skip per-member unread fanout while preserving conversation reads" do
+    with_open_chat_env(
+      %{group_max_members: 5, group_max_messages: 2, group_unread_fanout_limit: 2},
+      fn ->
+        guid = "large-fanout-room"
+
+        assert {:ok, _group} = Store.upsert_group(%{"guid" => guid, "type" => "public"})
+        assert {:ok, _members} = Store.add_group_members(guid, ["alice", "bob", "carol"])
+
+        sent =
+          for i <- 1..3 do
+            assert {:ok, message} =
+                     Store.send_message("alice", %{
+                       "receiver" => guid,
+                       "receiverType" => "group",
+                       "data" => %{"text" => "broadcast without unread fanout #{i}"}
+                     })
+
+            message
+          end
+
+        first = List.first(sent)
+        latest = List.last(sent)
+
+        assert {:ok, []} = Store.unread_counts("bob", %{"receiverType" => "group"})
+        assert {:ok, []} = Store.unread_counts("carol", %{"receiverType" => "group"})
+        assert :error = Store.get_message(first["id"])
+
+        assert {:ok, [conversation]} =
+                 Store.conversations("bob", %{"conversationType" => "group"})
+
+        assert conversation["latestMessageId"] == to_string(latest["id"])
+        assert conversation["unreadMessageCount"] == 0
+
+        assert {:ok, [^latest]} = Store.messages_for_group("carol", guid, %{"limit" => 1})
+      end
+    )
+  end
+
+  test "group message retention trims old records and resyncs unread counts" do
+    with_open_chat_env(
+      %{
+        group_max_messages: 3,
+        group_message_retention_days: 365,
+        group_unread_fanout_limit: 10
+      },
+      fn ->
+        guid = "retention-room"
+
+        assert {:ok, _group} = Store.upsert_group(%{"guid" => guid, "type" => "public"})
+        assert {:ok, _members} = Store.add_group_members(guid, ["alice", "bob"])
+
+        sent =
+          for i <- 1..5 do
+            assert {:ok, message} =
+                     Store.send_message("alice", %{
+                       "receiver" => guid,
+                       "receiverType" => "group",
+                       "muid" => "retention-#{i}",
+                       "data" => %{"text" => "retained #{i}"}
+                     })
+
+            message
+          end
+
+        first = List.first(sent)
+        latest = List.last(sent)
+
+        assert {:ok, messages} = Store.messages_for_group("bob", guid, %{"limit" => 10})
+
+        assert Enum.map(messages, &get_in(&1, ["data", "text"])) == [
+                 "retained 5",
+                 "retained 4",
+                 "retained 3"
+               ]
+
+        assert :error = Store.get_message(first["id"])
+        assert :error = Store.find_message_by_muid("retention-1")
+        assert {:ok, fetched_latest} = Store.find_message_by_muid("retention-5")
+        assert fetched_latest["id"] == latest["id"]
+
+        assert {:ok, [%{"entityId" => ^guid, "count" => 3}]} =
+                 Store.unread_counts("bob", %{"receiverType" => "group"})
+
+        assert {:ok, [conversation]} =
+                 Store.conversations("bob", %{"conversationType" => "group"})
+
+        assert conversation["latestMessageId"] == to_string(latest["id"])
+        assert conversation["unreadMessageCount"] == 3
+      end
+    )
   end
 
   test "message validation, deterministic pagination, cursor filters, and hidden deletes" do
@@ -919,5 +1079,28 @@ defmodule OpenChat.StoreRegressionTest do
 
     assert {:ok, %{"guid" => "server-created", "type" => "public"}} =
              Store.get_group("server-created")
+  end
+
+  defp with_open_chat_env(overrides, fun) do
+    previous =
+      Map.new(overrides, fn {key, _value} ->
+        {key, Application.get_env(:open_chat, key)}
+      end)
+
+    Enum.each(overrides, fn {key, value} ->
+      Application.put_env(:open_chat, key, value)
+    end)
+
+    try do
+      Store.reset!()
+      fun.()
+    after
+      Enum.each(previous, fn
+        {key, nil} -> Application.delete_env(:open_chat, key)
+        {key, value} -> Application.put_env(:open_chat, key, value)
+      end)
+
+      Store.reset!()
+    end
   end
 end

@@ -680,6 +680,48 @@ defmodule OpenChat.RedisPersistenceTest do
     end)
   end
 
+  test "Redis write-through trims retained group histories and evicted message keys",
+       context do
+    with_redis(context, fn ->
+      with_open_chat_env(%{group_max_messages: 3, group_message_retention_days: 365}, fn ->
+        guid = "redis-retention-room"
+        conv_id = Conversations.group_conversation_id(guid)
+
+        assert {:ok, _group} = Store.upsert_group(%{"guid" => guid, "type" => "public"})
+        assert {:ok, _members} = Store.add_group_members(guid, ["redis-retention-a"])
+
+        sent =
+          for i <- 1..5 do
+            assert {:ok, message} =
+                     Store.send_message("redis-retention-a", %{
+                       "receiver" => guid,
+                       "receiverType" => "group",
+                       "muid" => "redis-retention-#{i}",
+                       "data" => %{"text" => "redis retained #{i}"}
+                     })
+
+            message
+          end
+
+        first = List.first(sent)
+        retained_ids = sent |> Enum.drop(2) |> Enum.map(&to_string(&1["id"]))
+        latest = List.last(sent)
+
+        assert redis_json(context, "conversation_messages", conv_id) == retained_ids
+        assert redis_json(context, "conversation_latest", conv_id) == to_string(latest["id"])
+
+        assert redis_get_raw(context, redis_key(context, "messages", first["id"])) == nil
+        assert redis_get_raw(context, redis_key(context, "reactions", first["id"])) == nil
+
+        assert redis_get_raw(context, redis_key(context, "message_muids", "redis-retention-1")) ==
+                 nil
+
+        assert redis_json(context, "message_muids", "redis-retention-5") ==
+                 to_string(latest["id"])
+      end)
+    end)
+  end
+
   test "targeted Redis refreshes enforce actor-aware message and group access", context do
     with_redis(context, fn ->
       now = OpenChat.Time.now()
@@ -996,6 +1038,29 @@ defmodule OpenChat.RedisPersistenceTest do
   end
 
   defp with_redis(_context, fun), do: fun.()
+
+  defp with_open_chat_env(overrides, fun) do
+    previous =
+      Map.new(overrides, fn {key, _value} ->
+        {key, Application.get_env(:open_chat, key)}
+      end)
+
+    Enum.each(overrides, fn {key, value} ->
+      Application.put_env(:open_chat, key, value)
+    end)
+
+    try do
+      Store.reset!()
+      fun.()
+    after
+      Enum.each(previous, fn
+        {key, nil} -> Application.delete_env(:open_chat, key)
+        {key, value} -> Application.put_env(:open_chat, key, value)
+      end)
+
+      Store.reset!()
+    end
+  end
 
   defp start_peer_store! do
     {:ok, pid} = Store.start_link(name: nil)
