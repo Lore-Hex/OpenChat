@@ -274,6 +274,31 @@ defmodule OpenChat.RedisPersistenceTest do
     end)
   end
 
+  test "refreshes local state from Redis before serving calls", context do
+    with_redis(context, fn ->
+      assert {:ok, user} =
+               Store.upsert_user(%{
+                 "uid" => "externally-updated",
+                 "name" => "Before Redis Update"
+               })
+
+      assert user["name"] == "Before Redis Update"
+
+      external_user =
+        user
+        |> Map.put("name", "After Redis Update")
+        |> Jason.encode!()
+
+      Redix.command!(
+        context.redis,
+        ["SET", redis_key(context, "users", "externally-updated"), external_user]
+      )
+
+      assert {:ok, updated} = Store.get_user("externally-updated")
+      assert updated["name"] == "After Redis Update"
+    end)
+  end
+
   defp with_redis(%{skip_redis?: reason}, _fun) do
     IO.puts("Skipping Redis persistence test; Redis unavailable: #{inspect(reason)}")
     :ok

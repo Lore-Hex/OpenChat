@@ -13,6 +13,7 @@ defmodule OpenChat.Application do
     children = [
       {Registry, keys: :duplicate, name: OpenChat.PubSub},
       OpenChat.Store,
+      OpenChat.RedisBus,
       {Plug.Cowboy,
        scheme: :http, plug: OpenChatWeb.Endpoint, options: [port: port, dispatch: dispatch()]}
     ]

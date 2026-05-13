@@ -22,6 +22,8 @@ defmodule OpenChat.Store.RedisPersistence do
 
   @counters ["next_id", "next_reaction_id"]
   @version "3"
+  @lock_ttl_ms 60_000
+  @lock_attempts 600
 
   def load_or_seed(default_state, seed_fun) do
     case Config.redis_url() do
@@ -36,6 +38,40 @@ defmodule OpenChat.Store.RedisPersistence do
           {:ok, _pid} -> load(default_state, seed_fun)
           {:error, reason} -> redis_failed("connection", reason, seed_fun)
         end
+    end
+  end
+
+  def enabled?, do: Process.whereis(OpenChat.Redis) != nil
+
+  def refresh(default_state, fallback_state) do
+    if enabled?() do
+      case command(["GET", meta_key()]) do
+        {:ok, nil} -> fallback_state
+        {:ok, _version} -> read_state(default_state)
+        {:error, reason} -> redis_failed("state refresh", reason, fn -> fallback_state end)
+      end
+    else
+      fallback_state
+    end
+  end
+
+  def with_lock(fun) when is_function(fun, 0) do
+    if enabled?() do
+      lock_value = Base.url_encode64(:crypto.strong_rand_bytes(24), padding: false)
+
+      case acquire_lock(lock_value, @lock_attempts) do
+        :ok ->
+          try do
+            fun.()
+          after
+            release_lock(lock_value)
+          end
+
+        {:error, reason} ->
+          raise "Redis lock failed: #{inspect(reason)}"
+      end
+    else
+      fun.()
     end
   end
 
@@ -235,6 +271,35 @@ defmodule OpenChat.Store.RedisPersistence do
     end
   end
 
+  defp acquire_lock(_lock_value, 0), do: {:error, :timeout}
+
+  defp acquire_lock(lock_value, attempts) do
+    case command(["SET", lock_key(), lock_value, "NX", "PX", to_s(@lock_ttl_ms)]) do
+      {:ok, "OK"} ->
+        :ok
+
+      {:ok, nil} ->
+        Process.sleep(50)
+        acquire_lock(lock_value, attempts - 1)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp release_lock(lock_value) do
+    script = """
+    if redis.call("GET", KEYS[1]) == ARGV[1] then
+      return redis.call("DEL", KEYS[1])
+    else
+      return 0
+    end
+    """
+
+    command(["EVAL", script, "1", lock_key(), lock_value])
+    :ok
+  end
+
   defp redis_failed(context, reason, seed_fun) do
     Logger.warning("Redis #{context} failed: #{inspect(reason)}; using seeds")
     seed_fun.()
@@ -246,6 +311,7 @@ defmodule OpenChat.Store.RedisPersistence do
     do: [Config.redis_key_prefix() | parts] |> Enum.map(&to_s/1) |> Enum.join(":")
 
   defp meta_key, do: key(["meta", "version"])
+  defp lock_key, do: key(["lock", "store"])
   defp index_key(bucket), do: key(["index", bucket])
   defp record_key(bucket, id), do: key([bucket, id])
   defp counter_key(counter), do: key(["counter", counter])

@@ -33,127 +33,117 @@ defmodule OpenChat.Store do
 
   def start_link(opts \\ []), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
-  def reset!, do: GenServer.call(__MODULE__, :reset)
-  def get_user(uid), do: GenServer.call(__MODULE__, {:get_user, to_s(uid)})
+  def reset!, do: call(:reset)
+  def get_user(uid), do: call({:get_user, to_s(uid)})
 
   def get_user_for(viewer_uid, uid),
-    do: GenServer.call(__MODULE__, {:get_user_for, to_s(viewer_uid), to_s(uid)})
+    do: call({:get_user_for, to_s(viewer_uid), to_s(uid)})
 
-  def ensure_user(uid), do: GenServer.call(__MODULE__, {:ensure_user, to_s(uid)})
-  def upsert_user(attrs), do: GenServer.call(__MODULE__, {:upsert_user, attrs})
-  def list_users(params \\ %{}), do: GenServer.call(__MODULE__, {:list_users, params})
-  def delete_user(uid), do: GenServer.call(__MODULE__, {:delete_user, to_s(uid)})
-  def reactivate_users(uids), do: GenServer.call(__MODULE__, {:reactivate_users, uids})
-  def block_users(uid, uids), do: GenServer.call(__MODULE__, {:block_users, to_s(uid), uids})
-  def unblock_users(uid, uids), do: GenServer.call(__MODULE__, {:unblock_users, to_s(uid), uids})
+  def ensure_user(uid), do: call({:ensure_user, to_s(uid)})
+  def upsert_user(attrs), do: call({:upsert_user, attrs})
+  def list_users(params \\ %{}), do: call({:list_users, params})
+  def delete_user(uid), do: call({:delete_user, to_s(uid)})
+  def reactivate_users(uids), do: call({:reactivate_users, uids})
+  def block_users(uid, uids), do: call({:block_users, to_s(uid), uids})
+  def unblock_users(uid, uids), do: call({:unblock_users, to_s(uid), uids})
 
   def blocked_users(uid, params \\ %{}),
-    do: GenServer.call(__MODULE__, {:blocked_users, to_s(uid), params})
+    do: call({:blocked_users, to_s(uid), params})
 
-  def create_auth_token(uid), do: GenServer.call(__MODULE__, {:create_auth_token, to_s(uid)})
-  def revoke_auth_token(token), do: GenServer.call(__MODULE__, {:revoke_auth_token, token})
-  def authenticate(token), do: GenServer.call(__MODULE__, {:authenticate, token})
-  def me(token), do: GenServer.call(__MODULE__, {:me, token})
+  def create_auth_token(uid), do: call({:create_auth_token, to_s(uid)})
+  def revoke_auth_token(token), do: call({:revoke_auth_token, token})
+  def authenticate(token), do: call({:authenticate, token})
+  def me(token), do: call({:me, token})
 
-  def upsert_group(attrs), do: GenServer.call(__MODULE__, {:upsert_group, attrs})
-  def get_group(guid), do: GenServer.call(__MODULE__, {:get_group, to_s(guid)})
-  def list_groups(params \\ %{}), do: GenServer.call(__MODULE__, {:list_groups, params})
-  def delete_group(guid), do: GenServer.call(__MODULE__, {:delete_group, to_s(guid)})
+  def upsert_group(attrs), do: call({:upsert_group, attrs})
+  def get_group(guid), do: call({:get_group, to_s(guid)})
+  def list_groups(params \\ %{}), do: call({:list_groups, params})
+  def delete_group(guid), do: call({:delete_group, to_s(guid)})
 
   def join_group(guid, uid, params \\ %{}),
-    do: GenServer.call(__MODULE__, {:join_group, to_s(guid), to_s(uid), params})
+    do: call({:join_group, to_s(guid), to_s(uid), params})
 
   def leave_group(guid, uid),
-    do: GenServer.call(__MODULE__, {:leave_group, to_s(guid), to_s(uid)})
+    do: call({:leave_group, to_s(guid), to_s(uid)})
 
   def add_group_members(guid, uids, scope \\ "participant"),
-    do: GenServer.call(__MODULE__, {:add_group_members, to_s(guid), uids, scope})
+    do: call({:add_group_members, to_s(guid), uids, scope})
 
   def group_members(guid, params \\ %{}),
-    do: GenServer.call(__MODULE__, {:group_members, to_s(guid), params})
+    do: call({:group_members, to_s(guid), params})
 
-  def groups_for_user(uid), do: GenServer.call(__MODULE__, {:groups_for_user, to_s(uid)})
+  def groups_for_user(uid), do: call({:groups_for_user, to_s(uid)})
 
   def set_group_scopes(guid, scope_map),
-    do: GenServer.call(__MODULE__, {:set_group_scopes, to_s(guid), scope_map})
+    do: call({:set_group_scopes, to_s(guid), scope_map})
 
   def ban_group_member(guid, uid),
-    do: GenServer.call(__MODULE__, {:ban_group_member, to_s(guid), to_s(uid)})
+    do: call({:ban_group_member, to_s(guid), to_s(uid)})
 
   def unban_group_member(guid, uid),
-    do: GenServer.call(__MODULE__, {:unban_group_member, to_s(guid), to_s(uid)})
+    do: call({:unban_group_member, to_s(guid), to_s(uid)})
 
   def banned_group_members(guid, params \\ %{}),
-    do: GenServer.call(__MODULE__, {:banned_group_members, to_s(guid), params})
+    do: call({:banned_group_members, to_s(guid), params})
 
   def send_message(sender_uid, params, uploads \\ [], opts \\ []),
-    do: GenServer.call(__MODULE__, {:send_message, to_s(sender_uid), params, uploads, opts})
+    do: call({:send_message, to_s(sender_uid), params, uploads, opts})
 
   def edit_message(uid, id, params),
-    do: GenServer.call(__MODULE__, {:edit_message, to_s(uid), to_s(id), params})
+    do: call({:edit_message, to_s(uid), to_s(id), params})
 
   def delete_message(uid, id),
-    do: GenServer.call(__MODULE__, {:delete_message, to_s(uid), to_s(id)})
+    do: call({:delete_message, to_s(uid), to_s(id)})
 
   def delete_conversation(conversation_id),
-    do: GenServer.call(__MODULE__, {:delete_conversation, to_s(conversation_id)})
+    do: call({:delete_conversation, to_s(conversation_id)})
 
   def hide_conversation(uid, receiver_type, receiver_id),
-    do:
-      GenServer.call(
-        __MODULE__,
-        {:hide_conversation, to_s(uid), to_s(receiver_type), to_s(receiver_id)}
-      )
+    do: call({:hide_conversation, to_s(uid), to_s(receiver_type), to_s(receiver_id)})
 
-  def get_message(id), do: GenServer.call(__MODULE__, {:get_message, to_s(id)})
+  def get_message(id), do: call({:get_message, to_s(id)})
 
   def find_message_by_muid(muid),
-    do: GenServer.call(__MODULE__, {:find_message_by_muid, to_s(muid)})
+    do: call({:find_message_by_muid, to_s(muid)})
 
   def messages_for_user(uid, peer_uid, params \\ %{}),
-    do: GenServer.call(__MODULE__, {:messages_for_user, to_s(uid), to_s(peer_uid), params})
+    do: call({:messages_for_user, to_s(uid), to_s(peer_uid), params})
 
   def messages_for_group(uid, guid, params \\ %{}),
-    do: GenServer.call(__MODULE__, {:messages_for_group, to_s(uid), to_s(guid), params})
+    do: call({:messages_for_group, to_s(uid), to_s(guid), params})
 
   def messages_for_thread(uid, parent_id, params \\ %{}),
-    do: GenServer.call(__MODULE__, {:messages_for_thread, to_s(uid), to_s(parent_id), params})
+    do: call({:messages_for_thread, to_s(uid), to_s(parent_id), params})
 
   def mark_read(uid, receiver_type, receiver_id, message_id),
-    do:
-      GenServer.call(
-        __MODULE__,
-        {:mark_read, to_s(uid), to_s(receiver_type), to_s(receiver_id), to_s(message_id)}
-      )
+    do: call({:mark_read, to_s(uid), to_s(receiver_type), to_s(receiver_id), to_s(message_id)})
 
   def mark_unread(uid, receiver_type, receiver_id, message_id),
-    do:
-      GenServer.call(
-        __MODULE__,
-        {:mark_unread, to_s(uid), to_s(receiver_type), to_s(receiver_id), to_s(message_id)}
-      )
+    do: call({:mark_unread, to_s(uid), to_s(receiver_type), to_s(receiver_id), to_s(message_id)})
 
   def unread_counts(uid, params \\ %{}),
-    do: GenServer.call(__MODULE__, {:unread_counts, to_s(uid), params})
+    do: call({:unread_counts, to_s(uid), params})
 
   def conversations(uid, params \\ %{}),
-    do: GenServer.call(__MODULE__, {:conversations, to_s(uid), params})
+    do: call({:conversations, to_s(uid), params})
 
   def conversation(uid, receiver_type, receiver_id),
-    do:
-      GenServer.call(
-        __MODULE__,
-        {:conversation, to_s(uid), to_s(receiver_type), to_s(receiver_id)}
-      )
+    do: call({:conversation, to_s(uid), to_s(receiver_type), to_s(receiver_id)})
 
   def add_reaction(uid, id, reaction),
-    do: GenServer.call(__MODULE__, {:add_reaction, to_s(uid), to_s(id), reaction})
+    do: call({:add_reaction, to_s(uid), to_s(id), reaction})
 
   def remove_reaction(uid, id, reaction),
-    do: GenServer.call(__MODULE__, {:remove_reaction, to_s(uid), to_s(id), reaction})
+    do: call({:remove_reaction, to_s(uid), to_s(id), reaction})
 
   def reactions(uid, id, reaction \\ nil),
-    do: GenServer.call(__MODULE__, {:reactions, to_s(uid), to_s(id), reaction})
+    do: call({:reactions, to_s(uid), to_s(id), reaction})
+
+  defp call(request) do
+    RedisPersistence.with_lock(fn ->
+      GenServer.call(__MODULE__, {:locked_call, request}, :infinity)
+    end)
+  end
 
   # GenServer
 
@@ -164,6 +154,11 @@ defmodule OpenChat.Store do
   end
 
   @impl true
+  def handle_call({:locked_call, request}, from, state) do
+    request
+    |> handle_call(from, RedisPersistence.refresh(@default_state, state))
+  end
+
   def handle_call(:reset, _from, _state) do
     state = seed_state()
     persist(state)

@@ -1,0 +1,406 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Scalable OpenChat on ECS Fargate with ALB TLS, Redis, and EFS uploads.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    AllowedPattern: "^[a-z0-9-]+$"
+  DomainName:
+    Type: String
+  HostedZoneId:
+    Type: String
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet::Id
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet::Id
+  ImageUri:
+    Type: String
+  AdminApiKey:
+    Type: String
+    NoEcho: true
+  DesiredCount:
+    Type: Number
+    Default: 2
+  MinCapacity:
+    Type: Number
+    Default: 2
+  MaxCapacity:
+    Type: Number
+    Default: 6
+  TaskCpu:
+    Type: String
+    Default: "512"
+  TaskMemory:
+    Type: String
+    Default: "1024"
+  RedisNodeType:
+    Type: String
+    Default: cache.t4g.micro
+
+Resources:
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub openchat-${EnvironmentName}
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/openchat-${EnvironmentName}
+      RetentionInDays: 30
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub OpenChat-${EnvironmentName}-ExecutionRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub OpenChat-${EnvironmentName}-TaskRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub OpenChat ${EnvironmentName} ALB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  ServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub OpenChat ${EnvironmentName} tasks
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 4000
+          ToPort: 4000
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  RedisSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub OpenChat ${EnvironmentName} Redis
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref ServiceSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  EfsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub OpenChat ${EnvironmentName} EFS
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref ServiceSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  RedisSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: !Sub OpenChat ${EnvironmentName} Redis subnets
+      SubnetIds:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+
+  Redis:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      ReplicationGroupDescription: !Sub OpenChat ${EnvironmentName}
+      Engine: redis
+      CacheNodeType: !Ref RedisNodeType
+      NumNodeGroups: 1
+      ReplicasPerNodeGroup: 1
+      AutomaticFailoverEnabled: true
+      MultiAZEnabled: true
+      AtRestEncryptionEnabled: true
+      CacheSubnetGroupName: !Ref RedisSubnetGroup
+      SecurityGroupIds:
+        - !Ref RedisSecurityGroup
+
+  UploadsFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub openchat-${EnvironmentName}-uploads
+
+  UploadsAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref UploadsFileSystem
+      PosixUser:
+        Uid: "0"
+        Gid: "0"
+      RootDirectory:
+        Path: /uploads
+        CreationInfo:
+          OwnerUid: "0"
+          OwnerGid: "0"
+          Permissions: "0755"
+
+  UploadsMountTarget1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref UploadsFileSystem
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroups:
+        - !Ref EfsSecurityGroup
+
+  UploadsMountTarget2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref UploadsFileSystem
+      SubnetId: !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref EfsSecurityGroup
+
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref HostedZoneId
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub openchat-${EnvironmentName}
+      Scheme: internet-facing
+      Type: application
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub openchat-${EnvironmentName}
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: 4000
+      TargetType: ip
+      HealthCheckEnabled: true
+      HealthCheckPath: /v3.0/settings
+      HealthCheckProtocol: HTTP
+      Matcher:
+        HttpCode: "200"
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig:
+            Protocol: HTTPS
+            Port: "443"
+            StatusCode: HTTP_301
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref Certificate
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  DnsRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt LoadBalancer.DNSName
+        HostedZoneId: !GetAtt LoadBalancer.CanonicalHostedZoneID
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn:
+      - UploadsMountTarget1
+      - UploadsMountTarget2
+    Properties:
+      Family: !Sub openchat-${EnvironmentName}
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      RuntimePlatform:
+        CpuArchitecture: ARM64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      Volumes:
+        - Name: uploads
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref UploadsFileSystem
+            TransitEncryption: ENABLED
+            AuthorizationConfig:
+              AccessPointId: !Ref UploadsAccessPoint
+              IAM: DISABLED
+      ContainerDefinitions:
+        - Name: openchat
+          Image: !Ref ImageUri
+          Essential: true
+          PortMappings:
+            - ContainerPort: 4000
+              Protocol: tcp
+          MountPoints:
+            - SourceVolume: uploads
+              ContainerPath: /app/priv/static/uploads
+              ReadOnly: false
+          Environment:
+            - Name: PORT
+              Value: "4000"
+            - Name: PUBLIC_HOST
+              Value: !Ref DomainName
+            - Name: PUBLIC_WS_PORT
+              Value: "443"
+            - Name: COMETCHAT_REGION
+              Value: us
+            - Name: COMETCHAT_API_KEY
+              Value: !Ref AdminApiKey
+            - Name: ACCEPT_UID_TOKENS
+              Value: "false"
+            - Name: SEED_USERS_JSON
+              Value: "[]"
+            - Name: SEED_GROUPS_JSON
+              Value: "[]"
+            - Name: REDIS_URL
+              Value: !Sub
+                - redis://${Host}:6379/0
+                - Host: !GetAtt Redis.PrimaryEndPoint.Address
+            - Name: REDIS_KEY_PREFIX
+              Value: !Sub open_chat:${EnvironmentName}
+            - Name: UPLOAD_DIR
+              Value: /app/priv/static/uploads
+            - Name: EXTENSION_DOMAIN
+              Value: !Ref DomainName
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: openchat
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - HttpsListener
+      - Redis
+    Properties:
+      ServiceName: openchat
+      Cluster: !Ref Cluster
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      HealthCheckGracePeriodSeconds: 120
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref ServiceSecurityGroup
+          Subnets:
+            - !Ref PublicSubnet1
+            - !Ref PublicSubnet2
+      LoadBalancers:
+        - ContainerName: openchat
+          ContainerPort: 4000
+          TargetGroupArn: !Ref TargetGroup
+      TaskDefinition: !Ref TaskDefinition
+
+  ScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: !Ref MaxCapacity
+      MinCapacity: !Ref MinCapacity
+      ResourceId: !Join
+        - ""
+        - - service/
+          - !Ref Cluster
+          - /
+          - !GetAtt Service.Name
+      RoleARN: !Sub arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  CpuScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub openchat-${EnvironmentName}-cpu
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 60
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+
+Outputs:
+  Endpoint:
+    Value: !Sub https://${DomainName}
+  ClusterName:
+    Value: !Ref Cluster
+  ServiceName:
+    Value: !GetAtt Service.Name
+  RedisPrimaryEndpoint:
+    Value: !GetAtt Redis.PrimaryEndPoint.Address
+  LoadBalancerDnsName:
+    Value: !GetAtt LoadBalancer.DNSName
