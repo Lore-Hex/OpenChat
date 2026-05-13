@@ -134,6 +134,7 @@ defmodule OpenChat.Store.Indexes do
       state
       |> get_in(["user_conversations", uid])
       |> List.wrap()
+      |> Enum.reject(&(to_s(&1) |> String.starts_with?("group_")))
 
     groups =
       state

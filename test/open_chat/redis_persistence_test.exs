@@ -267,6 +267,60 @@ defmodule OpenChat.RedisPersistenceTest do
     end)
   end
 
+  test "legacy snapshots rebuild latest-message and unread indexes", context do
+    with_redis(context, fn ->
+      conv_id = Conversations.user_conversation_id("legacy-a", "legacy-b")
+
+      legacy_message = %{
+        "id" => 41,
+        "sender" => "legacy-a",
+        "receiver" => "legacy-b",
+        "receiverType" => "user",
+        "type" => "text",
+        "category" => "message",
+        "data" => %{"text" => "legacy indexed", "reactions" => []},
+        "sentAt" => 123,
+        "updatedAt" => 123,
+        "conversationId" => conv_id
+      }
+
+      legacy_state = %{
+        "users" => %{
+          "legacy-a" => %{"uid" => "legacy-a", "name" => "Legacy A"},
+          "legacy-b" => %{"uid" => "legacy-b", "name" => "Legacy B"}
+        },
+        "tokens" => %{},
+        "groups" => %{},
+        "members" => %{},
+        "messages" => %{"41" => legacy_message},
+        "conversation_messages" => %{conv_id => ["41"]},
+        "thread_messages" => %{},
+        "reads" => %{},
+        "delivered" => %{},
+        "hidden_conversations" => %{},
+        "reactions" => %{},
+        "blocks" => %{},
+        "banned" => %{},
+        "next_id" => 42,
+        "next_reaction_id" => 1
+      }
+
+      Redix.command!(context.redis, ["DEL", redis_key(context, "meta", "version")])
+      Redix.command!(context.redis, ["SET", context.snapshot_key, Jason.encode!(legacy_state)])
+
+      restart_store!()
+
+      assert {:ok, [conversation]} = Store.conversations("legacy-b", %{"limit" => 1})
+      assert conversation["latestMessageId"] == "41"
+      assert conversation["unreadMessageCount"] == 1
+      assert get_in(conversation, ["lastMessage", "data", "text"]) == "legacy indexed"
+
+      assert redis_json(context, "conversation_latest", conv_id) == "41"
+      assert redis_json(context, "unread_counts", "legacy-b") == %{conv_id => 1}
+      assert redis_get(context, "meta", "version") == "7"
+    end)
+  end
+
   test "removes deleted token, conversation, member, ban, block, and reaction records from indexes",
        context do
     with_redis(context, fn ->
@@ -776,6 +830,51 @@ defmodule OpenChat.RedisPersistenceTest do
         assert {:ok, []} = Store.call_on(peer, {:unread_counts, "multi-a", %{}})
         assert redis_get_raw(context, redis_key(context, "unread_counts", "multi-a")) == nil
         assert redis_json(context, "unread_counts", "multi-b") == %{conv_id => 1}
+      after
+        stop_peer_store(peer)
+      end
+    end)
+  end
+
+  test "peer Store processes observe edit and delete actions through latest indexes", context do
+    with_redis(context, fn ->
+      peer = start_peer_store!()
+
+      try do
+        conv_id = Conversations.user_conversation_id("action-a", "action-b")
+
+        assert {:ok, original} =
+                 Store.send_message("action-a", %{
+                   "receiver" => "action-b",
+                   "receiverType" => "user",
+                   "data" => %{"text" => "before edit"}
+                 })
+
+        assert {:ok, edited} =
+                 Store.edit_message("action-a", original["id"], %{
+                   "data" => %{"text" => "after edit"}
+                 })
+
+        assert edited["data"]["action"] == "edited"
+        assert redis_json(context, "conversation_latest", conv_id) == to_string(edited["id"])
+
+        assert {:ok, [peer_conversation]} =
+                 Store.call_on(peer, {:conversations, "action-b", %{"limit" => 1}})
+
+        assert peer_conversation["latestMessageId"] == to_string(edited["id"])
+        assert get_in(peer_conversation, ["lastMessage", "data", "action"]) == "edited"
+        assert peer_conversation["unreadMessageCount"] == 2
+
+        assert {:ok, deleted} =
+                 Store.call_on(peer, {:delete_message, "action-a", to_string(original["id"]), []})
+
+        assert deleted["data"]["action"] == "deleted"
+        assert redis_json(context, "conversation_latest", conv_id) == to_string(deleted["id"])
+
+        assert {:ok, [primary_conversation]} = Store.conversations("action-b", %{"limit" => 1})
+        assert primary_conversation["latestMessageId"] == to_string(deleted["id"])
+        assert get_in(primary_conversation, ["lastMessage", "data", "action"]) == "deleted"
+        assert primary_conversation["unreadMessageCount"] == 2
       after
         stop_peer_store(peer)
       end

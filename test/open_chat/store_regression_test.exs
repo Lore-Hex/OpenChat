@@ -177,6 +177,56 @@ defmodule OpenChat.StoreRegressionTest do
     assert Enum.any?(groups, &(&1["guid"] == "scoped-room"))
   end
 
+  test "group unread counters are per-member and resync on membership changes" do
+    guid = "unread-membership-room"
+
+    assert {:ok, _group} = Store.upsert_group(%{"guid" => guid, "type" => "public"})
+    assert {:ok, _members} = Store.add_group_members(guid, ["alice", "bob"])
+
+    assert {:ok, first} =
+             Store.send_message("alice", %{
+               "receiver" => guid,
+               "receiverType" => "group",
+               "data" => %{"text" => "first"}
+             })
+
+    assert {:ok, second} =
+             Store.send_message("alice", %{
+               "receiver" => guid,
+               "receiverType" => "group",
+               "data" => %{"text" => "second"}
+             })
+
+    assert {:ok, [%{"entityId" => ^guid, "entityType" => "group", "count" => 2}]} =
+             Store.unread_counts("bob", %{"receiverType" => "group"})
+
+    assert {:ok, []} = Store.unread_counts("alice", %{"receiverType" => "group"})
+
+    assert {:ok, _added} = Store.add_group_members(guid, ["carol"])
+
+    assert {:ok, [%{"entityId" => ^guid, "count" => 2}]} =
+             Store.unread_counts("carol", %{"receiverType" => "group"})
+
+    assert {:ok, conversation} = Store.conversation("carol", "group", guid)
+    assert conversation["latestMessageId"] == to_string(second["id"])
+    assert conversation["unreadMessageCount"] == 2
+
+    assert {:ok, _read} = Store.mark_read("carol", "group", guid, second["id"])
+    assert {:ok, []} = Store.unread_counts("carol", %{"receiverType" => "group"})
+
+    assert {:ok, _left} = Store.leave_group(guid, "bob")
+    assert {:ok, []} = Store.unread_counts("bob", %{"receiverType" => "group"})
+    assert {:ok, []} = Store.conversations("bob", %{"conversationType" => "group"})
+
+    assert {:ok, _readded} = Store.add_group_members(guid, ["bob"])
+
+    assert {:ok, [%{"entityId" => ^guid, "count" => 2}]} =
+             Store.unread_counts("bob", %{"receiverType" => "group"})
+
+    assert {:ok, messages} = Store.messages_for_group("bob", guid, %{"limit" => 10})
+    assert Enum.map(messages, & &1["id"]) == [second["id"], first["id"]]
+  end
+
   test "message validation, deterministic pagination, cursor filters, and hidden deletes" do
     assert {:error, %{"code" => "MISSING_PARAMETERS"}} =
              Store.send_message("alice", %{"receiverType" => "user"})

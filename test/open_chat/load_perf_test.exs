@@ -364,6 +364,63 @@ defmodule OpenChat.LoadPerfTest do
     end)
   end
 
+  test "mixed Redis peer writes and cursor reads keep unread indexes hot" do
+    with_redis(fn _context ->
+      peer = start_peer_store!()
+
+      try do
+        lanes = env_int("OPENCHAT_LOAD_REDIS_MIXED_LANES", 8)
+        per_lane = env_int("OPENCHAT_LOAD_REDIS_MIXED_MESSAGES_PER_LANE", 20)
+        concurrency = env_int("OPENCHAT_LOAD_REDIS_MIXED_CONCURRENCY", 10)
+        total = lanes * per_lane
+        minimum = env_int("OPENCHAT_MIN_REDIS_MIXED_OP_PER_SEC", 20)
+
+        {_ids, write_seconds} =
+          timed(fn ->
+            concurrent_map(1..total, concurrency, fn i ->
+              lane = rem(i, lanes)
+              sender = "redis-mixed-#{lane}-a"
+              receiver = "redis-mixed-#{lane}-b"
+              request = {:send_message, sender, mixed_message(receiver, i), [], []}
+
+              if rem(i, 2) == 0 do
+                assert {:ok, message} = Store.send_message(sender, mixed_message(receiver, i))
+                message["id"]
+              else
+                assert {:ok, message} = Store.call_on(peer, request)
+                message["id"]
+              end
+            end)
+          end)
+
+        {read_results, read_seconds} =
+          timed(fn ->
+            concurrent_map(0..(lanes - 1), concurrency, fn lane ->
+              uid = "redis-mixed-#{lane}-b"
+
+              assert {:ok, [%{"count" => ^per_lane}]} =
+                       Store.call_on(peer, {:unread_counts, uid, %{}})
+
+              assert {:ok, [conversation]} = Store.conversations(uid, %{"limit" => 1})
+              assert conversation["unreadMessageCount"] == per_lane
+              conversation["latestMessageId"]
+            end)
+          end)
+
+        assert length(read_results) == lanes
+
+        assert_rate(
+          "Redis mixed peer write/read ops",
+          total + lanes * 2,
+          write_seconds + read_seconds,
+          minimum
+        )
+      after
+        stop_peer_store(peer)
+      end
+    end)
+  end
+
   test "concurrent Redis secondary-index reads stay consistent under write-through load" do
     with_redis(fn context ->
       concurrency = env_int("OPENCHAT_LOAD_REDIS_INDEX_CONCURRENCY", 8)
@@ -480,6 +537,15 @@ defmodule OpenChat.LoadPerfTest do
   end
 
   defp load_user(i, users), do: "load-user-#{rem(i, users)}"
+
+  defp mixed_message(receiver, i) do
+    %{
+      "receiver" => receiver,
+      "receiverType" => "user",
+      "type" => "text",
+      "data" => %{"text" => "mixed peer #{i}"}
+    }
+  end
 
   defp start_peer_store! do
     {:ok, pid} = Store.start_link(name: nil)

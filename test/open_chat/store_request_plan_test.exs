@@ -199,4 +199,56 @@ defmodule OpenChat.StoreRequestPlanTest do
              {"unread_counts", "alice"}
            ]
   end
+
+  test "delete and group-send plans keep latest-message and unread buckets scoped" do
+    delete_conversation = RequestPlan.build({:delete_conversation, "user_alice_bob"})
+
+    assert delete_conversation.mutating?
+
+    assert delete_conversation.refresh == [
+             {"conversation_messages", "user_alice_bob"},
+             {"conversation_latest", "user_alice_bob"},
+             {"conversation_users", "user_alice_bob"},
+             {"conversation_messages", "group_user_alice_bob"},
+             {"conversation_latest", "group_user_alice_bob"},
+             {"conversation_users", "group_user_alice_bob"}
+           ]
+
+    assert RequestPlan.build({:delete_group, "room"}).refresh == [
+             {"groups", "room"},
+             {"members", "room"},
+             {"banned", "room"},
+             {"conversation_messages", "group_room"},
+             {"conversation_latest", "group_room"},
+             {"conversation_users", "group_room"}
+           ]
+
+    state = %{
+      "members" => %{
+        "room" => %{
+          "alice" => %{"uid" => "alice"},
+          "bob" => %{"uid" => "bob"},
+          "carol" => %{"uid" => "carol"}
+        }
+      },
+      "conversation_users" => %{"group_room" => ["alice", "bob", "carol"]}
+    }
+
+    assert RequestPlan.followup_refresh(
+             {:send_message, "alice",
+              %{"receiver" => "room", "receiverType" => "group", "data" => %{"text" => "hi"}}, [],
+              []},
+             state
+           ) == [
+             {"unread_counts", "alice"},
+             {"unread_counts", "bob"},
+             {"unread_counts", "carol"}
+           ]
+
+    assert RequestPlan.followup_refresh({:delete_conversation, "group_room"}, state) == [
+             {"unread_counts", "alice"},
+             {"unread_counts", "bob"},
+             {"unread_counts", "carol"}
+           ]
+  end
 end
