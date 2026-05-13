@@ -1,20 +1,18 @@
 defmodule OpenChatWeb.Endpoint do
   @moduledoc false
   use Plug.Router
-  @request_body_limit OpenChat.Config.request_body_limit()
+  @parser_opts_key {__MODULE__, :parser_opts}
 
   plug(:cors)
   plug(:security_headers)
-
-  plug(Plug.Parsers,
-    parsers: [:urlencoded, :multipart, :json],
-    pass: ["*/*"],
-    json_decoder: Jason,
-    length: @request_body_limit
-  )
+  plug(:parse_body)
 
   plug(:match)
   plug(:dispatch)
+
+  get "/health" do
+    send_resp(conn, 200, "ok")
+  end
 
   defp cors(conn, _opts) do
     origin = conn |> Plug.Conn.get_req_header("origin") |> List.first()
@@ -43,6 +41,29 @@ defmodule OpenChatWeb.Endpoint do
     |> Plug.Conn.put_resp_header("x-content-type-options", "nosniff")
     |> Plug.Conn.put_resp_header("x-frame-options", "DENY")
     |> Plug.Conn.put_resp_header("referrer-policy", "no-referrer")
+  end
+
+  defp parse_body(conn, _opts) do
+    Plug.Parsers.call(conn, parser_opts())
+  end
+
+  defp parser_opts do
+    case :persistent_term.get(@parser_opts_key, nil) do
+      nil ->
+        opts =
+          Plug.Parsers.init(
+            parsers: [:urlencoded, :multipart, :json],
+            pass: ["*/*"],
+            json_decoder: Jason,
+            length: OpenChat.Config.request_body_limit()
+          )
+
+        :persistent_term.put(@parser_opts_key, opts)
+        opts
+
+      opts ->
+        opts
+    end
   end
 
   options _ do

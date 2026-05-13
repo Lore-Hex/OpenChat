@@ -60,8 +60,6 @@ defmodule OpenChat.Store.AuthTokens do
 
   defp secure_compare(left, right) when byte_size(left) == byte_size(right) do
     :crypto.hash_equals(left, right)
-  rescue
-    _ -> left == right
   end
 
   defp secure_compare(_left, _right), do: false

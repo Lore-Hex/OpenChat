@@ -31,6 +31,32 @@ defmodule OpenChat.StoreRequestPlanTest do
     assert plan.refresh == [{"users", "plan-user"}, {"tokens", "uid:plan-user"}]
   end
 
+  test "group membership actions reserve message IDs through the shared counter" do
+    join_plan = RequestPlan.build({:join_group, "plan-room", "plan-user", %{}})
+    leave_plan = RequestPlan.build({:leave_group, "plan-room", "plan-user"})
+
+    assert join_plan.mutating?
+
+    assert join_plan.refresh == [
+             {"groups", "plan-room"},
+             {"members", "plan-room"},
+             {"banned", "plan-room"},
+             {"users", "plan-user"},
+             {"user_groups", "plan-user"},
+             {:counter, "next_id"}
+           ]
+
+    assert leave_plan.mutating?
+
+    assert leave_plan.refresh == [
+             {"groups", "plan-room"},
+             {"members", "plan-room"},
+             {"banned", "plan-room"},
+             {"user_groups", "plan-user"},
+             {:counter, "next_id"}
+           ]
+  end
+
   test "local JWT auth plans against the underlying token" do
     jwt = AuthTokens.local_jwt("jwt-plan-user", "uid:jwt-plan-user")
 

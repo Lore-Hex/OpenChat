@@ -41,9 +41,7 @@ defmodule OpenChatWeb.Auth do
   def admin?(conn), do: valid_api_key?(api_key(conn))
 
   def token(conn),
-    do:
-      header(conn, "authtoken") || header(conn, "authToken") || bearer_token(conn) ||
-        conn.params["authToken"]
+    do: header(conn, "authtoken") || bearer_token(conn) || conn.params["authToken"]
 
   defp valid_api_key?(api_key) do
     configured = Config.api_key()
@@ -53,7 +51,7 @@ defmodule OpenChatWeb.Auth do
       Plug.Crypto.secure_compare(api_key, configured)
   end
 
-  defp api_key(conn), do: header(conn, "apikey") || header(conn, "apiKey")
+  defp api_key(conn), do: header(conn, "apikey")
 
   defp bearer_token(conn) do
     case header(conn, "authorization") do

@@ -469,12 +469,13 @@ defmodule OpenChat.Store do
             group =
               state["groups"][guid] |> Map.put("hasJoined", true) |> with_members_count(state)
 
-            action = group_action(state, uid, group, uid, "joined")
+            {action, state} = group_action(state, uid, group, uid, "joined")
             publish_to_group(state, guid, action, except: uid)
 
             persist_ops(
               PersistenceOps.user(state, [uid]) ++
-                PersistenceOps.members(state, guid) ++ PersistenceOps.user_groups(state, [uid])
+                PersistenceOps.members(state, guid) ++
+                PersistenceOps.user_groups(state, [uid]) ++ PersistenceOps.next_id(state)
             )
 
             {:reply, {:ok, group}, state}
@@ -486,12 +487,20 @@ defmodule OpenChat.Store do
     state = remove_member_from_state(state, guid, uid)
     group = state["groups"][guid]
 
-    if group do
-      action = group_action(state, uid, group, uid, "left")
-      publish_to_group(state, guid, action, except: uid)
-    end
+    state =
+      if group do
+        {action, state} = group_action(state, uid, group, uid, "left")
+        publish_to_group(state, guid, action, except: uid)
+        state
+      else
+        state
+      end
 
-    persist_ops(PersistenceOps.members(state, guid) ++ PersistenceOps.user_groups(state, [uid]))
+    persist_ops(
+      PersistenceOps.members(state, guid) ++
+        PersistenceOps.user_groups(state, [uid]) ++ PersistenceOps.next_id(state)
+    )
+
     {:reply, {:ok, %{"success" => true}}, state}
   end
 
@@ -1700,27 +1709,30 @@ defmodule OpenChat.Store do
   end
 
   defp group_action(state, actor_uid, group, on_uid, action) do
-    id = (state["next_id"] || 1) + 10_000_000
+    {id, state} = take_counter(state, "next_id")
     actor = public_user(state["users"][actor_uid] || normalise_user(%{"uid" => actor_uid}))
     on_user = public_user(state["users"][on_uid] || normalise_user(%{"uid" => on_uid}))
 
-    %{
-      "id" => id,
-      "sender" => actor_uid,
-      "receiver" => group["guid"],
-      "receiverType" => "group",
-      "type" => "groupMember",
-      "category" => "action",
-      "sentAt" => Time.now(),
-      "conversationId" => group_conversation_id(group["guid"]),
-      "data" => %{
-        "action" => action,
-        "entities" => %{
-          "by" => %{"entityType" => "user", "entity" => actor},
-          "for" => %{"entityType" => "group", "entity" => group},
-          "on" => %{"entityType" => "user", "entity" => on_user}
+    {
+      %{
+        "id" => id,
+        "sender" => actor_uid,
+        "receiver" => group["guid"],
+        "receiverType" => "group",
+        "type" => "groupMember",
+        "category" => "action",
+        "sentAt" => Time.now(),
+        "conversationId" => group_conversation_id(group["guid"]),
+        "data" => %{
+          "action" => action,
+          "entities" => %{
+            "by" => %{"entityType" => "user", "entity" => actor},
+            "for" => %{"entityType" => "group", "entity" => group},
+            "on" => %{"entityType" => "user", "entity" => on_user}
+          }
         }
-      }
+      },
+      state
     }
   end
 

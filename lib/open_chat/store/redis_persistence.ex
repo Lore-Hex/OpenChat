@@ -126,8 +126,7 @@ defmodule OpenChat.Store.RedisPersistence do
           to_int(value)
 
         {:error, reason} ->
-          Logger.warning("Redis counter allocation failed: #{inspect(reason)}")
-          to_int(fallback_next)
+          raise "Redis counter allocation failed for #{inspect(name)}: #{inspect(reason)}"
       end
     else
       to_int(fallback_next)

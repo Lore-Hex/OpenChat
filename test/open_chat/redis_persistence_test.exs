@@ -681,6 +681,41 @@ defmodule OpenChat.RedisPersistenceTest do
     end)
   end
 
+  test "group membership action messages use Redis-backed IDs without reserved-offset collisions",
+       context do
+    with_redis(context, fn ->
+      Redix.command!(context.redis, [
+        "SET",
+        redis_key(context, "counter", "next_id"),
+        "20000000"
+      ])
+
+      assert {:ok, _group} =
+               Store.upsert_group(%{"guid" => "redis-action-room", "type" => "public"})
+
+      assert {:ok, _members} =
+               Store.add_group_members("redis-action-room", ["redis-observer"], "participant")
+
+      assert {:ok, _subscription} = OpenChat.PubSub.subscribe({:user, "redis-observer"})
+      assert {:ok, _joined} = Store.join_group("redis-action-room", "redis-joiner", %{})
+
+      assert_receive {:comet_event, %{"body" => action}}
+      assert action["id"] == 20_000_000
+      assert action["data"]["action"] == "joined"
+      assert redis_get(context, "counter", "next_id") == "20000001"
+
+      assert {:ok, message} =
+               Store.send_message("redis-joiner", %{
+                 "receiver" => "redis-observer",
+                 "receiverType" => "user",
+                 "data" => %{"text" => "after group action"}
+               })
+
+      assert message["id"] == 20_000_001
+      assert redis_get(context, "counter", "next_id") == "20000002"
+    end)
+  end
+
   defp with_redis(%{skip_redis?: reason}, _fun) do
     IO.puts("Skipping Redis persistence test; Redis unavailable: #{inspect(reason)}")
     :ok

@@ -58,9 +58,10 @@ defmodule OpenChatWeb.ApiRouter do
   end
 
   delete "/me" do
-    token = auth_token(conn)
-    if token, do: Store.revoke_auth_token(token)
-    JSON.ok(conn, %{"success" => true})
+    with_user(conn, fn conn, _user, token ->
+      Store.revoke_auth_token(token)
+      JSON.ok(conn, %{"success" => true})
+    end)
   end
 
   post "/me/jwt" do
@@ -628,8 +629,6 @@ defmodule OpenChatWeb.ApiRouter do
   defp with_admin_or_user(conn, admin_fun, user_fun) do
     Auth.with_admin_or_user(conn, admin_fun, user_fun)
   end
-
-  defp auth_token(conn), do: Auth.token(conn)
 
   defp uploads_from_params(params) do
     [

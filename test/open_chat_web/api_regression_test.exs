@@ -2,6 +2,10 @@ defmodule OpenChatWeb.ApiRegressionTest do
   use OpenChat.HttpCase, async: false
 
   test "auth, admin, route fallback, and CORS failures are explicit" do
+    conn = conn(:get, "/health") |> OpenChatWeb.Endpoint.call([])
+    assert conn.status == 200
+    assert conn.resp_body == "ok"
+
     conn = conn(:get, "/v3.0/users") |> OpenChatWeb.Endpoint.call([])
     assert conn.status == 401
     assert json(conn)["error"]["code"] == "ERR_NO_AUTH"
@@ -22,6 +26,10 @@ defmodule OpenChatWeb.ApiRegressionTest do
     conn = conn(:get, "/v3.0/does-not-exist") |> OpenChatWeb.Endpoint.call([])
     assert conn.status == 404
     assert json(conn)["error"]["code"] == "ERR_ROUTE_NOT_FOUND"
+
+    conn = conn(:delete, "/v3.0/me") |> OpenChatWeb.Endpoint.call([])
+    assert conn.status == 401
+    assert json(conn)["error"]["code"] == "ERR_NO_AUTH"
 
     conn = conn(:options, "/v3.0/users") |> OpenChatWeb.Endpoint.call([])
     assert conn.status == 204

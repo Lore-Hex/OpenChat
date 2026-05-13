@@ -56,9 +56,15 @@ defmodule OpenChat.Store.RequestPlan do
   def build({:delete_group, guid}), do: mutate(group_scope(guid), group_delete_keys(guid))
 
   def build({:join_group, guid, uid, _params}),
-    do: mutate(group_scope(guid), group_keys(guid) ++ user_record_keys(uid))
+    do:
+      mutate(
+        group_scope(guid),
+        group_keys(guid) ++ user_record_keys(uid) ++ [{"user_groups", uid}, {:counter, "next_id"}]
+      )
 
-  def build({:leave_group, guid, _uid}), do: mutate(group_scope(guid), group_keys(guid))
+  def build({:leave_group, guid, uid}),
+    do:
+      mutate(group_scope(guid), group_keys(guid) ++ [{"user_groups", uid}, {:counter, "next_id"}])
 
   def build({:add_group_members, guid, uids, _scope, opts}) do
     mutate(

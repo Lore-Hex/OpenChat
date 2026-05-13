@@ -24,6 +24,7 @@ OpenChat is a BEAM/Elixir replacement for the covered subset of CometChat. It is
 | Reactions | Native reaction add/remove/list/filter and `callExtension("reactions", ...)` fallback | `POST /messages/:messageId/reactions/:reaction`, `DELETE /messages/:messageId/reactions/:reaction`, `GET /messages/:messageId/reactions`, `GET /messages/:messageId/reactions/:reaction`, `MATCH /extensions/:name/*path`, `MATCH /v1/*path` | Covered by store/API tests. The real SDK extension contract is optional and requires wildcard HTTPS DNS. |
 | Media serving | Serve allowlisted uploaded media files with size limits and sanitized storage names | `GET /media/:file` | Covered by API and store regression tests. |
 | WebSocket | SDK auth event, message/action/reaction broadcasts, read receipts, ping/malformed frame handling | `/`, `/ws`, `/socket` | Covered by WebSocket handler tests. |
+| Health checks | Plain HTTP process health | `GET /health` | Covered by API regression tests. |
 
 ### Partial, stubbed, or not-done APIs
 
@@ -89,6 +90,8 @@ All existing CometChat method calls remain the same.
 For a literal zero-code swizzle, deploy TLS and DNS so the SDK's existing CometChat hostnames resolve to this service. That is usually harder operationally than using `overrideClientHost`/`overrideAdminHost`.
 
 ## Runtime configuration
+
+Runtime environment variables are read from `config/runtime.exs`, so container and release deployments can change them without rebuilding the image.
 
 | Variable | Default | Purpose |
 |---|---:|---|
@@ -165,7 +168,7 @@ When Redis is enabled, Store behaves as a local read-through/write-through cache
 
 - mutating calls take scoped Redis locks, usually by conversation, message, group, user, or token instead of a single global lock;
 - writes persist only touched records and index entries;
-- message and reaction IDs are allocated through Redis-backed monotonic counters so separate nodes do not race stale local counters;
+- message, membership-action, and reaction IDs are allocated through Redis-backed monotonic counters so separate nodes do not race stale local counters;
 - targeted read-through refresh pulls only records a request can touch, such as a conversation message list plus its messages, a token plus its user, or a group plus its members;
 - broad query paths use Redis index sets or secondary indexes rather than whole-state request refreshes: user/group lists read only their bucket indexes, unread and conversation lists read `user_conversations`/`user_groups`, MUID lookup reads `message_muids`, and destructive cleanup reads `conversation_users`;
 - reset and legacy imports remain namespace-wide operations.
