@@ -26,6 +26,9 @@ PRODUCTION_VPC_ID="vpc-9973f1f2"
 PRODUCTION_SUBNET_1="subnet-570ca63c"
 PRODUCTION_SUBNET_2="subnet-61bb581c"
 
+STAGING_REDIS_SNAPSHOTTING_CLUSTER_ID="${OPENCHAT_STAGING_REDIS_SNAPSHOTTING_CLUSTER_ID:-str7zpvd0hsodn0-001}"
+PRODUCTION_REDIS_SNAPSHOTTING_CLUSTER_ID="${OPENCHAT_PRODUCTION_REDIS_SNAPSHOTTING_CLUSTER_ID:-strg8paeq5g898a-001}"
+
 require_command() {
   command -v "$1" >/dev/null 2>&1 || {
     echo "Missing required command: $1" >&2
@@ -133,6 +136,7 @@ deploy_env() {
   local subnet_1="$7"
   local subnet_2="$8"
   local admin_api_key="$9"
+  local redis_snapshotting_cluster_id="${10}"
   local image_uri="$account.dkr.ecr.$REGION.amazonaws.com/openchat:$TAG"
 
   aws cloudformation deploy \
@@ -149,7 +153,8 @@ deploy_env() {
       PublicSubnet1="$subnet_1" \
       PublicSubnet2="$subnet_2" \
       ImageUri="$image_uri" \
-      AdminApiKey="$admin_api_key"
+      AdminApiKey="$admin_api_key" \
+      RedisSnapshottingClusterId="$redis_snapshotting_cluster_id"
 }
 
 verify_env() {
@@ -191,11 +196,13 @@ main() {
 
   echo "Deploying staging"
   deploy_env staging "$STAGING_PROFILE" "$STAGING_ACCOUNT" "$STAGING_DOMAIN" "$STAGING_HOSTED_ZONE_ID" \
-    "$STAGING_VPC_ID" "$STAGING_SUBNET_1" "$STAGING_SUBNET_2" "$staging_key"
+    "$STAGING_VPC_ID" "$STAGING_SUBNET_1" "$STAGING_SUBNET_2" "$staging_key" \
+    "$STAGING_REDIS_SNAPSHOTTING_CLUSTER_ID"
 
   echo "Deploying production"
   deploy_env production "$PRODUCTION_PROFILE" "$PRODUCTION_ACCOUNT" "$PRODUCTION_DOMAIN" "$PRODUCTION_HOSTED_ZONE_ID" \
-    "$PRODUCTION_VPC_ID" "$PRODUCTION_SUBNET_1" "$PRODUCTION_SUBNET_2" "$production_key"
+    "$PRODUCTION_VPC_ID" "$PRODUCTION_SUBNET_1" "$PRODUCTION_SUBNET_2" "$production_key" \
+    "$PRODUCTION_REDIS_SNAPSHOTTING_CLUSTER_ID"
 
   echo "Verifying staging"
   verify_env "$STAGING_PROFILE" openchat-staging openchat-staging "$STAGING_DOMAIN" "$STAGING_ACCOUNT"
