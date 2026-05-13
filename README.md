@@ -161,7 +161,7 @@ By default all state is in one OTP GenServer. If `REDIS_URL` is set, each mutati
 - `open_chat:counter:<counterName>`
 - `open_chat:index:<bucket>` sets for reloadable key discovery
 
-On startup, OpenChat reloads state from those Redis keys. If no per-key namespace has been initialized but `REDIS_SNAPSHOT_KEY` exists, OpenChat imports that legacy JSON snapshot into the per-key layout.
+On startup, OpenChat reloads state from those Redis keys. Normal mutations write only the touched records, indexes, and counters; reset and legacy imports replace the namespace. If no per-key namespace has been initialized but `REDIS_SNAPSHOT_KEY` exists, OpenChat imports that legacy JSON snapshot into the per-key layout.
 
 For high-scale production, evolve this into operation-specific writes or Postgres tables, but preserve the same route/test contract.
 

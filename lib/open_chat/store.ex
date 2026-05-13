@@ -8,9 +8,9 @@ defmodule OpenChat.Store do
   """
 
   use GenServer
-  require Logger
 
   alias OpenChat.{Config, Errors, Time}
+  alias OpenChat.Store.RedisPersistence
 
   @default_state %{
     "users" => %{},
@@ -27,22 +27,6 @@ defmodule OpenChat.Store do
     "next_id" => 1,
     "next_reaction_id" => 1
   }
-
-  @redis_buckets [
-    "users",
-    "tokens",
-    "groups",
-    "members",
-    "messages",
-    "conversation_messages",
-    "thread_messages",
-    "reads",
-    "reactions",
-    "blocks",
-    "banned"
-  ]
-
-  @redis_counters ["next_id", "next_reaction_id"]
 
   # Public API
 
@@ -187,7 +171,7 @@ defmodule OpenChat.Store do
 
   def handle_call({:ensure_user, uid}, _from, state) do
     {user, state} = ensure_user_in_state(state, uid)
-    persist(state)
+    persist_ops(user_ops(state, [user["uid"]]))
     {:reply, {:ok, user}, state}
   end
 
@@ -201,7 +185,7 @@ defmodule OpenChat.Store do
       user = normalise_user(Map.merge(Map.get(state["users"], to_s(uid), %{}), attrs))
       state = put_in(state, ["users", user["uid"]], user)
       state = maybe_store_embedded_token(state, user)
-      persist(state)
+      persist_ops(user_with_embedded_token_ops(user))
       {:reply, {:ok, public_user(user)}, state}
     end
   end
@@ -214,7 +198,7 @@ defmodule OpenChat.Store do
       {:ok, user} ->
         user = user |> Map.put("deactivatedAt", Time.now()) |> Map.put("status", "offline")
         state = put_in(state, ["users", uid], user)
-        persist(state)
+        persist_ops(user_ops(state, [uid]))
         {:reply, {:ok, %{"success" => true, "uid" => uid}}, state}
     end
   end
@@ -230,7 +214,7 @@ defmodule OpenChat.Store do
         {st, Map.put(acc, uid, %{"success" => true})}
       end)
 
-    persist(state)
+    persist_ops(user_ops(state, Map.keys(result)))
     {:reply, {:ok, %{"success" => result}}, state}
   end
 
@@ -260,7 +244,7 @@ defmodule OpenChat.Store do
         {st, Map.put(acc, blocked_uid, %{"success" => true, "message" => "User blocked."})}
       end)
 
-    persist(state)
+    persist_ops(user_ops(state, Map.keys(result)) ++ blocks_ops(state, uid))
     {:reply, {:ok, result}, state}
   end
 
@@ -273,7 +257,7 @@ defmodule OpenChat.Store do
         {st, Map.put(acc, blocked_uid, %{"success" => true, "message" => "User unblocked."})}
       end)
 
-    persist(state)
+    persist_ops(blocks_ops(state, uid))
     {:reply, {:ok, result}, state}
   end
 
@@ -315,26 +299,26 @@ defmodule OpenChat.Store do
     {user, state} = ensure_user_in_state(state, uid)
     token = "auth_" <> Base.url_encode64(:crypto.strong_rand_bytes(32), padding: false)
     state = put_in(state, ["tokens", token], user["uid"])
-    persist(state)
+    persist_ops(user_ops(state, [user["uid"]]) ++ token_ops(state, token))
     {:reply, {:ok, me_payload(user, token)}, state}
   end
 
   def handle_call({:revoke_auth_token, token}, _from, state) do
     state = update_in(state, ["tokens"], &Map.delete(&1 || %{}, token))
-    persist(state)
+    persist_ops([RedisPersistence.delete("tokens", token)])
     {:reply, {:ok, %{"success" => true}}, state}
   end
 
   def handle_call({:authenticate, token}, _from, state) do
     {reply, state} = authenticate_in_state(state, token)
-    persist(state)
+    persist_ops(token_ops(state, token))
     {:reply, reply, state}
   end
 
   def handle_call({:me, token}, _from, state) do
     case authenticate_in_state(state, token) do
       {{:ok, user}, state} ->
-        persist(state)
+        persist_ops(token_ops(state, token))
         {:reply, {:ok, me_payload(user, token)}, state}
 
       {error, state} ->
@@ -352,7 +336,7 @@ defmodule OpenChat.Store do
       group = normalise_group(Map.merge(Map.get(state["groups"], to_s(guid), %{}), attrs))
       state = put_in(state, ["groups", group["guid"]], group)
       state = ensure_group_member_map(state, group["guid"])
-      persist(state)
+      persist_ops(group_ops(state, group["guid"]) ++ members_ops(state, group["guid"]))
       {:reply, {:ok, group}, state}
     end
   end
@@ -408,7 +392,7 @@ defmodule OpenChat.Store do
 
             action = group_action(state, uid, group, uid, "joined")
             publish_to_group(state, guid, action, except: uid)
-            persist(state)
+            persist_ops(user_ops(state, [uid]) ++ members_ops(state, guid))
             {:reply, {:ok, group}, state}
         end
     end
@@ -423,7 +407,7 @@ defmodule OpenChat.Store do
       publish_to_group(state, guid, action, except: uid)
     end
 
-    persist(state)
+    persist_ops(members_ops(state, guid))
     {:reply, {:ok, %{"success" => true}}, state}
   end
 
@@ -438,7 +422,7 @@ defmodule OpenChat.Store do
         end)
 
       group = with_members_count(group, state)
-      persist(state)
+      persist_ops(user_ops(state, Map.keys(result)) ++ members_ops(state, guid))
       {:reply, {:ok, %{"success" => result, "group" => group}}, state}
     else
       :error -> {:reply, {:error, Errors.group_not_found(guid)}, state}
@@ -511,7 +495,11 @@ defmodule OpenChat.Store do
       end)
 
     first = List.first(Enum.reverse(touched)) || %{"guid" => guid}
-    persist(state)
+
+    persist_ops(
+      group_ops(state, guid) ++
+        members_ops(state, guid) ++ user_ops(state, Enum.map(touched, & &1["uid"]))
+    )
 
     {:reply, {:ok, Map.merge(%{"success" => true, "members" => Enum.reverse(touched)}, first)},
      state}
@@ -530,7 +518,11 @@ defmodule OpenChat.Store do
       )
 
     state = update_in(state, ["members", guid], &Map.delete(&1 || %{}, uid))
-    persist(state)
+
+    persist_ops(
+      group_ops(state, guid) ++
+        user_ops(state, [uid]) ++ banned_ops(state, guid) ++ members_ops(state, guid)
+    )
 
     {:reply,
      {:ok, %{"success" => true, "message" => "User banned.", "uid" => uid, "guid" => guid}},
@@ -539,7 +531,7 @@ defmodule OpenChat.Store do
 
   def handle_call({:unban_group_member, guid, uid}, _from, state) do
     state = update_in(state, ["banned", guid], &Map.delete(&1 || %{}, uid))
-    persist(state)
+    persist_ops(banned_ops(state, guid))
 
     {:reply,
      {:ok, %{"success" => true, "message" => "User unbanned.", "uid" => uid, "guid" => guid}},
@@ -586,7 +578,7 @@ defmodule OpenChat.Store do
       {:ok, message, state} ->
         state = store_message_in_state(state, message)
         publish_message(state, message)
-        persist(state)
+        persist_ops(message_create_ops(state, message))
         {:reply, {:ok, message}, state}
     end
   end
@@ -613,7 +605,12 @@ defmodule OpenChat.Store do
         {action, state} = message_action(state, uid, message, "edited")
         state = store_message_in_state(state, action)
         publish_message(state, action)
-        persist(state)
+
+        persist_ops(
+          [RedisPersistence.put("messages", id, message)] ++
+            stored_message_ops(state, action) ++ next_id_ops(state)
+        )
+
         {:reply, {:ok, action}, state}
     end
   end
@@ -636,7 +633,12 @@ defmodule OpenChat.Store do
         {action, state} = message_action(state, uid, message, "deleted")
         state = store_message_in_state(state, action)
         publish_message(state, action)
-        persist(state)
+
+        persist_ops(
+          [RedisPersistence.put("messages", id, message)] ++
+            stored_message_ops(state, action) ++ next_id_ops(state)
+        )
+
         {:reply, {:ok, action}, state}
     end
   end
@@ -660,7 +662,7 @@ defmodule OpenChat.Store do
         update_in(st, ["conversation_messages"], &Map.delete(&1 || %{}, conv_id))
       end)
 
-    persist(state)
+    persist_ops(Enum.map(ids, &RedisPersistence.delete("conversation_messages", &1)))
     {:reply, {:ok, %{"success" => true, "conversationId" => conversation_id}}, state}
   end
 
@@ -707,7 +709,7 @@ defmodule OpenChat.Store do
         Map.put(reads || %{}, conv_id, %{"messageId" => message_id, "readAt" => now})
       end)
 
-    persist(state)
+    persist_ops(reads_ops(state, uid))
 
     {:reply,
      {:ok,
@@ -731,7 +733,7 @@ defmodule OpenChat.Store do
       end)
 
     conv = build_conversation(state, uid, conv_id)
-    persist(state)
+    persist_ops(reads_ops(state, uid))
     {:reply, {:ok, %{"conversation" => conv}}, state}
   end
 
@@ -808,7 +810,12 @@ defmodule OpenChat.Store do
       message = refresh_message_reactions(state, message, uid)
       state = put_in(state, ["messages", id], message)
       publish_reaction(state, message, reaction_obj, "message_reaction_added", uid)
-      persist(state)
+
+      persist_ops(
+        reactions_ops(state, id) ++
+          [RedisPersistence.put("messages", id, message)] ++ next_reaction_id_ops(state)
+      )
+
       {:reply, {:ok, message}, state}
     else
       :error -> {:reply, {:error, Errors.message_not_found(id)}, state}
@@ -834,7 +841,7 @@ defmodule OpenChat.Store do
       message = refresh_message_reactions(state, message, uid)
       state = put_in(state, ["messages", id], message)
       publish_reaction(state, message, reaction_obj, "message_reaction_removed", uid)
-      persist(state)
+      persist_ops(reactions_ops(state, id) ++ [RedisPersistence.put("messages", id, message)])
       {:reply, {:ok, message}, state}
     else
       :error -> {:reply, {:error, Errors.message_not_found(id)}, state}
@@ -858,189 +865,116 @@ defmodule OpenChat.Store do
   # Loading/persistence
 
   defp load_or_seed_state do
-    case Config.redis_url() do
-      nil ->
-        seed_state()
-
-      "" ->
-        seed_state()
-
-      url ->
-        case ensure_redis_started(url) do
-          {:ok, _pid} ->
-            load_redis_state()
-
-          {:error, reason} ->
-            Logger.warning("Redis connection failed: #{inspect(reason)}; using in-memory store")
-            seed_state()
-        end
-    end
+    RedisPersistence.load_or_seed(@default_state, &seed_state/0)
   end
 
-  defp ensure_redis_started(url) do
-    case Process.whereis(OpenChat.Redis) do
-      nil ->
-        case Redix.start_link(url, name: OpenChat.Redis) do
-          {:ok, pid} -> {:ok, pid}
-          {:error, {:already_started, pid}} -> {:ok, pid}
-          error -> error
-        end
-
-      pid ->
-        {:ok, pid}
-    end
+  defp persist(state) do
+    RedisPersistence.replace_all(state)
   end
 
-  defp load_redis_state do
-    case redis_command(["GET", redis_meta_key()]) do
-      {:ok, nil} ->
-        load_legacy_snapshot_or_seed()
+  defp persist_ops(ops), do: RedisPersistence.write(ops)
 
-      {:ok, _version} ->
-        read_per_key_state()
-
-      {:error, reason} ->
-        Logger.warning("Redis key load failed: #{inspect(reason)}; using seeds")
-        seed_state()
-    end
-  end
-
-  defp load_legacy_snapshot_or_seed do
-    case redis_command(["GET", Config.redis_snapshot_key()]) do
-      {:ok, nil} ->
-        state = seed_state()
-        persist(state)
-        state
-
-      {:ok, json} ->
-        case Jason.decode(json) do
-          {:ok, state} ->
-            state = Map.merge(@default_state, state)
-            persist(state)
-            state
-
-          {:error, reason} ->
-            Logger.warning("Redis legacy snapshot decode failed: #{inspect(reason)}; using seeds")
-            seed_state()
-        end
-
-      {:error, reason} ->
-        Logger.warning("Redis legacy snapshot load failed: #{inspect(reason)}; using seeds")
-        seed_state()
-    end
-  end
-
-  defp read_per_key_state do
-    state =
-      Enum.reduce(@redis_buckets, @default_state, fn bucket, acc ->
-        Map.put(acc, bucket, read_redis_bucket(bucket))
-      end)
-
-    Enum.reduce(@redis_counters, state, fn counter, acc ->
-      case redis_command(["GET", redis_counter_key(counter)]) do
-        {:ok, nil} -> acc
-        {:ok, value} -> Map.put(acc, counter, max(to_int(value), @default_state[counter]))
-        {:error, _reason} -> acc
+  defp user_ops(state, uids) do
+    uids
+    |> List.wrap()
+    |> Enum.map(&to_s/1)
+    |> Enum.reject(&blank?/1)
+    |> Enum.uniq()
+    |> Enum.flat_map(fn uid ->
+      case get_in(state, ["users", uid]) do
+        nil -> []
+        user -> [RedisPersistence.put("users", uid, user)]
       end
     end)
   end
 
-  defp read_redis_bucket(bucket) do
-    with {:ok, ids} <- redis_command(["SMEMBERS", redis_index_key(bucket)]) do
-      Enum.reduce(ids, %{}, fn id, acc ->
-        case redis_command(["GET", redis_record_key(bucket, id)]) do
-          {:ok, nil} ->
-            acc
+  defp user_with_embedded_token_ops(user) do
+    [RedisPersistence.put("users", user["uid"], user)] ++ embedded_token_ops(user)
+  end
 
-          {:ok, json} ->
-            case Jason.decode(json) do
-              {:ok, value} -> Map.put(acc, id, value)
-              {:error, _reason} -> acc
-            end
+  defp embedded_token_ops(%{"authToken" => token, "uid" => uid})
+       when is_binary(token) and token != "",
+       do: [RedisPersistence.put("tokens", token, uid)]
 
-          {:error, _reason} ->
-            acc
-        end
-      end)
+  defp embedded_token_ops(_user), do: []
+
+  defp token_ops(state, token) do
+    case get_in(state, ["tokens", to_s(token)]) do
+      nil -> []
+      uid -> [RedisPersistence.put("tokens", token, uid)] ++ user_ops(state, [uid])
+    end
+  end
+
+  defp group_ops(state, guid) do
+    guid = to_s(guid)
+
+    case get_in(state, ["groups", guid]) do
+      nil -> []
+      group -> [RedisPersistence.put("groups", guid, group)]
+    end
+  end
+
+  defp members_ops(state, guid),
+    do: [RedisPersistence.put_or_delete("members", guid, get_in(state, ["members", to_s(guid)]))]
+
+  defp blocks_ops(state, uid),
+    do: [RedisPersistence.put_or_delete("blocks", uid, get_in(state, ["blocks", to_s(uid)]))]
+
+  defp banned_ops(state, guid),
+    do: [RedisPersistence.put_or_delete("banned", guid, get_in(state, ["banned", to_s(guid)]))]
+
+  defp reads_ops(state, uid),
+    do: [RedisPersistence.put_or_delete("reads", uid, get_in(state, ["reads", to_s(uid)]))]
+
+  defp reactions_ops(state, message_id),
+    do: [
+      RedisPersistence.put_or_delete(
+        "reactions",
+        message_id,
+        get_in(state, ["reactions", to_s(message_id)])
+      )
+    ]
+
+  defp stored_message_ops(state, message) do
+    id = to_s(message["id"])
+    conv_id = message["conversationId"]
+
+    ops = [
+      RedisPersistence.put("messages", id, message),
+      RedisPersistence.put(
+        "conversation_messages",
+        conv_id,
+        state["conversation_messages"][conv_id]
+      )
+    ]
+
+    if parent_id = message["parentId"] || message["parentMessageId"] do
+      parent_id = to_s(parent_id)
+
+      [
+        RedisPersistence.put("thread_messages", parent_id, state["thread_messages"][parent_id])
+        | ops
+      ]
     else
-      _ -> %{}
+      ops
     end
   end
 
-  defp persist(state) do
-    if Process.whereis(OpenChat.Redis) do
-      persist_per_key(state)
-    end
+  defp message_create_ops(state, message) do
+    participant_ops =
+      case message["receiverType"] do
+        "user" -> user_ops(state, [message["sender"], message["receiver"]])
+        "group" -> user_ops(state, [message["sender"]]) ++ group_ops(state, message["receiver"])
+        _other -> []
+      end
 
-    :ok
-  rescue
-    e ->
-      Logger.warning("Redis per-key persist failed: #{Exception.message(e)}")
-      :ok
+    participant_ops ++ stored_message_ops(state, message) ++ next_id_ops(state)
   end
 
-  defp persist_per_key(state) do
-    @redis_buckets
-    |> Enum.flat_map(fn bucket -> sync_bucket_commands(bucket, Map.get(state, bucket, %{})) end)
-    |> Kernel.++(counter_commands(state))
-    |> Kernel.++([["SET", redis_meta_key(), "2"]])
-    |> run_redis_pipeline()
-  end
+  defp next_id_ops(state), do: [RedisPersistence.counter("next_id", state["next_id"])]
 
-  defp sync_bucket_commands(bucket, values) do
-    current_ids = values |> Map.keys() |> Enum.map(&to_s/1)
-    old_ids = redis_set_members(redis_index_key(bucket))
-    removed_ids = old_ids -- current_ids
-
-    delete_commands =
-      Enum.flat_map(removed_ids, fn id ->
-        [["DEL", redis_record_key(bucket, id)], ["SREM", redis_index_key(bucket), id]]
-      end)
-
-    upsert_commands =
-      Enum.flat_map(values, fn {id, value} ->
-        id = to_s(id)
-
-        [
-          ["SET", redis_record_key(bucket, id), Jason.encode!(value)],
-          ["SADD", redis_index_key(bucket), id]
-        ]
-      end)
-
-    delete_commands ++ upsert_commands
-  end
-
-  defp counter_commands(state) do
-    Enum.map(@redis_counters, fn counter ->
-      ["SET", redis_counter_key(counter), to_s(Map.get(state, counter, @default_state[counter]))]
-    end)
-  end
-
-  defp run_redis_pipeline([]), do: :ok
-
-  defp run_redis_pipeline(commands) do
-    case Redix.pipeline(OpenChat.Redis, commands) do
-      {:ok, _results} -> :ok
-      {:error, reason} -> Logger.warning("Redis pipeline failed: #{inspect(reason)}")
-    end
-  end
-
-  defp redis_set_members(key) do
-    case redis_command(["SMEMBERS", key]) do
-      {:ok, ids} -> ids
-      _ -> []
-    end
-  end
-
-  defp redis_command(args), do: Redix.command(OpenChat.Redis, args)
-
-  defp redis_key(parts),
-    do: [Config.redis_key_prefix() | parts] |> Enum.map(&to_s/1) |> Enum.join(":")
-
-  defp redis_meta_key, do: redis_key(["meta", "version"])
-  defp redis_index_key(bucket), do: redis_key(["index", bucket])
-  defp redis_record_key(bucket, id), do: redis_key([bucket, id])
-  defp redis_counter_key(counter), do: redis_key(["counter", counter])
+  defp next_reaction_id_ops(state),
+    do: [RedisPersistence.counter("next_reaction_id", state["next_reaction_id"])]
 
   defp seed_state do
     users = decode_seed(Config.seed_users_json(), default_users()) |> Enum.map(&normalise_user/1)
