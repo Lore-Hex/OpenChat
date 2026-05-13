@@ -10,7 +10,15 @@ defmodule OpenChat.Store do
   use GenServer
 
   alias OpenChat.{Config, Errors, Time}
-  alias OpenChat.Store.{AuthTokens, Conversations, PersistenceOps, RedisPersistence, RequestPlan}
+
+  alias OpenChat.Store.{
+    AuthTokens,
+    Conversations,
+    MessagePermissions,
+    PersistenceOps,
+    RedisPersistence,
+    RequestPlan
+  }
 
   @default_state %{
     "users" => %{},
@@ -90,11 +98,11 @@ defmodule OpenChat.Store do
   def send_message(sender_uid, params, uploads \\ [], opts \\ []),
     do: call({:send_message, to_s(sender_uid), params, uploads, opts})
 
-  def edit_message(uid, id, params),
-    do: call({:edit_message, to_s(uid), to_s(id), params})
+  def edit_message(uid, id, params, opts \\ []),
+    do: call({:edit_message, to_s(uid), to_s(id), params, opts})
 
-  def delete_message(uid, id),
-    do: call({:delete_message, to_s(uid), to_s(id)})
+  def delete_message(uid, id, opts \\ []),
+    do: call({:delete_message, to_s(uid), to_s(id), opts})
 
   def delete_conversation(conversation_id),
     do: call({:delete_conversation, to_s(conversation_id)})
@@ -643,7 +651,7 @@ defmodule OpenChat.Store do
     end
   end
 
-  def handle_call({:edit_message, uid, id, params}, _from, state) do
+  def handle_call({:edit_message, uid, id, params, opts}, _from, state) do
     params = stringify_keys(params)
 
     case Map.fetch(state["messages"], id) do
@@ -651,55 +659,67 @@ defmodule OpenChat.Store do
         {:reply, {:error, Errors.message_not_found(id)}, state}
 
       {:ok, message} ->
-        now = Time.now()
-        data = merge_message_data(message["data"] || %{}, params["data"] || params)
+        case MessagePermissions.authorize(state, uid, message, :edit, opts) do
+          :ok ->
+            now = Time.now()
+            data = merge_message_data(message["data"] || %{}, params["data"] || params)
 
-        message =
-          message
-          |> Map.put("data", enrich_data_entities(state, message, data))
-          |> Map.put("editedAt", now)
-          |> Map.put("editedBy", uid)
-          |> Map.put("updatedAt", now)
+            message =
+              message
+              |> Map.put("data", enrich_data_entities(state, message, data))
+              |> Map.put("editedAt", now)
+              |> Map.put("editedBy", uid)
+              |> Map.put("updatedAt", now)
 
-        state = put_in(state, ["messages", id], message)
-        {action, state} = message_action(state, uid, message, "edited")
-        state = store_message_in_state(state, action)
-        publish_message(state, action)
+            state = put_in(state, ["messages", id], message)
+            {action, state} = message_action(state, uid, message, "edited")
+            state = store_message_in_state(state, action)
+            publish_message(state, action)
 
-        persist_ops(
-          [RedisPersistence.put("messages", id, message)] ++
-            PersistenceOps.stored_message(state, action) ++ PersistenceOps.next_id(state)
-        )
+            persist_ops(
+              [RedisPersistence.put("messages", id, message)] ++
+                PersistenceOps.stored_message(state, action) ++ PersistenceOps.next_id(state)
+            )
 
-        {:reply, {:ok, action}, state}
+            {:reply, {:ok, action}, state}
+
+          {:error, error} ->
+            {:reply, {:error, error}, state}
+        end
     end
   end
 
-  def handle_call({:delete_message, uid, id}, _from, state) do
+  def handle_call({:delete_message, uid, id, opts}, _from, state) do
     case Map.fetch(state["messages"], id) do
       :error ->
         {:reply, {:error, Errors.message_not_found(id)}, state}
 
       {:ok, message} ->
-        now = Time.now()
+        case MessagePermissions.authorize(state, uid, message, :delete, opts) do
+          :ok ->
+            now = Time.now()
 
-        message =
-          message
-          |> Map.put("deletedAt", now)
-          |> Map.put("deletedBy", uid)
-          |> Map.put("updatedAt", now)
+            message =
+              message
+              |> Map.put("deletedAt", now)
+              |> Map.put("deletedBy", uid)
+              |> Map.put("updatedAt", now)
 
-        state = put_in(state, ["messages", id], message)
-        {action, state} = message_action(state, uid, message, "deleted")
-        state = store_message_in_state(state, action)
-        publish_message(state, action)
+            state = put_in(state, ["messages", id], message)
+            {action, state} = message_action(state, uid, message, "deleted")
+            state = store_message_in_state(state, action)
+            publish_message(state, action)
 
-        persist_ops(
-          [RedisPersistence.put("messages", id, message)] ++
-            PersistenceOps.stored_message(state, action) ++ PersistenceOps.next_id(state)
-        )
+            persist_ops(
+              [RedisPersistence.put("messages", id, message)] ++
+                PersistenceOps.stored_message(state, action) ++ PersistenceOps.next_id(state)
+            )
 
-        {:reply, {:ok, action}, state}
+            {:reply, {:ok, action}, state}
+
+          {:error, error} ->
+            {:reply, {:error, error}, state}
+        end
     end
   end
 
@@ -1765,7 +1785,7 @@ defmodule OpenChat.Store do
       "password" => attrs["password"],
       "icon" => attrs["icon"],
       "description" => attrs["description"],
-      "owner" => attrs["owner"] || "system",
+      "owner" => attrs["owner"] || attrs["ownerUid"] || attrs["ownerUuid"] || "system",
       "metadata" => normalise_data(attrs["metadata"] || %{}),
       "tags" => attrs["tags"] || [],
       "createdAt" => attrs["createdAt"] || Time.now(),
@@ -1811,7 +1831,11 @@ defmodule OpenChat.Store do
 
   defp normalise_scope("participants"), do: "participant"
   defp normalise_scope("members"), do: "participant"
-  defp normalise_scope(scope) when scope in ["admin", "moderator", "participant"], do: scope
+
+  defp normalise_scope(scope) when scope in ["owner", "admin", "moderator", "participant"],
+    do: scope
+
+  defp normalise_scope("coOwner"), do: "coOwner"
   defp normalise_scope(_scope), do: "participant"
 
   defp with_members_count(nil, _state), do: nil

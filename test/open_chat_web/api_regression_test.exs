@@ -465,4 +465,35 @@ defmodule OpenChatWeb.ApiRegressionTest do
     assert conn.status == 400
     assert json(conn)["error"]["details"] == %{"parameter" => "reaction"}
   end
+
+  test "message mutation APIs forbid non-senders and allow full-access API key deletes" do
+    conn =
+      auth_conn(:post, "/v3.0/messages", %{
+        "receiver" => "bob",
+        "receiverType" => "user",
+        "data" => %{"text" => "owned by alice"}
+      })
+
+    assert conn.status == 201
+    message = json(conn)["data"]
+
+    conn =
+      auth_conn(
+        :put,
+        "/v3.0/messages/#{message["id"]}",
+        %{"data" => %{"text" => "bob edit"}},
+        "uid:bob"
+      )
+
+    assert conn.status == 403
+    assert json(conn)["error"]["code"] == "ERR_FORBIDDEN"
+
+    conn = auth_conn(:delete, "/v3.0/messages/#{message["id"]}", %{}, "uid:bob")
+    assert conn.status == 403
+    assert json(conn)["error"]["code"] == "ERR_FORBIDDEN"
+
+    conn = admin_conn(:delete, "/v3/messages/#{message["id"]}")
+    assert conn.status == 200
+    assert get_in(json(conn), ["data", "data", "action"]) == "deleted"
+  end
 end

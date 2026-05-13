@@ -96,10 +96,10 @@ defmodule OpenChat.Store.RequestPlan do
     mutate(conversation_scope(sender_uid, receiver_type, receiver), refresh)
   end
 
-  def build({:edit_message, _uid, id, _params}),
+  def build({:edit_message, _uid, id, _params, _opts}),
     do: mutate(message_scope(id), [{"messages", id}, {:counter, "next_id"}])
 
-  def build({:delete_message, _uid, id}),
+  def build({:delete_message, _uid, id, _opts}),
     do: mutate(message_scope(id), [{"messages", id}, {:counter, "next_id"}])
 
   def build({:delete_conversation, conversation_id}),
@@ -184,6 +184,15 @@ defmodule OpenChat.Store.RequestPlan do
     |> Enum.uniq()
   end
 
+  def followup_refresh({request, uid, id, _opts}, state) when request in [:delete_message] do
+    message_action_refresh_keys(state, uid, id)
+  end
+
+  def followup_refresh({request, uid, id, _params, _opts}, state)
+      when request in [:edit_message] do
+    message_action_refresh_keys(state, uid, id)
+  end
+
   def followup_refresh(_request, _state), do: []
 
   defp read(refresh), do: %__MODULE__{refresh: refresh}
@@ -257,6 +266,18 @@ defmodule OpenChat.Store.RequestPlan do
         |> get_in(["tokens", token])
         |> user_record_keys()
     end
+  end
+
+  defp message_action_refresh_keys(state, uid, id) do
+    message = get_in(state, ["messages", to_s(id)]) || %{}
+
+    user_record_keys(uid) ++
+      user_record_keys(message["sender"]) ++
+      case message["receiverType"] do
+        "group" -> group_keys(message["receiver"])
+        "user" -> user_record_keys(message["receiver"])
+        _other -> []
+      end
   end
 
   defp user_record_keys(value), do: if(blank?(value), do: [], else: [{"users", value}])

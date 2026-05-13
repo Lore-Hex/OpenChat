@@ -389,21 +389,34 @@ defmodule OpenChatWeb.ApiRouter do
   end
 
   put "/messages/:message_id" do
-    with_user(conn, fn conn, user, _token ->
-      case Store.edit_message(user["uid"], message_id, conn.body_params) do
-        {:ok, action} -> JSON.ok(conn, action)
-        {:error, e} -> JSON.error(conn, e, 400)
+    with_admin_or_user(
+      conn,
+      fn conn ->
+        store_response(
+          conn,
+          Store.edit_message("system", message_id, conn.body_params, admin?: true)
+        )
+      end,
+      fn conn ->
+        with_user(conn, fn conn, user, _token ->
+          store_response(conn, Store.edit_message(user["uid"], message_id, conn.body_params))
+        end)
       end
-    end)
+    )
   end
 
   delete "/messages/:message_id" do
-    with_user(conn, fn conn, user, _token ->
-      case Store.delete_message(user["uid"], message_id) do
-        {:ok, action} -> JSON.ok(conn, action)
-        {:error, e} -> JSON.error(conn, e, 400)
+    with_admin_or_user(
+      conn,
+      fn conn ->
+        store_response(conn, Store.delete_message("system", message_id, admin?: true))
+      end,
+      fn conn ->
+        with_user(conn, fn conn, user, _token ->
+          store_response(conn, Store.delete_message(user["uid"], message_id))
+        end)
       end
-    end)
+    )
   end
 
   get "/user/messages/:muid" do
@@ -558,9 +571,12 @@ defmodule OpenChatWeb.ApiRouter do
   defp store_response(conn, result, success_status \\ 200, error_status \\ 400) do
     case result do
       {:ok, data} -> JSON.ok(conn, data, success_status)
-      {:error, error} -> JSON.error(conn, error, error_status)
+      {:error, error} -> JSON.error(conn, error, error_status(error, error_status))
     end
   end
+
+  defp error_status(%{"code" => "ERR_FORBIDDEN"}, _default), do: 403
+  defp error_status(_error, default), do: default
 
   defp handle_extension(conn, _name, _path) do
     with_user(conn, fn conn, user, _token ->

@@ -59,4 +59,20 @@ defmodule OpenChat.StoreRequestPlanTest do
     assert plan.locks == []
     assert plan.refresh == [{"messages", "123"}, {"reactions", "123"}]
   end
+
+  test "message action follow-up refresh covers actor and group moderator records" do
+    state = %{
+      "messages" => %{
+        "42" => %{"sender" => "sender", "receiverType" => "group", "receiver" => "room"}
+      }
+    }
+
+    assert RequestPlan.followup_refresh({:delete_message, "moderator", "42", []}, state) == [
+             {"users", "moderator"},
+             {"users", "sender"},
+             {"groups", "room"},
+             {"members", "room"},
+             {"banned", "room"}
+           ]
+  end
 end

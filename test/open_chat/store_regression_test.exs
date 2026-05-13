@@ -150,6 +150,74 @@ defmodule OpenChat.StoreRegressionTest do
     refute Enum.any?(visible_messages, &(&1["id"] == fourth_id))
   end
 
+  test "message edits and deletes require sender or group moderator privileges" do
+    assert {:ok, direct} =
+             Store.send_message("alice", %{
+               "receiver" => "bob",
+               "receiverType" => "user",
+               "data" => %{"text" => "direct"}
+             })
+
+    assert {:error, %{"code" => "ERR_FORBIDDEN"}} =
+             Store.edit_message("bob", direct["id"], %{"data" => %{"text" => "nope"}})
+
+    assert {:error, %{"code" => "ERR_FORBIDDEN"}} = Store.delete_message("bob", direct["id"])
+
+    assert {:ok, edited} =
+             Store.edit_message("alice", direct["id"], %{"data" => %{"text" => "ok"}})
+
+    assert edited["data"]["action"] == "edited"
+
+    assert {:error, %{"code" => "ERR_FORBIDDEN"}} =
+             Store.delete_message("alice", edited["id"])
+
+    guid = "secure-room"
+
+    assert {:ok, _group} =
+             Store.upsert_group(%{"guid" => guid, "type" => "public", "owner" => "owner"})
+
+    assert {:ok, _members} = Store.add_group_members(guid, ["alice", "bob"], "participant")
+    assert {:ok, _mod} = Store.add_group_members(guid, ["mod"], "moderator")
+    assert {:ok, _admin} = Store.add_group_members(guid, ["admin"], "admin")
+
+    assert {:ok, group_message} =
+             Store.send_message("alice", %{
+               "receiver" => guid,
+               "receiverType" => "group",
+               "data" => %{"text" => "group"}
+             })
+
+    assert {:error, %{"code" => "ERR_FORBIDDEN"}} =
+             Store.delete_message("bob", group_message["id"])
+
+    assert {:ok, owner_deleted} = Store.delete_message("owner", group_message["id"])
+    assert owner_deleted["data"]["action"] == "deleted"
+
+    assert {:ok, second_group_message} =
+             Store.send_message("alice", %{
+               "receiver" => guid,
+               "receiverType" => "group",
+               "data" => %{"text" => "group 2"}
+             })
+
+    assert {:ok, mod_deleted} = Store.delete_message("mod", second_group_message["id"])
+    assert mod_deleted["data"]["action"] == "deleted"
+
+    assert {:ok, third_group_message} =
+             Store.send_message("alice", %{
+               "receiver" => guid,
+               "receiverType" => "group",
+               "data" => %{"text" => "group 3"}
+             })
+
+    assert {:ok, admin_edited} =
+             Store.edit_message("admin", third_group_message["id"], %{
+               "data" => %{"text" => "edited"}
+             })
+
+    assert admin_edited["data"]["action"] == "edited"
+  end
+
   test "threads, muid lookup, unread filters, conversations, and conversation deletion" do
     assert {:ok, parent} =
              Store.send_message("alice", %{
