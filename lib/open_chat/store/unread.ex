@@ -133,7 +133,21 @@ defmodule OpenChat.Store.Unread do
   end
 
   defp countable?(message) do
-    not blank?(message["conversationId"]) and blank?(message["deletedAt"])
+    not blank?(message["conversationId"]) and blank?(message["deletedAt"]) and
+      increment_unread?(message)
+  end
+
+  defp increment_unread?(message) do
+    flag = get_in(message, ["data", "metadata", "incrementUnreadCount"])
+
+    case flag do
+      false -> false
+      "false" -> false
+      "FALSE" -> false
+      0 -> false
+      "0" -> false
+      _other -> true
+    end
   end
 
   defp blank?(value), do: value in [nil, "", false]
