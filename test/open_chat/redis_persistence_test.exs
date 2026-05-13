@@ -64,7 +64,7 @@ defmodule OpenChat.RedisPersistenceTest do
 
       assert {:ok, _message} = Store.add_reaction("alice", message["id"], "👍")
 
-      assert redis_get(context, "meta", "version") == "2"
+      assert redis_get(context, "meta", "version") == "3"
       assert redis_get_raw(context, context.snapshot_key) == nil
 
       assert "redis-user" in redis_members(context, "index", "users")
@@ -144,6 +144,7 @@ defmodule OpenChat.RedisPersistenceTest do
         "conversation_messages" => %{},
         "thread_messages" => %{},
         "reads" => %{},
+        "hidden_conversations" => %{},
         "reactions" => %{},
         "blocks" => %{},
         "banned" => %{},
@@ -158,7 +159,7 @@ defmodule OpenChat.RedisPersistenceTest do
 
       assert {:ok, me} = Store.me("legacy-token")
       assert me["uid"] == "legacy-user"
-      assert redis_get(context, "meta", "version") == "2"
+      assert redis_get(context, "meta", "version") == "3"
       assert redis_json(context, "users", "legacy-user")["name"] == "Legacy User"
 
       assert {:ok, message} =
@@ -199,6 +200,9 @@ defmodule OpenChat.RedisPersistenceTest do
       assert "cleanup-user" in redis_members(context, "index", "blocks")
       assert "cleanup-room" in redis_members(context, "index", "banned")
 
+      assert {:ok, _hidden} = Store.hide_conversation("cleanup-user", "user", "alice")
+      assert "cleanup-user" in redis_members(context, "index", "hidden_conversations")
+
       assert {:ok, _revoked} = Store.revoke_auth_token(auth["authToken"])
       assert {:ok, _unreacted} = Store.remove_reaction("alice", message["id"], "👍")
       assert {:ok, _unblocked} = Store.unblock_users("cleanup-user", ["alice"])
@@ -209,14 +213,64 @@ defmodule OpenChat.RedisPersistenceTest do
       refute "user_alice_cleanup-user" in redis_members(context, "index", "conversation_messages")
       refute to_string(message["id"]) in redis_members(context, "index", "reactions")
       refute "cleanup-user" in redis_members(context, "index", "blocks")
+      refute "cleanup-user" in redis_members(context, "index", "hidden_conversations")
       refute "cleanup-room" in redis_members(context, "index", "members")
       refute "cleanup-room" in redis_members(context, "index", "banned")
 
       assert redis_get_raw(context, redis_key(context, "tokens", auth["authToken"])) == nil
       assert redis_get_raw(context, redis_key(context, "reactions", message["id"])) == nil
       assert redis_get_raw(context, redis_key(context, "blocks", "cleanup-user")) == nil
+
+      assert redis_get_raw(context, redis_key(context, "hidden_conversations", "cleanup-user")) ==
+               nil
+
       assert redis_get_raw(context, redis_key(context, "members", "cleanup-room")) == nil
       assert redis_get_raw(context, redis_key(context, "banned", "cleanup-room")) == nil
+    end)
+  end
+
+  test "persists conversation hides and removes deleted group records from Redis", context do
+    with_redis(context, fn ->
+      assert {:ok, _group} = Store.upsert_group(%{"guid" => "redis-delete-room"})
+      assert {:ok, _members} = Store.add_group_members("redis-delete-room", ["alice", "bob"])
+      assert {:ok, _ban} = Store.ban_group_member("redis-delete-room", "carol")
+
+      assert {:ok, message} =
+               Store.send_message("alice", %{
+                 "receiver" => "redis-delete-room",
+                 "receiverType" => "group",
+                 "data" => %{"text" => "delete me"}
+               })
+
+      assert {:ok, _reaction} = Store.add_reaction("bob", message["id"], "👍")
+      assert {:ok, _read} = Store.mark_read("bob", "group", "redis-delete-room", message["id"])
+      assert {:ok, _hidden} = Store.hide_conversation("alice", "group", "redis-delete-room")
+
+      assert "redis-delete-room" in redis_members(context, "index", "groups")
+      assert "redis-delete-room" in redis_members(context, "index", "members")
+      assert "redis-delete-room" in redis_members(context, "index", "banned")
+      assert "group_redis-delete-room" in redis_members(context, "index", "conversation_messages")
+      assert to_string(message["id"]) in redis_members(context, "index", "messages")
+      assert to_string(message["id"]) in redis_members(context, "index", "reactions")
+      assert "alice" in redis_members(context, "index", "hidden_conversations")
+      assert "bob" in redis_members(context, "index", "reads")
+
+      assert {:ok, _deleted} = Store.delete_group("redis-delete-room")
+
+      refute "redis-delete-room" in redis_members(context, "index", "groups")
+      refute "redis-delete-room" in redis_members(context, "index", "members")
+      refute "redis-delete-room" in redis_members(context, "index", "banned")
+      refute "group_redis-delete-room" in redis_members(context, "index", "conversation_messages")
+      refute to_string(message["id"]) in redis_members(context, "index", "messages")
+      refute to_string(message["id"]) in redis_members(context, "index", "reactions")
+      refute "alice" in redis_members(context, "index", "hidden_conversations")
+      refute "bob" in redis_members(context, "index", "reads")
+
+      assert redis_get_raw(context, redis_key(context, "groups", "redis-delete-room")) == nil
+      assert redis_get_raw(context, redis_key(context, "members", "redis-delete-room")) == nil
+      assert redis_get_raw(context, redis_key(context, "banned", "redis-delete-room")) == nil
+      assert redis_get_raw(context, redis_key(context, "messages", message["id"])) == nil
+      assert redis_get_raw(context, redis_key(context, "reactions", message["id"])) == nil
     end)
   end
 

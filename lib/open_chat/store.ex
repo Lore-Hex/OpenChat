@@ -21,6 +21,7 @@ defmodule OpenChat.Store do
     "conversation_messages" => %{},
     "thread_messages" => %{},
     "reads" => %{},
+    "hidden_conversations" => %{},
     "reactions" => %{},
     "blocks" => %{},
     "banned" => %{},
@@ -57,6 +58,7 @@ defmodule OpenChat.Store do
   def upsert_group(attrs), do: GenServer.call(__MODULE__, {:upsert_group, attrs})
   def get_group(guid), do: GenServer.call(__MODULE__, {:get_group, to_s(guid)})
   def list_groups(params \\ %{}), do: GenServer.call(__MODULE__, {:list_groups, params})
+  def delete_group(guid), do: GenServer.call(__MODULE__, {:delete_group, to_s(guid)})
 
   def join_group(guid, uid, params \\ %{}),
     do: GenServer.call(__MODULE__, {:join_group, to_s(guid), to_s(uid), params})
@@ -95,6 +97,13 @@ defmodule OpenChat.Store do
 
   def delete_conversation(conversation_id),
     do: GenServer.call(__MODULE__, {:delete_conversation, to_s(conversation_id)})
+
+  def hide_conversation(uid, receiver_type, receiver_id),
+    do:
+      GenServer.call(
+        __MODULE__,
+        {:hide_conversation, to_s(uid), to_s(receiver_type), to_s(receiver_id)}
+      )
 
   def get_message(id), do: GenServer.call(__MODULE__, {:get_message, to_s(id)})
 
@@ -365,6 +374,30 @@ defmodule OpenChat.Store do
           end)
 
     {:reply, {:ok, paginate(groups, params, 30, 100)}, state}
+  end
+
+  def handle_call({:delete_group, guid}, _from, state) do
+    conv_id = group_conversation_id(guid)
+    message_ids = Map.get(state["conversation_messages"], conv_id, [])
+
+    {state, conversation_ops} = delete_conversation_indexes(state, [conv_id])
+    {state, message_ops} = delete_message_records(state, message_ids)
+
+    state =
+      state
+      |> update_in(["groups"], &Map.delete(&1 || %{}, guid))
+      |> update_in(["members"], &Map.delete(&1 || %{}, guid))
+      |> update_in(["banned"], &Map.delete(&1 || %{}, guid))
+
+    persist_ops(
+      [
+        RedisPersistence.delete("groups", guid),
+        RedisPersistence.delete("members", guid),
+        RedisPersistence.delete("banned", guid)
+      ] ++ conversation_ops ++ message_ops
+    )
+
+    {:reply, {:ok, %{"success" => true, "guid" => guid}}, state}
   end
 
   def handle_call({:join_group, guid, uid, params}, _from, state) do
@@ -657,13 +690,36 @@ defmodule OpenChat.Store do
       )
       |> Enum.uniq()
 
+    {state, ops} = delete_conversation_indexes(state, ids)
+
+    persist_ops(ops)
+    {:reply, {:ok, %{"success" => true, "conversationId" => conversation_id}}, state}
+  end
+
+  def handle_call({:hide_conversation, uid, receiver_type, receiver_id}, _from, state) do
+    conv_id = conversation_id_for(uid, receiver_type, receiver_id)
+    latest = latest_conversation_message(state, conv_id)
+    message_id = if latest, do: latest["id"], else: "0"
+    now = Time.now()
+
     state =
-      Enum.reduce(ids, state, fn conv_id, st ->
-        update_in(st, ["conversation_messages"], &Map.delete(&1 || %{}, conv_id))
+      update_in(state, ["hidden_conversations", uid], fn hidden ->
+        Map.put(hidden || %{}, conv_id, %{
+          "messageId" => to_s(message_id),
+          "hiddenAt" => now
+        })
       end)
 
-    persist_ops(Enum.map(ids, &RedisPersistence.delete("conversation_messages", &1)))
-    {:reply, {:ok, %{"success" => true, "conversationId" => conversation_id}}, state}
+    persist_ops(hidden_conversations_ops(state, uid))
+
+    {:reply,
+     {:ok,
+      %{
+        "success" => true,
+        "conversationId" => conv_id,
+        "messageId" => to_s(message_id),
+        "hiddenAt" => now
+      }}, state}
   end
 
   def handle_call({:find_message_by_muid, muid}, _from, state) do
@@ -925,6 +981,16 @@ defmodule OpenChat.Store do
 
   defp reads_ops(state, uid),
     do: [RedisPersistence.put_or_delete("reads", uid, get_in(state, ["reads", to_s(uid)]))]
+
+  defp hidden_conversations_ops(state, uid) do
+    [
+      RedisPersistence.put_or_delete(
+        "hidden_conversations",
+        uid,
+        get_in(state, ["hidden_conversations", to_s(uid)])
+      )
+    ]
+  end
 
   defp reactions_ops(state, message_id),
     do: [
@@ -1300,6 +1366,79 @@ defmodule OpenChat.Store do
     end
   end
 
+  defp delete_conversation_indexes(state, conv_ids) do
+    conv_ids =
+      conv_ids |> List.wrap() |> Enum.map(&to_s/1) |> Enum.reject(&blank?/1) |> Enum.uniq()
+
+    read_uids = uids_with_conversations(state, "reads", conv_ids)
+    hidden_uids = uids_with_conversations(state, "hidden_conversations", conv_ids)
+
+    state =
+      state
+      |> update_in(["conversation_messages"], fn conversations ->
+        Enum.reduce(conv_ids, conversations || %{}, &Map.delete(&2, &1))
+      end)
+      |> remove_conversations_from_user_bucket("reads", conv_ids)
+      |> remove_conversations_from_user_bucket("hidden_conversations", conv_ids)
+
+    ops =
+      Enum.map(conv_ids, &RedisPersistence.delete("conversation_messages", &1)) ++
+        Enum.flat_map(read_uids, &reads_ops(state, &1)) ++
+        Enum.flat_map(hidden_uids, &hidden_conversations_ops(state, &1))
+
+    {state, ops}
+  end
+
+  defp delete_message_records(state, message_ids) do
+    message_ids = message_ids |> List.wrap() |> Enum.map(&to_s/1) |> Enum.uniq()
+
+    thread_ids =
+      message_ids
+      |> Enum.filter(&Map.has_key?(state["thread_messages"], &1))
+
+    state =
+      state
+      |> update_in(["messages"], fn messages ->
+        Enum.reduce(message_ids, messages || %{}, &Map.delete(&2, &1))
+      end)
+      |> update_in(["reactions"], fn reactions ->
+        Enum.reduce(message_ids, reactions || %{}, &Map.delete(&2, &1))
+      end)
+      |> update_in(["thread_messages"], fn threads ->
+        Enum.reduce(thread_ids, threads || %{}, &Map.delete(&2, &1))
+      end)
+
+    ops =
+      Enum.map(message_ids, &RedisPersistence.delete("messages", &1)) ++
+        Enum.map(message_ids, &RedisPersistence.delete("reactions", &1)) ++
+        Enum.map(thread_ids, &RedisPersistence.delete("thread_messages", &1))
+
+    {state, ops}
+  end
+
+  defp uids_with_conversations(state, bucket, conv_ids) do
+    state
+    |> Map.get(bucket, %{})
+    |> Enum.filter(fn {_uid, conversations} ->
+      Enum.any?(conv_ids, &Map.has_key?(conversations || %{}, &1))
+    end)
+    |> Enum.map(fn {uid, _conversations} -> uid end)
+  end
+
+  defp remove_conversations_from_user_bucket(state, bucket, conv_ids) do
+    update_in(state, [bucket], fn rows ->
+      rows
+      |> Kernel.||(%{})
+      |> Enum.reduce(%{}, fn {uid, conversations}, acc ->
+        conversations = Enum.reduce(conv_ids, conversations || %{}, &Map.delete(&2, &1))
+
+        if map_size(conversations) == 0,
+          do: acc,
+          else: Map.put(acc, uid, conversations)
+      end)
+    end)
+  end
+
   defp all_conversation_ids_for_user(state, uid) do
     direct =
       state["conversation_messages"]
@@ -1312,7 +1451,9 @@ defmodule OpenChat.Store do
       |> Enum.map(fn {guid, _} -> group_conversation_id(guid) end)
       |> Enum.filter(&Map.has_key?(state["conversation_messages"], &1))
 
-    Enum.uniq(direct ++ groups)
+    (direct ++ groups)
+    |> Enum.uniq()
+    |> Enum.reject(&conversation_hidden?(state, uid, &1))
   end
 
   defp user_conversation_for?(state, uid, "user_" <> _ = conv_id) do
@@ -1335,7 +1476,7 @@ defmodule OpenChat.Store do
   defp build_conversation(state, uid, conv_id) do
     last = latest_conversation_message(state, conv_id)
 
-    if is_nil(last) do
+    if is_nil(last) or conversation_hidden?(state, uid, conv_id) do
       nil
     else
       type = if String.starts_with?(conv_id, "group_"), do: "group", else: "user"
@@ -1363,6 +1504,14 @@ defmodule OpenChat.Store do
     |> Enum.reverse()
     |> Enum.map(&state["messages"][&1])
     |> Enum.find(& &1)
+  end
+
+  defp conversation_hidden?(state, uid, conv_id) do
+    hidden = get_in(state, ["hidden_conversations", uid, conv_id])
+    latest = latest_conversation_message(state, conv_id)
+
+    not is_nil(hidden) and
+      (is_nil(latest) or to_int(latest["id"]) <= to_int(hidden["messageId"]))
   end
 
   defp conversation_with(state, _uid, "group_" <> guid),

@@ -194,7 +194,10 @@ defmodule OpenChatWeb.ApiRouter do
   end
 
   delete "/groups/:guid" do
-    JSON.ok(conn, %{"success" => true, "guid" => guid})
+    with_admin_or_open(conn, fn conn ->
+      {:ok, data} = Store.delete_group(guid)
+      JSON.ok(conn, data)
+    end)
   end
 
   get "/groups/:guid/members" do
@@ -462,11 +465,17 @@ defmodule OpenChatWeb.ApiRouter do
   end
 
   delete "/users/:uid/conversation" do
-    JSON.ok(conn, %{"success" => true, "uid" => uid})
+    with_user(conn, fn conn, user, _token ->
+      {:ok, data} = Store.hide_conversation(user["uid"], "user", uid)
+      JSON.ok(conn, Map.put(data, "uid", uid))
+    end)
   end
 
   delete "/groups/:guid/conversation" do
-    JSON.ok(conn, %{"success" => true, "guid" => guid})
+    with_user(conn, fn conn, user, _token ->
+      {:ok, data} = Store.hide_conversation(user["uid"], "group", guid)
+      JSON.ok(conn, Map.put(data, "guid", guid))
+    end)
   end
 
   delete "/conversations/:conversation_id" do

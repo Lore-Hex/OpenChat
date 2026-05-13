@@ -183,6 +183,77 @@ defmodule OpenChat.StoreRegressionTest do
     assert {:ok, []} = Store.conversations("alice", %{"conversationType" => "user"})
   end
 
+  test "conversation hiding is per viewer and a new message reveals it again" do
+    assert {:ok, first} =
+             Store.send_message("alice", %{
+               "receiver" => "bob",
+               "receiverType" => "user",
+               "data" => %{"text" => "hide me"}
+             })
+
+    assert {:ok, [%{"latestMessageId" => latest_id}]} = Store.conversations("alice")
+    assert latest_id == to_string(first["id"])
+
+    assert {:ok, hidden} = Store.hide_conversation("alice", "user", "bob")
+    assert hidden["conversationId"] == "user_alice_bob"
+    assert hidden["messageId"] == to_string(first["id"])
+
+    assert {:ok, []} = Store.conversations("alice")
+    assert {:ok, nil} = Store.conversation("alice", "user", "bob")
+
+    assert {:ok, [%{"conversationWith" => %{"uid" => "alice"}}]} = Store.conversations("bob")
+
+    assert {:ok, second} =
+             Store.send_message("bob", %{
+               "receiver" => "alice",
+               "receiverType" => "user",
+               "data" => %{"text" => "new after hide"}
+             })
+
+    assert {:ok, [%{"latestMessageId" => latest_id}]} = Store.conversations("alice")
+    assert latest_id == to_string(second["id"])
+  end
+
+  test "group deletion removes group state, indexes, messages, reactions, and thread lists" do
+    assert {:ok, _group} = Store.upsert_group(%{"guid" => "delete-room", "type" => "public"})
+    assert {:ok, _members} = Store.add_group_members("delete-room", ["alice", "bob"])
+    assert {:ok, _ban} = Store.ban_group_member("delete-room", "carol")
+
+    assert {:ok, parent} =
+             Store.send_message("alice", %{
+               "receiver" => "delete-room",
+               "receiverType" => "group",
+               "data" => %{"text" => "parent"}
+             })
+
+    assert {:ok, reply} =
+             Store.send_message("bob", %{
+               "receiver" => "delete-room",
+               "receiverType" => "group",
+               "parentId" => parent["id"],
+               "data" => %{"text" => "reply"}
+             })
+
+    assert {:ok, _message} = Store.add_reaction("bob", parent["id"], "👍")
+    assert {:ok, _read} = Store.mark_read("bob", "group", "delete-room", reply["id"])
+    assert {:ok, _hidden} = Store.hide_conversation("alice", "group", "delete-room")
+
+    assert {:ok, _deleted} = Store.delete_group("delete-room")
+
+    assert :error = Store.get_group("delete-room")
+    assert {:error, %{"code" => "ERR_GUID_NOT_FOUND"}} = Store.group_members("delete-room")
+    assert {:ok, []} = Store.banned_group_members("delete-room")
+
+    assert {:error, %{"code" => "ERR_NOT_A_MEMBER"}} =
+             Store.messages_for_group("alice", "delete-room")
+
+    assert :error = Store.get_message(parent["id"])
+    assert :error = Store.get_message(reply["id"])
+    assert {:ok, []} = Store.messages_for_thread("alice", parent["id"])
+    assert {:ok, []} = Store.reactions("bob", parent["id"], "👍")
+    assert {:ok, []} = Store.conversations("bob", %{"conversationType" => "group"})
+  end
+
   test "media uploads use configured upload dir and public media base URL" do
     old_upload_dir = Application.get_env(:open_chat, :upload_dir)
     old_media_base_url = Application.get_env(:open_chat, :public_media_base_url)

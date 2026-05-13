@@ -106,6 +106,33 @@ defmodule OpenChatWeb.ApiRegressionTest do
 
     assert admin_conn(:put, "/v3/groups/api-scopes/members/bob", %{"scope" => "moderator"}).status ==
              200
+
+    assert admin_conn(:post, "/v3/groups", %{"guid" => "api-delete", "name" => "Delete Me"}).status ==
+             201
+
+    assert admin_conn(:post, "/v3/groups/api-delete/members", %{"participants" => ["alice"]}).status ==
+             200
+
+    assert auth_conn(
+             :post,
+             "/v3.0/messages",
+             %{
+               "receiver" => "api-delete",
+               "receiverType" => "group",
+               "data" => %{"text" => "delete group message"}
+             },
+             "uid:alice"
+           ).status == 201
+
+    assert admin_conn(:delete, "/v3/groups/api-delete").status == 200
+
+    conn = auth_conn(:get, "/v3.0/groups/api-delete")
+    assert conn.status == 404
+    assert json(conn)["error"]["code"] == "ERR_GUID_NOT_FOUND"
+
+    conn = auth_conn(:get, "/v3.0/groups/api-delete/messages", %{}, "uid:alice")
+    assert conn.status == 400
+    assert json(conn)["error"]["code"] == "ERR_NOT_A_MEMBER"
   end
 
   test "message APIs cover errors, thread fetches, muid lookup, cursor metadata, and unread rewind" do
@@ -305,7 +332,7 @@ defmodule OpenChatWeb.ApiRegressionTest do
     assert json(conn)["error"]["code"] == "ERR_NO_AUTH"
   end
 
-  test "group search, banned-user search, block directions, and delivered routes return SDK shapes" do
+  test "group search, banned-user search, block directions, conversation hiding, and delivered routes return SDK shapes" do
     for guid <- ["api-list-a", "api-list-b", "api-other"] do
       assert admin_conn(:post, "/v3/groups", %{"guid" => guid, "name" => guid}).status == 201
     end
@@ -334,7 +361,38 @@ defmodule OpenChatWeb.ApiRegressionTest do
     assert auth_conn(:post, "/v3.0/groups/api-list-a/conversation/delivered", %{}, "uid:alice").status ==
              200
 
-    assert auth_conn(:delete, "/v3.0/users/bob/conversation", %{}, "uid:alice").status == 200
+    message =
+      auth_conn(:post, "/v3.0/messages", %{
+        "receiver" => "bob",
+        "receiverType" => "user",
+        "data" => %{"text" => "hide this conversation"}
+      })
+      |> json()
+      |> get_in(["data"])
+
+    conn = auth_conn(:delete, "/v3.0/users/bob/conversation", %{}, "uid:alice")
+    assert conn.status == 200
+    assert json(conn)["data"]["messageId"] == to_string(message["id"])
+
+    conn = auth_conn(:get, "/v3.0/conversations?conversationType=user", %{}, "uid:alice")
+    refute Enum.any?(json(conn)["data"], &(get_in(&1, ["conversationWith", "uid"]) == "bob"))
+
+    conn = auth_conn(:get, "/v3.0/conversations?conversationType=user", %{}, "uid:bob")
+    assert Enum.any?(json(conn)["data"], &(get_in(&1, ["conversationWith", "uid"]) == "alice"))
+
+    assert auth_conn(
+             :post,
+             "/v3.0/messages",
+             %{
+               "receiver" => "alice",
+               "receiverType" => "user",
+               "data" => %{"text" => "visible again"}
+             },
+             "uid:bob"
+           ).status == 201
+
+    conn = auth_conn(:get, "/v3.0/conversations?conversationType=user", %{}, "uid:alice")
+    assert Enum.any?(json(conn)["data"], &(get_in(&1, ["conversationWith", "uid"]) == "bob"))
 
     assert auth_conn(:delete, "/v3.0/groups/api-list-a/conversation", %{}, "uid:alice").status ==
              200

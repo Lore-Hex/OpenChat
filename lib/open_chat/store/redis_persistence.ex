@@ -14,13 +14,14 @@ defmodule OpenChat.Store.RedisPersistence do
     "conversation_messages",
     "thread_messages",
     "reads",
+    "hidden_conversations",
     "reactions",
     "blocks",
     "banned"
   ]
 
   @counters ["next_id", "next_reaction_id"]
-  @version "2"
+  @version "3"
 
   def load_or_seed(default_state, seed_fun) do
     case Config.redis_url() do

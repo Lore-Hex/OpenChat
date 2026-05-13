@@ -14,13 +14,13 @@ OpenChat is a BEAM/Elixir replacement for the covered subset of CometChat. It is
 | Local JWT and sessions | SDK session/JWT compatibility payloads | `POST /me/jwt`, `POST /user_sessions` | Covered by ExUnit API tests. These are local compatibility payloads, not CometChat-issued credentials. |
 | Users | List, search, paginate, create, update, deactivate, reactivate, fetch with block state | `GET /users`, `POST /users`, `PUT /users`, `GET /users/:uid`, `PUT /users/:uid`, `DELETE /users/:uid` | Covered by store and API regression tests. |
 | Blocks | Block, unblock, list blocked users, `blockedByMe`, `hasBlockedMe` | `GET /blockedusers`, `POST /blockedusers`, `DELETE /blockedusers` | Covered by ExUnit API tests and Playwright SDK contract tests. |
-| Groups and membership | List, search, paginate, create, update, fetch, join public/password groups, member list, add/remove members, update scopes | `GET /groups`, `POST /groups`, `GET /groups/:guid`, `PUT /groups/:guid`, `GET /groups/:guid/members`, `POST /groups/:guid/members`, `PUT /groups/:guid/members`, `DELETE /groups/:guid/members`, `PUT /groups/:guid/members/:uid`, `DELETE /groups/:guid/members/:uid` | Covered by store/API tests and SDK group join contract tests. |
+| Groups and membership | List, search, paginate, create, update, fetch, delete, join public/password groups, member list, add/remove members, update scopes | `GET /groups`, `POST /groups`, `GET /groups/:guid`, `PUT /groups/:guid`, `DELETE /groups/:guid`, `GET /groups/:guid/members`, `POST /groups/:guid/members`, `PUT /groups/:guid/members`, `DELETE /groups/:guid/members`, `PUT /groups/:guid/members/:uid`, `DELETE /groups/:guid/members/:uid` | Covered by store/API/Redis tests and SDK group join contract tests. |
 | Group bans | Ban, unban, list/search banned users | `GET /groups/:guid/bannedusers`, `POST /groups/:guid/bannedusers/:uid`, `DELETE /groups/:guid/bannedusers/:uid` | Covered by API regression and Redis cleanup tests. |
 | Messages | Text, custom, media-shaped messages, multipart media upload, admin sends, validation, deterministic pagination, cursor metadata | `POST /messages`, `GET /users/:uid/messages`, `GET /groups/:guid/messages`, `GET /messages/:messageId`, `GET /user/messages/:muid` | Covered by store tests, API tests, media upload tests, and Playwright SDK contract tests. |
 | Threads | Send replies and fetch thread messages | `POST /messages/:parentId/thread`, `GET /messages/:parentId/thread` | Covered by API regression tests. |
 | Message actions | Edit/delete action messages and hidden deleted-message fetch behavior | `PUT /messages/:messageId`, `DELETE /messages/:messageId` | Covered by store/API tests and SDK delete contract tests. |
 | Unread and read state | Unread count fetches, mark read, mark unread, read cursor rewind | `GET /messages?unread=1&count=1`, `POST /users/:uid/conversation/read`, `POST /groups/:guid/conversation/read`, `DELETE /users/:uid/conversation/read`, `DELETE /groups/:guid/conversation/read` | Covered by store/API tests and WebSocket receipt tests. SDK v4 can also send read receipts over WebSocket, which update read state. |
-| Conversations | List conversations, fetch user/group conversation, delete a conversation by canonical conversation id | `GET /conversations`, `GET /users/:uid/conversation`, `GET /groups/:guid/conversation`, `DELETE /conversations/:conversationId` | Covered by store/API tests and SDK conversation contract tests. |
+| Conversations | List conversations, fetch user/group conversation, hide a conversation for the current user, delete a conversation by canonical conversation id | `GET /conversations`, `GET /users/:uid/conversation`, `GET /groups/:guid/conversation`, `DELETE /users/:uid/conversation`, `DELETE /groups/:guid/conversation`, `DELETE /conversations/:conversationId` | Covered by store/API/Redis tests and SDK conversation contract tests. |
 | Reactions | Native reaction add/remove/list/filter and `callExtension("reactions", ...)` fallback | `POST /messages/:messageId/reactions/:reaction`, `DELETE /messages/:messageId/reactions/:reaction`, `GET /messages/:messageId/reactions`, `GET /messages/:messageId/reactions/:reaction`, `MATCH /extensions/:name/*path`, `MATCH /v1/*path` | Covered by store/API tests. The real SDK extension contract is optional and requires wildcard HTTPS DNS. |
 | Media serving | Serve uploaded media files | `GET /media/:file` | Covered by API regression tests. |
 | WebSocket | SDK auth event, message/action/reaction broadcasts, read receipts, ping/malformed frame handling | `/`, `/ws`, `/socket` | Covered by WebSocket handler tests. |
@@ -29,9 +29,7 @@ OpenChat is a BEAM/Elixir replacement for the covered subset of CometChat. It is
 
 | Area | Routes/API | Current behavior | Status |
 |---|---|---|---|
-| Group deletion | `DELETE /groups/:guid` | Returns `{"success": true, "guid": ...}` only. It does not remove the group, memberships, messages, bans, or related indexes. | Stub |
 | Delivery receipts | `POST /users/:uid/conversation/delivered`, `POST /groups/:guid/conversation/delivered` | Returns success in the SDK shape. It does not persist a delivered cursor or broadcast delivered events. | Stub |
-| Per-view conversation deletion | `DELETE /users/:uid/conversation`, `DELETE /groups/:guid/conversation` | Returns success only. It does not hide/delete the conversation for the current user. Use `DELETE /conversations/:conversationId` for actual canonical conversation deletion. | Stub |
 | Generic message list | `GET /messages` without `unread=1&count=1` | Returns an empty list. Use `GET /users/:uid/messages`, `GET /groups/:guid/messages`, or thread routes for real message history. | Partial |
 | Extensions beyond reactions | `MATCH /extensions/:name/*path`, extension-host fallback | All extension calls are interpreted as reaction add/remove requests. Non-reaction extensions are not implemented. | Partial |
 | SDK sessions and JWTs | `POST /user_sessions`, `POST /me/jwt` | Returns local compatibility payloads only. There is no external CometChat session registry or signed CometChat JWT issuer. | Partial |
@@ -122,6 +120,7 @@ By default all state is in one OTP GenServer. If `REDIS_URL` is set, each mutati
 - `open_chat:conversation_messages:<conversationId>`
 - `open_chat:thread_messages:<parentMessageId>`
 - `open_chat:reads:<uid>`
+- `open_chat:hidden_conversations:<uid>`
 - `open_chat:reactions:<messageId>`
 - `open_chat:blocks:<uid>`
 - `open_chat:banned:<guid>`
