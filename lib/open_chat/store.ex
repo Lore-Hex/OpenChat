@@ -290,7 +290,13 @@ defmodule OpenChat.Store do
 
   def handle_call({:list_users, params}, _from, state) do
     params = stringify_keys(params)
-    users = state["users"] |> Map.values() |> Enum.map(&public_user/1) |> sort_by_key("uid")
+
+    users =
+      state["users"]
+      |> Map.values()
+      |> Enum.reject(& &1["deactivatedAt"])
+      |> Enum.map(&public_user/1)
+      |> sort_by_key("uid")
     search = params["searchKey"] || params["search"]
 
     users =
@@ -477,7 +483,12 @@ defmodule OpenChat.Store do
         {:reply, {:error, Errors.group_not_found(guid)}, state}
 
       {:ok, group} ->
+        {user, state} = ensure_user_in_state(state, uid)
+
         cond do
+          not blank?(user["deactivatedAt"]) ->
+            {:reply, {:error, Errors.no_auth()}, state}
+
           group["type"] == "private" ->
             {:reply, {:error, Errors.forbidden("Private groups must add members server-side.")},
              state}
@@ -959,6 +970,7 @@ defmodule OpenChat.Store do
           Conversations.mark_read(state, uid, receiver_type, receiver_id, message_id, Time.now())
 
         persist_ops(PersistenceOps.reads(state, uid) ++ PersistenceOps.unread_counts(state, uid))
+        publish_receipt(payload, uid, receiver_type, receiver_id, "read")
         {:reply, {:ok, payload}, state}
 
       {:error, error} ->
@@ -1067,39 +1079,43 @@ defmodule OpenChat.Store do
   def handle_call({:add_reaction, uid, id, reaction}, _from, state) do
     with {:ok, message} <- Map.fetch(state["messages"], id),
          :ok <- Access.message(state, uid, message) do
-      reaction = URI.decode(to_s(reaction))
-      now = Time.now()
-      {reaction_id, state} = take_counter(state, "next_reaction_id")
-      user = public_user(state["users"][uid] || normalise_user(%{"uid" => uid}))
+      if message["deletedAt"] do
+        {:reply, {:error, Errors.forbidden("Cannot react to a deleted message.")}, state}
+      else
+        reaction = URI.decode(to_s(reaction))
+        now = Time.now()
+        {reaction_id, state} = take_counter(state, "next_reaction_id")
+        user = public_user(state["users"][uid] || normalise_user(%{"uid" => uid}))
 
-      reaction_obj =
-        Entities.reaction(%{
-          "id" => reaction_id,
-          "messageId" => message["id"],
-          "reaction" => reaction,
-          "uid" => uid,
-          "reactedAt" => now,
-          "reactedBy" => user
-        })
+        reaction_obj =
+          Entities.reaction(%{
+            "id" => reaction_id,
+            "messageId" => message["id"],
+            "reaction" => reaction,
+            "uid" => uid,
+            "reactedAt" => now,
+            "reactedBy" => user
+          })
 
-      state =
-        update_in(state, ["reactions", id], fn reaction_map ->
-          Map.update(reaction_map || %{}, reaction, %{uid => reaction_obj}, fn by_uid ->
-            Map.put(by_uid || %{}, uid, reaction_obj)
+        state =
+          update_in(state, ["reactions", id], fn reaction_map ->
+            Map.update(reaction_map || %{}, reaction, %{uid => reaction_obj}, fn by_uid ->
+              Map.put(by_uid || %{}, uid, reaction_obj)
+            end)
           end)
-        end)
 
-      message = refresh_message_reactions(state, message, uid)
-      state = put_in(state, ["messages", id], message)
-      publish_reaction(state, message, reaction_obj, "message_reaction_added", uid)
+        message = refresh_message_reactions(state, message, uid)
+        state = put_in(state, ["messages", id], message)
+        publish_reaction(state, message, reaction_obj, "message_reaction_added", uid)
 
-      persist_ops(
-        PersistenceOps.reactions(state, id) ++
-          [RedisPersistence.put("messages", id, message)] ++
-          PersistenceOps.next_reaction_id(state)
-      )
+        persist_ops(
+          PersistenceOps.reactions(state, id) ++
+            [RedisPersistence.put("messages", id, message)] ++
+            PersistenceOps.next_reaction_id(state)
+        )
 
-      {:reply, {:ok, message}, state}
+        {:reply, {:ok, message}, state}
+      end
     else
       :error -> {:reply, {:error, Errors.message_not_found(id)}, state}
       {:error, error} -> {:reply, {:error, error}, state}
@@ -1109,29 +1125,33 @@ defmodule OpenChat.Store do
   def handle_call({:remove_reaction, uid, id, reaction}, _from, state) do
     with {:ok, message} <- Map.fetch(state["messages"], id),
          :ok <- Access.message(state, uid, message) do
-      reaction = URI.decode(to_s(reaction))
+      if message["deletedAt"] do
+        {:reply, {:error, Errors.forbidden("Cannot unreact to a deleted message.")}, state}
+      else
+        reaction = URI.decode(to_s(reaction))
 
-      reaction_obj =
-        get_in(state, ["reactions", id, reaction, uid]) ||
-          Entities.reaction(%{
-            "messageId" => message["id"],
-            "reaction" => reaction,
-            "uid" => uid,
-            "reactedAt" => Time.now(),
-            "reactedBy" => public_user(state["users"][uid] || normalise_user(%{"uid" => uid}))
-          })
+        reaction_obj =
+          get_in(state, ["reactions", id, reaction, uid]) ||
+            Entities.reaction(%{
+              "messageId" => message["id"],
+              "reaction" => reaction,
+              "uid" => uid,
+              "reactedAt" => Time.now(),
+              "reactedBy" => public_user(state["users"][uid] || normalise_user(%{"uid" => uid}))
+            })
 
-      state = remove_reaction_from_state(state, id, reaction, uid)
+        state = remove_reaction_from_state(state, id, reaction, uid)
 
-      message = refresh_message_reactions(state, message, uid)
-      state = put_in(state, ["messages", id], message)
-      publish_reaction(state, message, reaction_obj, "message_reaction_removed", uid)
+        message = refresh_message_reactions(state, message, uid)
+        state = put_in(state, ["messages", id], message)
+        publish_reaction(state, message, reaction_obj, "message_reaction_removed", uid)
 
-      persist_ops(
-        PersistenceOps.reactions(state, id) ++ [RedisPersistence.put("messages", id, message)]
-      )
+        persist_ops(
+          PersistenceOps.reactions(state, id) ++ [RedisPersistence.put("messages", id, message)]
+        )
 
-      {:reply, {:ok, message}, state}
+        {:reply, {:ok, message}, state}
+      end
     else
       :error -> {:reply, {:error, Errors.message_not_found(id)}, state}
       {:error, error} -> {:reply, {:error, error}, state}
@@ -1259,51 +1279,61 @@ defmodule OpenChat.Store do
       true ->
         {sender, state} = ensure_user_in_state(state, sender_uid)
         {state, receiver_entity} = ensure_receiver_entity(state, receiver_type, to_s(receiver))
-        {id, state} = take_counter(state, "next_id")
-        now = Time.now()
-        type = params["type"] || MessageData.infer_type(params, uploads)
-        category = params["category"] || "message"
 
-        case MessageData.normalise(params, uploads) do
-          {:ok, data} ->
-            message =
-              Entities.message(%{
-                "id" => id,
-                "muid" => params["muid"],
-                "sender" => sender["uid"],
-                "receiver" => to_s(receiver),
-                "receiverType" => receiver_type,
-                "type" => type,
-                "category" => category,
-                "data" => %{},
-                "sentAt" => now,
-                "updatedAt" => now,
-                "conversationId" => conversation_id_for(sender_uid, receiver_type, receiver),
-                "resource" => params["resource"],
-                "parentId" => params["parentId"] || params["parentMessageId"],
-                "tags" => params["tags"]
-              })
+        cond do
+          not blank?(sender["deactivatedAt"]) and not admin? ->
+            {:error, Errors.no_auth()}
 
-            parent_id = params["parentId"] || params["parentMessageId"]
+          receiver_type == "user" and not blank?(receiver_entity["deactivatedAt"]) and not admin? ->
+            {:error, Errors.user_not_found(receiver)}
 
-            case Access.parent_message(state, sender_uid, parent_id, message["conversationId"],
-                   admin?: admin?
-                 ) do
-              :ok ->
-                data =
-                  data
-                  |> Map.put_new("reactions", [])
-                  |> MessageData.put_entity("sender", "user", public_user(sender))
-                  |> MessageData.put_entity("receiver", receiver_type, receiver_entity)
+          true ->
+            {id, state} = take_counter(state, "next_id")
+            now = Time.now()
+            type = params["type"] || MessageData.infer_type(params, uploads)
+            category = params["category"] || "message"
 
-                {:ok, Map.put(message, "data", data), state}
+            case MessageData.normalise(params, uploads) do
+              {:ok, data} ->
+                message =
+                  Entities.message(%{
+                    "id" => id,
+                    "muid" => params["muid"],
+                    "sender" => sender["uid"],
+                    "receiver" => to_s(receiver),
+                    "receiverType" => receiver_type,
+                    "type" => type,
+                    "category" => category,
+                    "data" => %{},
+                    "sentAt" => now,
+                    "updatedAt" => now,
+                    "conversationId" => conversation_id_for(sender_uid, receiver_type, receiver),
+                    "resource" => params["resource"],
+                    "parentId" => params["parentId"] || params["parentMessageId"],
+                    "tags" => params["tags"]
+                  })
+
+                parent_id = params["parentId"] || params["parentMessageId"]
+
+                case Access.parent_message(state, sender_uid, parent_id, message["conversationId"],
+                       admin?: admin?
+                     ) do
+                  :ok ->
+                    data =
+                      data
+                      |> Map.put_new("reactions", [])
+                      |> MessageData.put_entity("sender", "user", public_user(sender))
+                      |> MessageData.put_entity("receiver", receiver_type, receiver_entity)
+
+                    {:ok, Map.put(message, "data", data), state}
+
+                  {:error, error} ->
+                    {:error, error}
+                end
 
               {:error, error} ->
                 {:error, error}
             end
-
-          {:error, error} ->
-            {:error, error}
         end
     end
   end
@@ -1653,7 +1683,12 @@ defmodule OpenChat.Store do
     cond do
       uid = state["tokens"][token] ->
         user = state["users"][uid] || normalise_user(%{"uid" => uid})
-        {{:ok, user}, state}
+
+        if user["deactivatedAt"] do
+          {{:error, Errors.no_auth()}, state}
+        else
+          {{:ok, user}, state}
+        end
 
       Config.accept_uid_tokens?() and String.starts_with?(token, "uid:") ->
         uid = String.replace_prefix(token, "uid:", "")

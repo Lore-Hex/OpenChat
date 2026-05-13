@@ -2,7 +2,7 @@ defmodule OpenChatWeb.WSHandler do
   @moduledoc false
   @behaviour :cowboy_websocket
 
-  alias OpenChat.{Config, Store, Time}
+  alias OpenChat.{Config, Store}
 
   @impl true
   def init(req, _state),
@@ -94,7 +94,6 @@ defmodule OpenChatWeb.WSHandler do
     receiver_type = event["receiverType"] || body["receiverType"] || "user"
     message_id = body["messageId"] || body["id"] || "0"
     action = body["action"] || "read"
-    timestamp = Time.now()
 
     delivered? = action in ["delivered", "deliver", "message_delivered"]
 
@@ -107,13 +106,6 @@ defmodule OpenChatWeb.WSHandler do
 
       true ->
         :ok
-    end
-
-    receipt = put_in(event, ["body", "timestamp"], timestamp)
-    targets = if receiver_type == "group", do: [{:group, receiver}], else: [{:user, receiver}]
-
-    unless delivered? do
-      OpenChat.PubSub.broadcast(targets, receipt)
     end
 
     {:ok, state}
