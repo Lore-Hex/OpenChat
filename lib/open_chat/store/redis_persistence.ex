@@ -12,6 +12,7 @@ defmodule OpenChat.Store.RedisPersistence do
     "members",
     "messages",
     "conversation_messages",
+    "conversation_latest",
     "thread_messages",
     "reads",
     "delivered",
@@ -22,11 +23,12 @@ defmodule OpenChat.Store.RedisPersistence do
     "message_muids",
     "user_conversations",
     "conversation_users",
-    "user_groups"
+    "user_groups",
+    "unread_counts"
   ]
 
   @counters ["next_id", "next_reaction_id"]
-  @version "5"
+  @version "7"
   @lock_ttl_ms 60_000
   @lock_attempts 600
 
@@ -320,7 +322,6 @@ defmodule OpenChat.Store.RedisPersistence do
     |> read_related_conversation_indexes(related_keys)
     |> read_related_messages(related_keys)
     |> read_related_message_participants(related_keys)
-    |> read_related_conversations(related_keys)
     |> read_counters(default_state, Enum.uniq(counter_keys))
   end
 
@@ -365,7 +366,12 @@ defmodule OpenChat.Store.RedisPersistence do
     message_keys =
       record_keys
       |> Enum.filter(fn {bucket, _id} ->
-        bucket in ["conversation_messages", "thread_messages", "message_muids"]
+        bucket in [
+          "conversation_messages",
+          "conversation_latest",
+          "thread_messages",
+          "message_muids"
+        ]
       end)
       |> Enum.flat_map(fn {bucket, id} -> state |> get_in([bucket, id]) |> List.wrap() end)
       |> Enum.map(&{"messages", to_s(&1)})
@@ -376,7 +382,6 @@ defmodule OpenChat.Store.RedisPersistence do
     state
     |> read_records(message_keys)
     |> read_related_message_participants(message_keys)
-    |> read_related_conversations(message_keys)
   end
 
   defp read_related_token_users(state, record_keys) do
@@ -445,7 +450,7 @@ defmodule OpenChat.Store.RedisPersistence do
           {"groups", guid},
           {"members", guid},
           {"banned", guid},
-          {"conversation_messages", "group_#{guid}"},
+          {"conversation_latest", "group_#{guid}"},
           {"conversation_users", "group_#{guid}"}
         ]
       end)
@@ -484,7 +489,7 @@ defmodule OpenChat.Store.RedisPersistence do
       conversation_ids
       |> Enum.flat_map(fn conv_id ->
         [
-          {"conversation_messages", conv_id},
+          {"conversation_latest", conv_id},
           {"conversation_users", conv_id}
         ]
       end)
@@ -510,7 +515,8 @@ defmodule OpenChat.Store.RedisPersistence do
           {"reads", uid},
           {"delivered", uid},
           {"hidden_conversations", uid},
-          {"user_conversations", uid}
+          {"user_conversations", uid},
+          {"unread_counts", uid}
         ]
       end)
       |> Enum.reject(&(&1 in record_keys))
@@ -526,10 +532,15 @@ defmodule OpenChat.Store.RedisPersistence do
       |> Enum.flat_map(fn {_bucket, id} ->
         case get_in(state, ["messages", id]) do
           %{"receiverType" => "group", "receiver" => guid, "sender" => sender} ->
-            [{"users", sender}, {"groups", guid}, {"members", guid}]
+            [{"users", sender}, {"groups", guid}, {"members", guid}, {"unread_counts", sender}]
 
           %{"receiver" => receiver, "sender" => sender} ->
-            [{"users", sender}, {"users", receiver}]
+            [
+              {"users", sender},
+              {"users", receiver},
+              {"unread_counts", sender},
+              {"unread_counts", receiver}
+            ]
 
           _other ->
             []
@@ -539,24 +550,6 @@ defmodule OpenChat.Store.RedisPersistence do
       |> Enum.uniq()
 
     read_records(state, participant_keys)
-  end
-
-  defp read_related_conversations(state, record_keys) do
-    conversation_keys =
-      record_keys
-      |> Enum.filter(fn {bucket, _id} -> bucket == "messages" end)
-      |> Enum.map(fn {_bucket, id} -> get_in(state, ["messages", id, "conversationId"]) end)
-      |> Enum.reject(&(&1 in [nil, ""]))
-      |> Enum.flat_map(fn conversation_id ->
-        [
-          {"conversation_messages", to_s(conversation_id)},
-          {"conversation_users", to_s(conversation_id)}
-        ]
-      end)
-      |> Enum.reject(&(&1 in record_keys))
-      |> Enum.uniq()
-
-    read_records(state, conversation_keys)
   end
 
   defp read_counters(state, _default_state, []), do: state

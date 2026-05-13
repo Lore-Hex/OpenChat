@@ -145,7 +145,10 @@ defmodule OpenChat.Store.Indexes do
     |> Enum.map(&to_s/1)
     |> Enum.reject(&blank?/1)
     |> Enum.uniq()
-    |> Enum.filter(&Map.has_key?(state["conversation_messages"] || %{}, &1))
+    |> Enum.filter(fn conv_id ->
+      Map.has_key?(state["conversation_latest"] || %{}, conv_id) or
+        Map.has_key?(state["conversation_messages"] || %{}, conv_id)
+    end)
   end
 
   def message_participants(state, %{"receiverType" => "group", "receiver" => guid} = message) do

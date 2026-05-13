@@ -1,6 +1,33 @@
 defmodule OpenChat.Store.Conversations do
   @moduledoc false
 
+  alias OpenChat.Store.Unread
+
+  def rebuild_latest(state) do
+    latest =
+      state
+      |> Map.get("conversation_messages", %{})
+      |> Enum.reduce(%{}, fn {conv_id, ids}, acc ->
+        case latest_message_id(ids, state) do
+          nil -> acc
+          id -> Map.put(acc, to_s(conv_id), id)
+        end
+      end)
+
+    Map.put(state, "conversation_latest", latest)
+  end
+
+  def put_latest(state, message) do
+    conv_id = to_s(message["conversationId"])
+    id = to_s(message["id"])
+
+    if blank?(conv_id) or blank?(id) do
+      state
+    else
+      put_in(state, ["conversation_latest", conv_id], id)
+    end
+  end
+
   def mark_read(state, uid, receiver_type, receiver_id, message_id, now) do
     conv_id = conversation_id_for(uid, receiver_type, receiver_id)
 
@@ -8,6 +35,7 @@ defmodule OpenChat.Store.Conversations do
       update_in(state, ["reads", uid], fn reads ->
         Map.put(reads || %{}, conv_id, %{"messageId" => to_s(message_id), "readAt" => now})
       end)
+      |> Unread.mark_read(uid, conv_id, message_id)
 
     {state,
      %{
@@ -21,13 +49,16 @@ defmodule OpenChat.Store.Conversations do
   def mark_unread(state, uid, receiver_type, receiver_id, message_id, now) do
     conv_id = conversation_id_for(uid, receiver_type, receiver_id)
 
+    previous_id = previous_message_id(state, conv_id, message_id)
+
     state =
       update_in(state, ["reads", uid], fn reads ->
         Map.put(reads || %{}, conv_id, %{
-          "messageId" => previous_message_id(state, conv_id, message_id),
+          "messageId" => previous_id,
           "readAt" => now
         })
       end)
+      |> Unread.mark_read(uid, conv_id, previous_id)
 
     {state, conv_id}
   end
@@ -92,6 +123,9 @@ defmodule OpenChat.Store.Conversations do
       |> update_in(["conversation_messages"], fn conversations ->
         Enum.reduce(conv_ids, conversations || %{}, &Map.delete(&2, &1))
       end)
+      |> update_in(["conversation_latest"], fn latest ->
+        Enum.reduce(conv_ids, latest || %{}, &Map.delete(&2, &1))
+      end)
 
     state =
       Enum.reduce(user_buckets, state, fn bucket, acc ->
@@ -121,11 +155,13 @@ defmodule OpenChat.Store.Conversations do
   end
 
   def latest_message(state, conv_id) do
-    state["conversation_messages"]
-    |> Map.get(conv_id, [])
-    |> Enum.reverse()
-    |> Enum.map(&state["messages"][&1])
-    |> Enum.find(& &1)
+    case get_in(state, ["conversation_latest", to_s(conv_id)]) do
+      id when is_binary(id) and id != "" ->
+        get_in(state, ["messages", id]) || latest_message_from_conversation(state, conv_id)
+
+      _other ->
+        latest_message_from_conversation(state, conv_id)
+    end
   end
 
   def previous_message_id(state, conv_id, message_id) do
@@ -200,6 +236,24 @@ defmodule OpenChat.Store.Conversations do
   defp empty_conversations?(_conversations), do: true
 
   defp blank?(value), do: value in [nil, "", false]
+
+  defp latest_message_from_conversation(state, conv_id) do
+    state["conversation_messages"]
+    |> Map.get(to_s(conv_id), [])
+    |> latest_message_id(state)
+    |> case do
+      nil -> nil
+      id -> get_in(state, ["messages", id])
+    end
+  end
+
+  defp latest_message_id(ids, state) do
+    ids
+    |> List.wrap()
+    |> Enum.reverse()
+    |> Enum.map(&to_s/1)
+    |> Enum.find(&Map.has_key?(state["messages"] || %{}, &1))
+  end
 
   defp to_s(nil), do: ""
   defp to_s(value) when is_binary(value), do: value

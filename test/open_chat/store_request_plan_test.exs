@@ -19,6 +19,9 @@ defmodule OpenChat.StoreRequestPlanTest do
              {"users", "plan-a"},
              {:counter, "next_id"},
              {"conversation_messages", conversation_id},
+             {"conversation_latest", conversation_id},
+             {"unread_counts", "plan-a"},
+             {"unread_counts", "plan-b"},
              {"users", "plan-b"}
            ]
   end
@@ -43,6 +46,7 @@ defmodule OpenChat.StoreRequestPlanTest do
              {"banned", "plan-room"},
              {"users", "plan-user"},
              {"user_groups", "plan-user"},
+             {"unread_counts", "plan-user"},
              {:counter, "next_id"}
            ]
 
@@ -53,6 +57,7 @@ defmodule OpenChat.StoreRequestPlanTest do
              {"members", "plan-room"},
              {"banned", "plan-room"},
              {"user_groups", "plan-user"},
+             {"unread_counts", "plan-user"},
              {:counter, "next_id"}
            ]
   end
@@ -86,13 +91,22 @@ defmodule OpenChat.StoreRequestPlanTest do
   test "message action follow-up refresh covers actor and group moderator records" do
     state = %{
       "messages" => %{
-        "42" => %{"sender" => "sender", "receiverType" => "group", "receiver" => "room"}
+        "42" => %{
+          "sender" => "sender",
+          "receiverType" => "group",
+          "receiver" => "room",
+          "conversationId" => "group_room"
+        }
       }
     }
 
     assert RequestPlan.followup_refresh({:delete_message, "moderator", "42", []}, state) == [
              {"users", "moderator"},
              {"users", "sender"},
+             {"conversation_messages", "group_room"},
+             {"conversation_latest", "group_room"},
+             {"conversation_users", "group_room"},
+             {"unread_counts", "moderator"},
              {"groups", "room"},
              {"members", "room"},
              {"banned", "room"}
@@ -113,13 +127,16 @@ defmodule OpenChat.StoreRequestPlanTest do
 
     assert RequestPlan.build({:mark_read, "alice", "user", "bob", "55"}).refresh == [
              {"conversation_messages", direct_conversation},
+             {"conversation_latest", direct_conversation},
              {"users", "bob"},
              {"messages", "55"},
-             {"reads", "alice"}
+             {"reads", "alice"},
+             {"unread_counts", "alice"}
            ]
 
     assert RequestPlan.build({:mark_delivered, "alice", "group", "room", "77"}).refresh == [
              {"conversation_messages", "group_room"},
+             {"conversation_latest", "group_room"},
              {"groups", "room"},
              {"members", "room"},
              {"banned", "room"},
@@ -139,6 +156,9 @@ defmodule OpenChat.StoreRequestPlanTest do
              {"users", "alice"},
              {:counter, "next_id"},
              {"conversation_messages", direct_conversation},
+             {"conversation_latest", direct_conversation},
+             {"unread_counts", "alice"},
+             {"unread_counts", "bob"},
              {"messages", "55"},
              {"users", "bob"}
            ]
@@ -175,7 +195,8 @@ defmodule OpenChat.StoreRequestPlanTest do
              {"user_groups", "alice"},
              {"reads", "alice"},
              {"delivered", "alice"},
-             {"hidden_conversations", "alice"}
+             {"hidden_conversations", "alice"},
+             {"unread_counts", "alice"}
            ]
   end
 end

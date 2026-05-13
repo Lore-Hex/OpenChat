@@ -80,6 +80,43 @@ defmodule OpenChat.LoadPerfTest do
     assert_rate("concurrent store messages", total, seconds, minimum)
   end
 
+  test "deep conversations keep unread and conversation reads on cursor indexes" do
+    messages = env_int("OPENCHAT_LOAD_DEEP_CONVERSATION_MESSAGES", 2_000)
+    reads = env_int("OPENCHAT_LOAD_DEEP_CONVERSATION_READS", 600)
+    minimum = env_int("OPENCHAT_MIN_DEEP_CURSOR_READ_PER_SEC", 300)
+
+    sent =
+      Enum.map(1..messages, fn i ->
+        assert {:ok, message} =
+                 Store.send_message("deep-cursor-a", %{
+                   "receiver" => "deep-cursor-b",
+                   "receiverType" => "user",
+                   "type" => "text",
+                   "data" => %{"text" => "deep #{i}"}
+                 })
+
+        message
+      end)
+
+    latest_id = List.last(sent)["id"]
+
+    {results, seconds} =
+      timed(fn ->
+        concurrent_map(1..reads, env_int("OPENCHAT_LOAD_DEEP_READ_CONCURRENCY", 16), fn _i ->
+          assert {:ok, [%{"entityId" => "deep-cursor-a", "count" => ^messages}]} =
+                   Store.unread_counts("deep-cursor-b")
+
+          assert {:ok, [conversation]} = Store.conversations("deep-cursor-b", %{"limit" => 1})
+          assert conversation["latestMessageId"] == to_string(latest_id)
+          assert conversation["unreadMessageCount"] == messages
+          conversation["latestMessageId"]
+        end)
+      end)
+
+    assert length(results) == reads
+    assert_rate("deep conversation cursor reads", reads * 2, seconds, minimum)
+  end
+
   test "group fanout plus read and delivered receipts keep conversation cursors stable" do
     members = env_int("OPENCHAT_LOAD_GROUP_MEMBERS", 150)
     messages = env_int("OPENCHAT_LOAD_GROUP_MESSAGES", 600)
@@ -268,6 +305,65 @@ defmodule OpenChat.LoadPerfTest do
     end)
   end
 
+  test "concurrent Redis write-through across peer stores scales on independent conversations" do
+    with_redis(fn context ->
+      peer = start_peer_store!()
+
+      try do
+        lanes = env_int("OPENCHAT_LOAD_REDIS_PEER_LANES", 16)
+        concurrency = env_int("OPENCHAT_LOAD_REDIS_PEER_CONCURRENCY", 10)
+        per_lane = env_int("OPENCHAT_LOAD_REDIS_PEER_MESSAGES_PER_LANE", 20)
+        total = lanes * per_lane
+        minimum = env_int("OPENCHAT_MIN_REDIS_PEER_MSG_PER_SEC", 20)
+
+        Redix.command!(context.redis, ["SET", redis_key(context, "counter", "next_id"), "500"])
+
+        {ids, seconds} =
+          timed(fn ->
+            concurrent_map(1..total, concurrency, fn i ->
+              lane = rem(i, lanes)
+              sender = "redis-peer-#{lane}-a"
+              receiver = "redis-peer-#{lane}-b"
+
+              if rem(i, 2) == 0 do
+                assert {:ok, message} =
+                         Store.send_message(sender, %{
+                           "receiver" => receiver,
+                           "receiverType" => "user",
+                           "type" => "text",
+                           "data" => %{"text" => "primary peer #{i}"}
+                         })
+
+                message["id"]
+              else
+                assert {:ok, message} =
+                         Store.call_on(
+                           peer,
+                           {:send_message, sender,
+                            %{
+                              "receiver" => receiver,
+                              "receiverType" => "user",
+                              "type" => "text",
+                              "data" => %{"text" => "peer #{i}"}
+                            }, [], []}
+                         )
+
+                message["id"]
+              end
+            end)
+          end)
+
+        assert length(ids) == total
+        assert ids |> MapSet.new() |> MapSet.size() == total
+        assert redis_get(context, "counter", "next_id") == to_string(Enum.max(ids) + 1)
+        assert length(redis_members(context, "index", "messages")) == total
+        assert_rate("Redis peer store messages", total, seconds, minimum)
+      after
+        stop_peer_store(peer)
+      end
+    end)
+  end
+
   test "concurrent Redis secondary-index reads stay consistent under write-through load" do
     with_redis(fn context ->
       concurrency = env_int("OPENCHAT_LOAD_REDIS_INDEX_CONCURRENCY", 8)
@@ -384,6 +480,15 @@ defmodule OpenChat.LoadPerfTest do
   end
 
   defp load_user(i, users), do: "load-user-#{rem(i, users)}"
+
+  defp start_peer_store! do
+    {:ok, pid} = Store.start_link(name: nil)
+    pid
+  end
+
+  defp stop_peer_store(pid) when is_pid(pid) do
+    if Process.alive?(pid), do: GenServer.stop(pid)
+  end
 
   defp restart_store! do
     if Process.whereis(OpenChat.Store) do

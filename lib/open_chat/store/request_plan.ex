@@ -59,12 +59,17 @@ defmodule OpenChat.Store.RequestPlan do
     do:
       mutate(
         group_scope(guid),
-        group_keys(guid) ++ user_record_keys(uid) ++ [{"user_groups", uid}, {:counter, "next_id"}]
+        group_keys(guid) ++
+          user_record_keys(uid) ++
+          [{"user_groups", uid}, {"unread_counts", uid}, {:counter, "next_id"}]
       )
 
   def build({:leave_group, guid, uid}),
     do:
-      mutate(group_scope(guid), group_keys(guid) ++ [{"user_groups", uid}, {:counter, "next_id"}])
+      mutate(
+        group_scope(guid),
+        group_keys(guid) ++ [{"user_groups", uid}, {"unread_counts", uid}, {:counter, "next_id"}]
+      )
 
   def build({:add_group_members, guid, uids, _scope, opts}) do
     mutate(
@@ -72,7 +77,8 @@ defmodule OpenChat.Store.RequestPlan do
       group_keys(guid) ++
         actor_user_keys(opts) ++
         Enum.flat_map(List.wrap(uids), &user_record_keys/1) ++
-        Enum.map(List.wrap(uids), &{"user_groups", &1})
+        Enum.map(List.wrap(uids), &{"user_groups", &1}) ++
+        Enum.map(List.wrap(uids), &{"unread_counts", &1})
     )
   end
 
@@ -85,7 +91,8 @@ defmodule OpenChat.Store.RequestPlan do
       group_keys(guid) ++
         actor_user_keys(opts) ++
         Enum.flat_map(uids_from_scope_map(scope_map), &user_record_keys/1) ++
-        Enum.map(uids_from_scope_map(scope_map), &{"user_groups", &1})
+        Enum.map(uids_from_scope_map(scope_map), &{"user_groups", &1}) ++
+        Enum.map(uids_from_scope_map(scope_map), &{"unread_counts", &1})
     )
   end
 
@@ -93,7 +100,8 @@ defmodule OpenChat.Store.RequestPlan do
     do:
       mutate(
         group_scope(guid),
-        group_keys(guid) ++ user_record_keys(uid) ++ [{"user_groups", uid}]
+        group_keys(guid) ++
+          user_record_keys(uid) ++ [{"user_groups", uid}, {"unread_counts", uid}]
       )
 
   def build({:unban_group_member, guid, _uid}), do: mutate(group_scope(guid), [{"banned", guid}])
@@ -107,6 +115,7 @@ defmodule OpenChat.Store.RequestPlan do
     refresh =
       [{"users", sender_uid}, {:counter, "next_id"}] ++
         conversation_record_keys(sender_uid, receiver_type, receiver) ++
+        unread_count_keys(sender_uid, receiver_type, receiver) ++
         parent_message_keys(params) ++
         if(receiver_type == "group", do: group_keys(receiver), else: user_record_keys(receiver))
 
@@ -151,7 +160,9 @@ defmodule OpenChat.Store.RequestPlan do
       when receipt in [:mark_read, :mark_unread] do
     mutate(
       conversation_scope(uid, receiver_type, receiver_id) ++ user_scope(uid),
-      receipt_refresh_keys(uid, receiver_type, receiver_id, message_id) ++ [{"reads", uid}]
+      receipt_refresh_keys(uid, receiver_type, receiver_id, message_id) ++
+        [{"reads", uid}] ++
+        [{"unread_counts", uid}]
     )
   end
 
@@ -163,6 +174,7 @@ defmodule OpenChat.Store.RequestPlan do
   end
 
   def build({:unread_counts, uid, _params}), do: read(user_conversation_keys(uid))
+
   def build({:conversations, uid, _params}), do: read(user_conversation_keys(uid))
 
   def build({:conversation, uid, receiver_type, receiver_id}) do
@@ -170,7 +182,8 @@ defmodule OpenChat.Store.RequestPlan do
       [
         {"reads", uid},
         {"delivered", uid},
-        {"hidden_conversations", uid}
+        {"hidden_conversations", uid},
+        {"unread_counts", uid}
       ] ++
         conversation_record_keys(uid, receiver_type, receiver_id) ++
         if(receiver_type == "group",
@@ -204,6 +217,21 @@ defmodule OpenChat.Store.RequestPlan do
     |> Enum.uniq()
   end
 
+  def followup_refresh({:send_message, sender_uid, params, _uploads, _opts}, state) do
+    params = stringify_keys(params)
+    receiver = params["receiver"] || params["receiverId"]
+    receiver_type = receiver_type(params)
+
+    unread_count_keys(sender_uid, receiver_type, receiver, state)
+  end
+
+  def followup_refresh({:delete_conversation, conversation_id}, state) do
+    state
+    |> get_in(["conversation_users", to_s(conversation_id)])
+    |> List.wrap()
+    |> Enum.map(&{"unread_counts", &1})
+  end
+
   def followup_refresh({request, uid, id, _opts}, state) when request in [:delete_message] do
     message_action_refresh_keys(state, uid, id)
   end
@@ -233,6 +261,8 @@ defmodule OpenChat.Store.RequestPlan do
     if valid_receiver?(receiver_type, receiver_id) do
       [
         {"conversation_messages",
+         Conversations.conversation_id_for(uid, receiver_type, receiver_id)},
+        {"conversation_latest",
          Conversations.conversation_id_for(uid, receiver_type, receiver_id)}
       ]
     else
@@ -247,6 +277,35 @@ defmodule OpenChat.Store.RequestPlan do
         else: user_record_keys(receiver_id)
       ) ++
       message_record_keys(message_id)
+  end
+
+  defp unread_count_keys(sender_uid, "user", receiver_id) do
+    [sender_uid, receiver_id]
+    |> Enum.map(&to_s/1)
+    |> Enum.reject(&blank?/1)
+    |> Enum.uniq()
+    |> Enum.map(&{"unread_counts", &1})
+  end
+
+  defp unread_count_keys(_sender_uid, "group", _receiver_id), do: []
+  defp unread_count_keys(_sender_uid, _receiver_type, _receiver_id), do: []
+
+  defp unread_count_keys(sender_uid, "group", receiver_id, state) do
+    state
+    |> get_in(["members", to_s(receiver_id)])
+    |> case do
+      members when is_map(members) -> Map.keys(members)
+      _other -> []
+    end
+    |> Kernel.++([sender_uid])
+    |> Enum.map(&to_s/1)
+    |> Enum.reject(&blank?/1)
+    |> Enum.uniq()
+    |> Enum.map(&{"unread_counts", &1})
+  end
+
+  defp unread_count_keys(sender_uid, receiver_type, receiver_id, _state) do
+    unread_count_keys(sender_uid, receiver_type, receiver_id)
   end
 
   defp parent_message_keys(params) do
@@ -311,6 +370,8 @@ defmodule OpenChat.Store.RequestPlan do
 
     user_record_keys(uid) ++
       user_record_keys(message["sender"]) ++
+      conversation_index_keys(message["conversationId"]) ++
+      unread_count_keys(uid, message["receiverType"], message["receiver"], state) ++
       case message["receiverType"] do
         "group" -> group_keys(message["receiver"])
         "user" -> user_record_keys(message["receiver"])
@@ -329,7 +390,13 @@ defmodule OpenChat.Store.RequestPlan do
 
   defp group_delete_keys(guid) do
     conv_id = Conversations.group_conversation_id(guid)
-    group_keys(guid) ++ [{"conversation_messages", conv_id}, {"conversation_users", conv_id}]
+
+    group_keys(guid) ++
+      [
+        {"conversation_messages", conv_id},
+        {"conversation_latest", conv_id},
+        {"conversation_users", conv_id}
+      ]
   end
 
   defp conversation_delete_keys(conversation_id) do
@@ -344,8 +411,26 @@ defmodule OpenChat.Store.RequestPlan do
     |> Kernel.++(extra_ids)
     |> Enum.uniq()
     |> Enum.flat_map(fn conv_id ->
-      [{"conversation_messages", conv_id}, {"conversation_users", conv_id}]
+      [
+        {"conversation_messages", conv_id},
+        {"conversation_latest", conv_id},
+        {"conversation_users", conv_id}
+      ]
     end)
+  end
+
+  defp conversation_index_keys(conversation_id) do
+    conversation_id = to_s(conversation_id)
+
+    if blank?(conversation_id) do
+      []
+    else
+      [
+        {"conversation_messages", conversation_id},
+        {"conversation_latest", conversation_id},
+        {"conversation_users", conversation_id}
+      ]
+    end
   end
 
   defp user_conversation_keys(uid) do
@@ -354,7 +439,8 @@ defmodule OpenChat.Store.RequestPlan do
       {"user_groups", uid},
       {"reads", uid},
       {"delivered", uid},
-      {"hidden_conversations", uid}
+      {"hidden_conversations", uid},
+      {"unread_counts", uid}
     ]
   end
 

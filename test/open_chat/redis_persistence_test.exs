@@ -66,7 +66,7 @@ defmodule OpenChat.RedisPersistenceTest do
 
       assert {:ok, _message} = Store.add_reaction("alice", message["id"], "👍")
 
-      assert redis_get(context, "meta", "version") == "5"
+      assert redis_get(context, "meta", "version") == "7"
       assert redis_get_raw(context, context.snapshot_key) == nil
 
       assert "redis-user" in redis_members(context, "index", "users")
@@ -74,6 +74,7 @@ defmodule OpenChat.RedisPersistenceTest do
       assert "redis-room" in redis_members(context, "index", "groups")
       assert to_string(message["id"]) in redis_members(context, "index", "messages")
       assert "redis-muid" in redis_members(context, "index", "message_muids")
+      assert message["conversationId"] in redis_members(context, "index", "conversation_latest")
       assert "redis-user" in redis_members(context, "index", "user_conversations")
       assert "alice" in redis_members(context, "index", "user_conversations")
       assert message["conversationId"] in redis_members(context, "index", "conversation_users")
@@ -84,6 +85,9 @@ defmodule OpenChat.RedisPersistenceTest do
       assert redis_json(context, "members", "redis-room")["redis-user"]["scope"] == "admin"
       assert redis_json(context, "messages", message["id"])["data"]["text"] == "stored per key"
       assert redis_json(context, "message_muids", "redis-muid") == to_string(message["id"])
+
+      assert redis_json(context, "conversation_latest", message["conversationId"]) ==
+               to_string(message["id"])
 
       assert redis_json(context, "user_conversations", "redis-user") == [
                message["conversationId"]
@@ -249,7 +253,7 @@ defmodule OpenChat.RedisPersistenceTest do
 
       assert {:ok, me} = Store.me("legacy-token")
       assert me["uid"] == "legacy-user"
-      assert redis_get(context, "meta", "version") == "5"
+      assert redis_get(context, "meta", "version") == "7"
       assert redis_json(context, "users", "legacy-user")["name"] == "Legacy User"
 
       assert {:ok, message} =
@@ -287,6 +291,7 @@ defmodule OpenChat.RedisPersistenceTest do
 
       assert auth["authToken"] in redis_members(context, "index", "tokens")
       assert "user_alice_cleanup-user" in redis_members(context, "index", "conversation_messages")
+      assert "user_alice_cleanup-user" in redis_members(context, "index", "conversation_latest")
       assert "user_alice_cleanup-user" in redis_members(context, "index", "conversation_users")
       assert "cleanup-user" in redis_members(context, "index", "user_conversations")
       assert "alice" in redis_members(context, "index", "user_conversations")
@@ -311,6 +316,7 @@ defmodule OpenChat.RedisPersistenceTest do
 
       refute auth["authToken"] in redis_members(context, "index", "tokens")
       refute "user_alice_cleanup-user" in redis_members(context, "index", "conversation_messages")
+      refute "user_alice_cleanup-user" in redis_members(context, "index", "conversation_latest")
       refute "user_alice_cleanup-user" in redis_members(context, "index", "conversation_users")
       refute "cleanup-user" in redis_members(context, "index", "user_conversations")
       refute "alice" in redis_members(context, "index", "user_conversations")
@@ -336,6 +342,11 @@ defmodule OpenChat.RedisPersistenceTest do
       assert redis_get_raw(
                context,
                redis_key(context, "conversation_users", "user_alice_cleanup-user")
+             ) == nil
+
+      assert redis_get_raw(
+               context,
+               redis_key(context, "conversation_latest", "user_alice_cleanup-user")
              ) == nil
 
       assert redis_get_raw(context, redis_key(context, "user_conversations", "cleanup-user")) ==
@@ -370,6 +381,7 @@ defmodule OpenChat.RedisPersistenceTest do
       assert "redis-delete-room" in redis_members(context, "index", "members")
       assert "redis-delete-room" in redis_members(context, "index", "banned")
       assert "group_redis-delete-room" in redis_members(context, "index", "conversation_messages")
+      assert "group_redis-delete-room" in redis_members(context, "index", "conversation_latest")
       assert "group_redis-delete-room" in redis_members(context, "index", "conversation_users")
       assert to_string(message["id"]) in redis_members(context, "index", "messages")
       assert to_string(message["id"]) in redis_members(context, "index", "reactions")
@@ -385,6 +397,7 @@ defmodule OpenChat.RedisPersistenceTest do
       refute "redis-delete-room" in redis_members(context, "index", "members")
       refute "redis-delete-room" in redis_members(context, "index", "banned")
       refute "group_redis-delete-room" in redis_members(context, "index", "conversation_messages")
+      refute "group_redis-delete-room" in redis_members(context, "index", "conversation_latest")
       refute "group_redis-delete-room" in redis_members(context, "index", "conversation_users")
       refute to_string(message["id"]) in redis_members(context, "index", "messages")
       refute to_string(message["id"]) in redis_members(context, "index", "reactions")
@@ -403,6 +416,11 @@ defmodule OpenChat.RedisPersistenceTest do
       assert redis_get_raw(
                context,
                redis_key(context, "conversation_users", "group_redis-delete-room")
+             ) == nil
+
+      assert redis_get_raw(
+               context,
+               redis_key(context, "conversation_latest", "group_redis-delete-room")
              ) == nil
 
       assert redis_get_raw(context, redis_key(context, "user_groups", "alice")) == nil
@@ -532,6 +550,7 @@ defmodule OpenChat.RedisPersistenceTest do
       redis_put_json(context, ["messages", 999], second)
       redis_put_json(context, ["message_muids", "secondary-conversation-muid"], "999")
       redis_put_json(context, ["conversation_messages", conv_id], [to_string(first["id"]), "999"])
+      redis_put_json(context, ["conversation_latest", conv_id], "999")
       redis_put_json(context, ["conversation_users", conv_id], ["secondary-a", "secondary-b"])
       redis_put_json(context, ["user_conversations", "secondary-a"], [conv_id])
       redis_put_json(context, ["user_conversations", "secondary-b"], [conv_id])
@@ -540,6 +559,7 @@ defmodule OpenChat.RedisPersistenceTest do
             {"messages", "999"},
             {"message_muids", "secondary-conversation-muid"},
             {"conversation_messages", conv_id},
+            {"conversation_latest", conv_id},
             {"conversation_users", conv_id},
             {"user_conversations", "secondary-a"},
             {"user_conversations", "secondary-b"}
@@ -552,6 +572,57 @@ defmodule OpenChat.RedisPersistenceTest do
 
       assert get_in(conversation, ["lastMessage", "data", "text"]) ==
                "external conversation latest"
+    end)
+  end
+
+  test "conversation reads use the latest-message index without loading full histories",
+       context do
+    with_redis(context, fn ->
+      now = OpenChat.Time.now()
+      conv_id = Conversations.user_conversation_id("latest-index-a", "latest-index-b")
+
+      latest = %{
+        "id" => 7001,
+        "sender" => "latest-index-b",
+        "receiver" => "latest-index-a",
+        "receiverType" => "user",
+        "type" => "text",
+        "category" => "message",
+        "data" => %{"text" => "indexed latest", "reactions" => []},
+        "sentAt" => now,
+        "updatedAt" => now,
+        "conversationId" => conv_id
+      }
+
+      redis_put_json(context, ["messages", "7001"], latest)
+      redis_put_json(context, ["conversation_latest", conv_id], "7001")
+
+      redis_put_json(context, ["conversation_users", conv_id], [
+        "latest-index-a",
+        "latest-index-b"
+      ])
+
+      redis_put_json(context, ["user_conversations", "latest-index-a"], [conv_id])
+      redis_put_json(context, ["user_conversations", "latest-index-b"], [conv_id])
+      redis_put_json(context, ["unread_counts", "latest-index-a"], %{conv_id => 1})
+
+      for {bucket, id} <- [
+            {"messages", "7001"},
+            {"conversation_latest", conv_id},
+            {"conversation_users", conv_id},
+            {"user_conversations", "latest-index-a"},
+            {"user_conversations", "latest-index-b"},
+            {"unread_counts", "latest-index-a"}
+          ] do
+        redis_index!(context, bucket, id)
+      end
+
+      assert {:ok, [conversation]} = Store.conversations("latest-index-a", %{"limit" => 1})
+      assert conversation["latestMessageId"] == "7001"
+      assert conversation["unreadMessageCount"] == 1
+      assert get_in(conversation, ["lastMessage", "data", "text"]) == "indexed latest"
+
+      assert redis_get_raw(context, redis_key(context, "conversation_messages", conv_id)) == nil
     end)
   end
 
@@ -665,6 +736,110 @@ defmodule OpenChat.RedisPersistenceTest do
     end)
   end
 
+  test "peer Store processes coordinate counters, latest indexes, and unread cursors through Redis",
+       context do
+    with_redis(context, fn ->
+      peer = start_peer_store!()
+
+      try do
+        conv_id = Conversations.user_conversation_id("multi-a", "multi-b")
+
+        assert {:ok, from_primary} =
+                 Store.send_message("multi-a", %{
+                   "receiver" => "multi-b",
+                   "receiverType" => "user",
+                   "data" => %{"text" => "from primary"}
+                 })
+
+        assert {:ok, from_peer} =
+                 Store.call_on(
+                   peer,
+                   {:send_message, "multi-b",
+                    %{
+                      "receiver" => "multi-a",
+                      "receiverType" => "user",
+                      "data" => %{"text" => "from peer"}
+                    }, [], []}
+                 )
+
+        assert MapSet.new([from_primary["id"], from_peer["id"]]) |> MapSet.size() == 2
+        assert from_peer["id"] > from_primary["id"]
+        assert redis_json(context, "conversation_latest", conv_id) == to_string(from_peer["id"])
+
+        assert {:ok, [%{"entityId" => "multi-b", "count" => 1}]} =
+                 Store.unread_counts("multi-a")
+
+        assert {:ok, [%{"entityId" => "multi-a", "count" => 1}]} =
+                 Store.call_on(peer, {:unread_counts, "multi-b", %{}})
+
+        assert {:ok, _read} = Store.mark_read("multi-a", "user", "multi-b", from_peer["id"])
+        assert {:ok, []} = Store.call_on(peer, {:unread_counts, "multi-a", %{}})
+        assert redis_get_raw(context, redis_key(context, "unread_counts", "multi-a")) == nil
+        assert redis_json(context, "unread_counts", "multi-b") == %{conv_id => 1}
+      after
+        stop_peer_store(peer)
+      end
+    end)
+  end
+
+  test "concurrent peer Store writes keep Redis IDs, indexes, and unread counts consistent",
+       context do
+    with_redis(context, fn ->
+      peer = start_peer_store!()
+
+      try do
+        total = 40
+        conv_id = Conversations.user_conversation_id("peer-race-a", "peer-race-b")
+
+        ids =
+          1..total
+          |> Task.async_stream(
+            fn i ->
+              if rem(i, 2) == 0 do
+                assert {:ok, message} =
+                         Store.send_message("peer-race-a", %{
+                           "receiver" => "peer-race-b",
+                           "receiverType" => "user",
+                           "data" => %{"text" => "primary #{i}"}
+                         })
+
+                message["id"]
+              else
+                assert {:ok, message} =
+                         Store.call_on(
+                           peer,
+                           {:send_message, "peer-race-b",
+                            %{
+                              "receiver" => "peer-race-a",
+                              "receiverType" => "user",
+                              "data" => %{"text" => "peer #{i}"}
+                            }, [], []}
+                         )
+
+                message["id"]
+              end
+            end,
+            max_concurrency: 8,
+            ordered: false,
+            timeout: :infinity
+          )
+          |> Enum.map(fn {:ok, id} -> id end)
+
+        assert MapSet.new(ids) |> MapSet.size() == total
+        assert length(redis_json(context, "conversation_messages", conv_id)) == total
+        assert redis_json(context, "conversation_latest", conv_id) == to_string(Enum.max(ids))
+
+        assert {:ok, [%{"entityId" => "peer-race-b", "count" => 20}]} =
+                 Store.unread_counts("peer-race-a")
+
+        assert {:ok, [%{"entityId" => "peer-race-a", "count" => 20}]} =
+                 Store.call_on(peer, {:unread_counts, "peer-race-b", %{}})
+      after
+        stop_peer_store(peer)
+      end
+    end)
+  end
+
   test "Redis counter allocation ignores stale local next_id", context do
     with_redis(context, fn ->
       Redix.command!(context.redis, ["SET", redis_key(context, "counter", "next_id"), "1000"])
@@ -722,6 +897,15 @@ defmodule OpenChat.RedisPersistenceTest do
   end
 
   defp with_redis(_context, fun), do: fun.()
+
+  defp start_peer_store! do
+    {:ok, pid} = Store.start_link(name: nil)
+    pid
+  end
+
+  defp stop_peer_store(pid) when is_pid(pid) do
+    if Process.alive?(pid), do: GenServer.stop(pid)
+  end
 
   defp restart_store! do
     if Process.whereis(OpenChat.Store) do

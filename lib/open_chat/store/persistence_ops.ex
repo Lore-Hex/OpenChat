@@ -84,6 +84,17 @@ defmodule OpenChat.Store.PersistenceOps do
     end)
   end
 
+  def unread_counts(state, uids) do
+    uids
+    |> List.wrap()
+    |> Enum.map(&to_s/1)
+    |> Enum.reject(&blank?/1)
+    |> Enum.uniq()
+    |> Enum.map(fn uid ->
+      RedisPersistence.put_or_delete("unread_counts", uid, get_in(state, ["unread_counts", uid]))
+    end)
+  end
+
   def conversation_users(state, conversation_ids) do
     conversation_ids
     |> List.wrap()
@@ -95,6 +106,21 @@ defmodule OpenChat.Store.PersistenceOps do
         "conversation_users",
         conversation_id,
         get_in(state, ["conversation_users", conversation_id])
+      )
+    end)
+  end
+
+  def conversation_latest(state, conversation_ids) do
+    conversation_ids
+    |> List.wrap()
+    |> Enum.map(&to_s/1)
+    |> Enum.reject(&blank?/1)
+    |> Enum.uniq()
+    |> Enum.map(fn conversation_id ->
+      RedisPersistence.put_or_delete(
+        "conversation_latest",
+        conversation_id,
+        get_in(state, ["conversation_latest", conversation_id])
       )
     end)
   end
@@ -148,6 +174,11 @@ defmodule OpenChat.Store.PersistenceOps do
           state["conversation_messages"][conv_id]
         ),
         RedisPersistence.put_or_delete(
+          "conversation_latest",
+          conv_id,
+          get_in(state, ["conversation_latest", conv_id])
+        ),
+        RedisPersistence.put_or_delete(
           "conversation_users",
           conv_id,
           state["conversation_users"][conv_id]
@@ -162,7 +193,8 @@ defmodule OpenChat.Store.PersistenceOps do
             uid,
             get_in(state, ["user_conversations", uid])
           )
-        end)
+        end) ++
+        unread_counts(state, participants)
 
     if parent_id = message["parentId"] || message["parentMessageId"] do
       parent_id = to_s(parent_id)

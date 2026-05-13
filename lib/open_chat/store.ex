@@ -14,6 +14,7 @@ defmodule OpenChat.Store do
   alias OpenChat.Store.{
     Access,
     AuthTokens,
+    ConversationView,
     Conversations,
     Entities,
     GroupPermissions,
@@ -21,7 +22,8 @@ defmodule OpenChat.Store do
     MessagePermissions,
     PersistenceOps,
     RedisPersistence,
-    RequestPlan
+    RequestPlan,
+    Unread
   }
 
   @default_state %{
@@ -31,6 +33,7 @@ defmodule OpenChat.Store do
     "members" => %{},
     "messages" => %{},
     "conversation_messages" => %{},
+    "conversation_latest" => %{},
     "thread_messages" => %{},
     "reads" => %{},
     "delivered" => %{},
@@ -42,13 +45,25 @@ defmodule OpenChat.Store do
     "user_conversations" => %{},
     "conversation_users" => %{},
     "user_groups" => %{},
+    "unread_counts" => %{},
     "next_id" => 1,
     "next_reaction_id" => 1
   }
 
   # Public API
 
-  def start_link(opts \\ []), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  def start_link(opts \\ []) do
+    {start_opts, init_opts} = Keyword.split(opts, [:name])
+
+    start_opts =
+      case Keyword.fetch(start_opts, :name) do
+        {:ok, nil} -> []
+        {:ok, _name} -> start_opts
+        :error -> [name: __MODULE__]
+      end
+
+    GenServer.start_link(__MODULE__, init_opts, start_opts)
+  end
 
   def reset!, do: call(:reset)
   def get_user(uid), do: call({:get_user, to_s(uid)})
@@ -166,15 +181,19 @@ defmodule OpenChat.Store do
   def reactions(uid, id, reaction \\ nil),
     do: call({:reactions, to_s(uid), to_s(id), reaction})
 
-  defp call(request) do
+  def call_on(server, request), do: call(server, request)
+
+  defp call(request), do: call(__MODULE__, request)
+
+  defp call(server, request) do
     plan = RequestPlan.build(request)
 
     if plan.mutating? do
       RedisPersistence.with_locks(plan.locks, fn ->
-        GenServer.call(__MODULE__, {:locked_call, request, plan.refresh}, :infinity)
+        GenServer.call(server, {:locked_call, request, plan.refresh}, :infinity)
       end)
     else
-      GenServer.call(__MODULE__, {:cache_call, request, plan.refresh}, :infinity)
+      GenServer.call(server, {:cache_call, request, plan.refresh}, :infinity)
     end
   end
 
@@ -475,7 +494,9 @@ defmodule OpenChat.Store do
             persist_ops(
               PersistenceOps.user(state, [uid]) ++
                 PersistenceOps.members(state, guid) ++
-                PersistenceOps.user_groups(state, [uid]) ++ PersistenceOps.next_id(state)
+                PersistenceOps.user_groups(state, [uid]) ++
+                PersistenceOps.unread_counts(state, [uid]) ++
+                PersistenceOps.next_id(state)
             )
 
             {:reply, {:ok, group}, state}
@@ -498,7 +519,9 @@ defmodule OpenChat.Store do
 
     persist_ops(
       PersistenceOps.members(state, guid) ++
-        PersistenceOps.user_groups(state, [uid]) ++ PersistenceOps.next_id(state)
+        PersistenceOps.user_groups(state, [uid]) ++
+        PersistenceOps.unread_counts(state, [uid]) ++
+        PersistenceOps.next_id(state)
     )
 
     {:reply, {:ok, %{"success" => true}}, state}
@@ -520,7 +543,8 @@ defmodule OpenChat.Store do
       persist_ops(
         PersistenceOps.user(state, Map.keys(result)) ++
           PersistenceOps.members(state, guid) ++
-          PersistenceOps.user_groups(state, Map.keys(result))
+          PersistenceOps.user_groups(state, Map.keys(result)) ++
+          PersistenceOps.unread_counts(state, Map.keys(result))
       )
 
       {:reply, {:ok, %{"success" => result, "group" => group}}, state}
@@ -605,7 +629,8 @@ defmodule OpenChat.Store do
           PersistenceOps.group(state, guid) ++
             PersistenceOps.members(state, guid) ++
             PersistenceOps.user(state, touched_uids) ++
-            PersistenceOps.user_groups(state, touched_uids)
+            PersistenceOps.user_groups(state, touched_uids) ++
+            PersistenceOps.unread_counts(state, touched_uids)
         )
 
         {:reply,
@@ -634,7 +659,9 @@ defmodule OpenChat.Store do
       PersistenceOps.group(state, guid) ++
         PersistenceOps.user(state, [uid]) ++
         PersistenceOps.banned(state, guid) ++
-        PersistenceOps.members(state, guid) ++ PersistenceOps.user_groups(state, [uid])
+        PersistenceOps.members(state, guid) ++
+        PersistenceOps.user_groups(state, [uid]) ++
+        PersistenceOps.unread_counts(state, [uid])
     )
 
     {:reply,
@@ -744,6 +771,8 @@ defmodule OpenChat.Store do
         case MessagePermissions.authorize(state, uid, message, :delete, opts) do
           :ok ->
             now = Time.now()
+            original_participants = Unread.participants(state, message)
+            state = Unread.message_deleted(state, message)
 
             message =
               message
@@ -758,7 +787,9 @@ defmodule OpenChat.Store do
 
             persist_ops(
               [RedisPersistence.put("messages", id, message)] ++
-                PersistenceOps.stored_message(state, action) ++ PersistenceOps.next_id(state)
+                PersistenceOps.stored_message(state, action) ++
+                PersistenceOps.unread_counts(state, original_participants) ++
+                PersistenceOps.next_id(state)
             )
 
             {:reply, {:ok, action}, state}
@@ -851,14 +882,14 @@ defmodule OpenChat.Store do
 
   def handle_call({:messages_for_user, uid, peer_uid, params}, _from, state) do
     conv_id = user_conversation_id(uid, peer_uid)
-    messages = fetch_messages_from_conversation(state, conv_id, params)
+    messages = ConversationView.messages(state, conv_id, params)
     {:reply, {:ok, messages}, state}
   end
 
   def handle_call({:messages_for_group, uid, guid, params}, _from, state) do
     if member?(state, guid, uid) do
       conv_id = group_conversation_id(guid)
-      messages = fetch_messages_from_conversation(state, conv_id, params)
+      messages = ConversationView.messages(state, conv_id, params)
       {:reply, {:ok, messages}, state}
     else
       {:reply, {:error, Errors.not_member(guid)}, state}
@@ -872,10 +903,7 @@ defmodule OpenChat.Store do
 
       messages =
         ids
-        |> Enum.map(&state["messages"][&1])
-        |> Enum.reject(&is_nil/1)
-        |> filter_messages(params)
-        |> paginate_messages(params)
+        |> ConversationView.messages_by_ids(state, params)
 
       {:reply, {:ok, messages}, state}
     else
@@ -890,7 +918,7 @@ defmodule OpenChat.Store do
         {state, payload} =
           Conversations.mark_read(state, uid, receiver_type, receiver_id, message_id, Time.now())
 
-        persist_ops(PersistenceOps.reads(state, uid))
+        persist_ops(PersistenceOps.reads(state, uid) ++ PersistenceOps.unread_counts(state, uid))
         {:reply, {:ok, payload}, state}
 
       {:error, error} ->
@@ -933,8 +961,8 @@ defmodule OpenChat.Store do
             Time.now()
           )
 
-        conv = build_conversation(state, uid, conv_id)
-        persist_ops(PersistenceOps.reads(state, uid))
+        conv = ConversationView.build(state, uid, conv_id)
+        persist_ops(PersistenceOps.reads(state, uid) ++ PersistenceOps.unread_counts(state, uid))
         {:reply, {:ok, %{"conversation" => conv}}, state}
 
       {:error, error} ->
@@ -947,10 +975,12 @@ defmodule OpenChat.Store do
     receiver_type = params["receiverType"]
 
     counts =
-      all_conversation_ids_for_user(state, uid)
-      |> Enum.map(fn conv_id -> {conv_id, unread_count(state, uid, conv_id)} end)
+      ConversationView.ids_for_user(state, uid)
+      |> Enum.map(fn conv_id -> {conv_id, Unread.count(state, uid, conv_id)} end)
       |> Enum.filter(fn {_conv_id, count} -> count > 0 end)
-      |> Enum.map(fn {conv_id, count} -> unread_count_row(state, uid, conv_id, count) end)
+      |> Enum.map(fn {conv_id, count} ->
+        ConversationView.unread_count_row(state, uid, conv_id, count)
+      end)
       |> Enum.filter(fn row -> blank?(receiver_type) or row["entityType"] == receiver_type end)
       |> Enum.filter(fn row ->
         cond do
@@ -973,8 +1003,8 @@ defmodule OpenChat.Store do
     type = params["conversationType"] || params["type"]
 
     convs =
-      all_conversation_ids_for_user(state, uid)
-      |> Enum.map(&build_conversation(state, uid, &1))
+      ConversationView.ids_for_user(state, uid)
+      |> Enum.map(&ConversationView.build(state, uid, &1))
       |> Enum.reject(&is_nil/1)
       |> Enum.filter(fn conv -> blank?(type) or conv["conversationType"] == type end)
       |> Enum.sort_by(fn conv -> -(get_in(conv, ["lastMessage", "sentAt"]) || 0) end)
@@ -987,7 +1017,7 @@ defmodule OpenChat.Store do
     case Access.conversation(state, uid, receiver_type, receiver_id) do
       :ok ->
         conv_id = conversation_id_for(uid, receiver_type, receiver_id)
-        {:reply, {:ok, build_conversation(state, uid, conv_id)}, state}
+        {:reply, {:ok, ConversationView.build(state, uid, conv_id)}, state}
 
       {:error, error} ->
         {:reply, {:error, error}, state}
@@ -1099,8 +1129,15 @@ defmodule OpenChat.Store do
       @default_state
       |> RedisPersistence.load_or_seed(&seed_state/0)
       |> Indexes.rebuild()
+      |> Conversations.rebuild_latest()
+      |> Unread.rebuild()
 
-    persist_ops(PersistenceOps.secondary_indexes(state))
+    persist_ops(
+      PersistenceOps.secondary_indexes(state) ++
+        PersistenceOps.conversation_latest(state, Map.keys(state["conversation_latest"])) ++
+        PersistenceOps.unread_counts(state, Map.keys(state["unread_counts"]))
+    )
+
     state
   end
 
@@ -1241,6 +1278,8 @@ defmodule OpenChat.Store do
       |> put_in(["messages", id_key], message)
       |> update_in(["conversation_messages", conv_id], fn ids -> (ids || []) ++ [id_key] end)
       |> Indexes.link_message(message)
+      |> Conversations.put_latest(message)
+      |> Unread.message_created(message)
 
     if parent_id = message["parentId"] || message["parentMessageId"] do
       update_in(state, ["thread_messages", to_s(parent_id)], fn ids ->
@@ -1375,66 +1414,14 @@ defmodule OpenChat.Store do
     )
   end
 
-  defp fetch_messages_from_conversation(state, conv_id, params) do
-    ids = Map.get(state["conversation_messages"], conv_id, [])
-
-    ids
-    |> Enum.map(&state["messages"][&1])
-    |> Enum.reject(&is_nil/1)
-    |> filter_messages(params)
-    |> paginate_messages(params)
-  end
-
-  defp filter_messages(messages, params) do
-    params = stringify_keys(params)
-    hide_deleted = truthy?(params["hideDeleted"] || params["hideDeletedMessages"])
-    type = params["type"]
-    category = params["category"]
-    timestamp = params["sentAt"] || params["timestamp"]
-    id = params["id"] || params["cursorValue"]
-    affix = params["cursorAffix"] || params["affix"] || "prepend"
-    cursor_field = params["cursorField"] || if(id, do: "id", else: "sentAt")
-
-    messages
-    |> Enum.filter(fn m -> not hide_deleted or blank?(m["deletedAt"]) end)
-    |> Enum.filter(fn m -> blank?(type) or m["type"] == type end)
-    |> Enum.filter(fn m -> blank?(category) or m["category"] == category end)
-    |> filter_cursor(cursor_field, timestamp || id, affix)
-  end
-
-  defp filter_cursor(messages, _field, nil, _affix), do: messages
-
-  defp filter_cursor(messages, field, value, affix) do
-    value_i = to_int(value)
-    field = if field == "id", do: "id", else: "sentAt"
-
-    Enum.filter(messages, fn m ->
-      v = to_int(m[field])
-      if affix == "append", do: v > value_i, else: v < value_i
-    end)
-  end
-
-  defp paginate_messages(messages, params) do
-    params = stringify_keys(params)
-    limit = clamp(to_int(params["per_page"] || params["limit"] || 30), 1, 100)
-    affix = params["cursorAffix"] || params["affix"] || "prepend"
-
-    messages =
-      Enum.sort_by(messages, fn message ->
-        {to_int(message["sentAt"]), to_int(message["id"])}
-      end)
-
-    messages = if affix == "append", do: messages, else: Enum.reverse(messages)
-    Enum.take(messages, limit)
-  end
-
   defp delete_conversation_indexes(state, conv_ids) do
     {state, %{conversation_ids: conv_ids, touched_user_buckets: touched}} =
       Conversations.delete_indexes(state, conv_ids, [
         "reads",
         "delivered",
         "hidden_conversations",
-        "user_conversations"
+        "user_conversations",
+        "unread_counts"
       ])
 
     conversation_user_uids =
@@ -1450,6 +1437,7 @@ defmodule OpenChat.Store do
 
     ops =
       Enum.map(conv_ids, &RedisPersistence.delete("conversation_messages", &1)) ++
+        Enum.map(conv_ids, &RedisPersistence.delete("conversation_latest", &1)) ++
         Enum.map(conv_ids, &RedisPersistence.delete("conversation_users", &1)) ++
         Enum.flat_map(touched["reads"], &PersistenceOps.reads(state, &1)) ++
         Enum.flat_map(touched["delivered"], &PersistenceOps.delivered(state, &1)) ++
@@ -1457,7 +1445,11 @@ defmodule OpenChat.Store do
           touched["hidden_conversations"],
           &PersistenceOps.hidden_conversations(state, &1)
         ) ++
-        PersistenceOps.user_conversations(state, touched_user_conversation_uids)
+        PersistenceOps.user_conversations(state, touched_user_conversation_uids) ++
+        PersistenceOps.unread_counts(
+          state,
+          ((touched["unread_counts"] || []) ++ conversation_user_uids) |> Enum.uniq()
+        )
 
     {state, ops}
   end
@@ -1482,145 +1474,6 @@ defmodule OpenChat.Store do
         Enum.map(thread_ids, &RedisPersistence.delete("thread_messages", &1))
 
     {state, ops}
-  end
-
-  defp all_conversation_ids_for_user(state, uid) do
-    indexed = Indexes.conversation_ids_for_user(state, uid)
-
-    legacy_direct =
-      state["conversation_messages"]
-      |> Map.keys()
-      |> Enum.filter(&user_conversation_for?(state, uid, &1))
-
-    (indexed ++ legacy_direct)
-    |> Enum.uniq()
-    |> Enum.reject(&conversation_hidden?(state, uid, &1))
-  end
-
-  defp user_conversation_for?(state, uid, "user_" <> _ = conv_id) do
-    case latest_conversation_message(state, conv_id) do
-      %{"sender" => sender, "receiver" => receiver} ->
-        uid in [to_s(sender), to_s(receiver)]
-
-      _ ->
-        case String.split(conv_id, "_") do
-          ["user", a, b] -> uid in [a, b]
-          _ -> false
-        end
-    end
-  end
-
-  defp user_conversation_for?(_state, _uid, _conv_id), do: false
-
-  defp build_conversation(_state, _uid, nil), do: nil
-
-  defp build_conversation(state, uid, conv_id) do
-    last = latest_conversation_message(state, conv_id)
-
-    if is_nil(last) or conversation_hidden?(state, uid, conv_id) do
-      nil
-    else
-      type = if String.starts_with?(conv_id, "group_"), do: "group", else: "user"
-      with_entity = conversation_with(state, uid, conv_id)
-      latest = to_s(last["id"])
-      read = get_in(state, ["reads", uid, conv_id]) || %{}
-      delivered = get_in(state, ["delivered", uid, conv_id]) || %{}
-
-      %{
-        "conversationId" => conv_id,
-        "conversationType" => type,
-        "lastMessage" => last,
-        "conversationWith" => with_entity,
-        "unreadMessageCount" => unread_count(state, uid, conv_id),
-        "tags" => [],
-        "unreadMentionsCount" => 0,
-        "lastReadMessageId" => to_s(read["messageId"] || ""),
-        "lastDeliveredMessageId" => to_s(delivered["messageId"] || ""),
-        "deliveredAt" => delivered["deliveredAt"],
-        "latestMessageId" => latest
-      }
-    end
-  end
-
-  defp latest_conversation_message(state, conv_id) do
-    Conversations.latest_message(state, conv_id)
-  end
-
-  defp conversation_hidden?(state, uid, conv_id) do
-    hidden = get_in(state, ["hidden_conversations", uid, conv_id])
-    latest = latest_conversation_message(state, conv_id)
-
-    not is_nil(hidden) and
-      (is_nil(latest) or to_int(latest["id"]) <= to_int(hidden["messageId"]))
-  end
-
-  defp conversation_with(state, _uid, "group_" <> guid),
-    do:
-      with_members_count(
-        state["groups"][guid] || normalise_group(%{"guid" => guid, "name" => guid}),
-        state
-      )
-
-  defp conversation_with(state, uid, "user_" <> _rest = conv_id) do
-    peer = user_peer_uid(state, uid, conv_id)
-    public_user(state["users"][peer] || normalise_user(%{"uid" => peer}))
-  end
-
-  defp user_peer_uid(state, uid, conv_id) do
-    case latest_conversation_message(state, conv_id) do
-      %{"sender" => sender, "receiver" => receiver} ->
-        sender = to_s(sender)
-        receiver = to_s(receiver)
-
-        if sender == uid, do: receiver, else: sender
-
-      _ ->
-        fallback_user_peer_uid(uid, conv_id)
-    end
-  end
-
-  defp fallback_user_peer_uid(uid, "user_" <> rest) do
-    case String.split(rest, "_", parts: 2) do
-      [^uid, peer] -> peer
-      [peer, ^uid] -> peer
-      [_first, peer] -> peer
-      [peer] -> peer
-    end
-  end
-
-  defp unread_count(state, uid, conv_id) do
-    read_id = get_in(state, ["reads", uid, conv_id, "messageId"]) |> to_int()
-
-    state["conversation_messages"]
-    |> Map.get(conv_id, [])
-    |> Enum.map(&state["messages"][&1])
-    |> Enum.reject(&is_nil/1)
-    |> Enum.reject(fn m -> to_s(m["sender"]) == uid end)
-    |> Enum.reject(fn m -> not blank?(m["deletedAt"]) end)
-    |> Enum.count(fn m -> to_int(m["id"]) > read_id end)
-  end
-
-  defp unread_count_row(state, uid, conv_id, count) do
-    case conv_id do
-      "group_" <> guid ->
-        %{
-          "entity" =>
-            with_members_count(state["groups"][guid] || normalise_group(%{"guid" => guid}), state),
-          "entityType" => "group",
-          "entityId" => guid,
-          "count" => count
-        }
-
-      "user_" <> rest ->
-        peer = user_peer_uid(state, uid, "user_" <> rest)
-
-        %{
-          "entity" => public_user(state["users"][peer] || normalise_user(%{"uid" => peer})),
-          "entityType" => "user",
-          "entityId" => peer,
-          "count" => count
-        }
-    end
   end
 
   defp conversation_id_for(uid, receiver_type, receiver),
@@ -1953,9 +1806,14 @@ defmodule OpenChat.Store do
     state
     |> ensure_group_member_map(guid)
     |> Indexes.put_member(guid, uid, scope)
+    |> Unread.sync(uid, group_conversation_id(guid))
   end
 
-  defp remove_member_from_state(state, guid, uid), do: Indexes.remove_member(state, guid, uid)
+  defp remove_member_from_state(state, guid, uid) do
+    state
+    |> Indexes.remove_member(guid, uid)
+    |> Unread.remove_conversation(uid, group_conversation_id(guid))
+  end
 
   defp authorize_group_moderation(_state, _guid, opts) when opts in [nil, []], do: :ok
 
@@ -2015,7 +1873,6 @@ defmodule OpenChat.Store do
   defp to_int(value), do: value |> to_s() |> to_int()
 
   defp blank?(value), do: value in [nil, "", false]
-  defp truthy?(value), do: value in [true, 1, "1", "true", "TRUE", "yes"]
   defp contains?(a, b), do: String.contains?(String.downcase(to_s(a)), String.downcase(to_s(b)))
   defp clamp(value, lo, hi), do: value |> Kernel.max(lo) |> Kernel.min(hi)
 
