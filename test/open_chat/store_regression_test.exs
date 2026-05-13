@@ -421,6 +421,34 @@ defmodule OpenChat.StoreRegressionTest do
     assert {:ok, [%{"entityId" => "alice", "count" => 1}]} = Store.unread_counts("bob")
   end
 
+  test "delivery receipts persist a delivered cursor and notify the sender" do
+    {:ok, message} =
+      Store.send_message("alice", %{
+        "receiver" => "bob",
+        "receiverType" => "user",
+        "data" => %{"text" => "deliverable"}
+      })
+
+    OpenChat.PubSub.subscribe({:user, "alice"})
+
+    assert {:ok, delivered} = Store.mark_delivered("bob", "user", "alice", message["id"])
+    assert delivered["conversationId"] == "user_alice_bob"
+    assert delivered["messageId"] == to_string(message["id"])
+    assert is_integer(delivered["deliveredAt"])
+
+    assert {:ok, conversation} = Store.conversation("bob", "user", "alice")
+    assert conversation["lastDeliveredMessageId"] == to_string(message["id"])
+    assert conversation["deliveredAt"] == delivered["deliveredAt"]
+
+    assert_receive {:comet_event,
+                    %{
+                      "type" => "receipts",
+                      "receiver" => "alice",
+                      "sender" => "bob",
+                      "body" => %{"action" => "delivered"}
+                    }}
+  end
+
   test "admin group messages can create a public group while user sends cannot" do
     assert {:error, %{"code" => "ERR_GUID_NOT_FOUND"}} =
              Store.send_message("alice", %{

@@ -14,6 +14,7 @@ defmodule OpenChat.Store.RedisPersistence do
     "conversation_messages",
     "thread_messages",
     "reads",
+    "delivered",
     "hidden_conversations",
     "reactions",
     "blocks",
@@ -21,7 +22,7 @@ defmodule OpenChat.Store.RedisPersistence do
   ]
 
   @counters ["next_id", "next_reaction_id"]
-  @version "3"
+  @version "4"
   @lock_ttl_ms 60_000
   @lock_attempts 600
 
@@ -251,10 +252,12 @@ defmodule OpenChat.Store.RedisPersistence do
         commands
 
       {:ok, [next_cursor, keys]} when next_cursor != "0" ->
-        delete_prefix_commands(next_cursor, [["DEL" | keys] | commands])
+        keys = Enum.reject(keys, &(&1 == lock_key()))
+        delete_prefix_commands(next_cursor, delete_command(keys, commands))
 
       {:ok, [_next_cursor, keys]} ->
-        [["DEL" | keys] | commands]
+        keys = Enum.reject(keys, &(&1 == lock_key()))
+        delete_command(keys, commands)
 
       {:error, reason} ->
         Logger.warning("Redis prefix scan failed: #{inspect(reason)}")
@@ -270,6 +273,9 @@ defmodule OpenChat.Store.RedisPersistence do
       {:error, reason} -> Logger.warning("Redis pipeline failed: #{inspect(reason)}")
     end
   end
+
+  defp delete_command([], commands), do: commands
+  defp delete_command(keys, commands), do: [["DEL" | keys] | commands]
 
   defp acquire_lock(_lock_value, 0), do: {:error, :timeout}
 

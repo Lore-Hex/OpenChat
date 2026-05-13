@@ -101,13 +101,26 @@ defmodule OpenChatWeb.WSHandler do
     action = body["action"] || "read"
     timestamp = Time.now()
 
-    if action == "read" do
-      Store.mark_read(uid, receiver_type, receiver, message_id)
+    delivered? = action in ["delivered", "deliver", "message_delivered"]
+
+    cond do
+      action == "read" ->
+        Store.mark_read(uid, receiver_type, receiver, message_id)
+
+      delivered? ->
+        Store.mark_delivered(uid, receiver_type, receiver, message_id)
+
+      true ->
+        :ok
     end
 
     receipt = put_in(event, ["body", "timestamp"], timestamp)
     targets = if receiver_type == "group", do: [{:group, receiver}], else: [{:user, receiver}]
-    OpenChat.PubSub.broadcast(targets, receipt)
+
+    unless delivered? do
+      OpenChat.PubSub.broadcast(targets, receipt)
+    end
+
     {:ok, state}
   end
 

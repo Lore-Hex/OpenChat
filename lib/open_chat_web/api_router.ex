@@ -457,11 +457,11 @@ defmodule OpenChatWeb.ApiRouter do
   end
 
   post "/users/:uid/conversation/delivered" do
-    JSON.ok(conn, %{"success" => true, "uid" => uid})
+    mark_conversation_delivered(conn, "user", uid)
   end
 
   post "/groups/:guid/conversation/delivered" do
-    JSON.ok(conn, %{"success" => true, "guid" => guid})
+    mark_conversation_delivered(conn, "group", guid)
   end
 
   delete "/users/:uid/conversation" do
@@ -518,6 +518,10 @@ defmodule OpenChatWeb.ApiRouter do
 
   defp mark_conversation_unread(conn, receiver_type, receiver_id) do
     mark_conversation_receipt(conn, receiver_type, receiver_id, &Store.mark_unread/4)
+  end
+
+  defp mark_conversation_delivered(conn, receiver_type, receiver_id) do
+    mark_conversation_receipt(conn, receiver_type, receiver_id, &Store.mark_delivered/4)
   end
 
   defp mark_conversation_receipt(conn, receiver_type, receiver_id, marker) do

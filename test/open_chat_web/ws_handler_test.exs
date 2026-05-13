@@ -94,6 +94,39 @@ defmodule OpenChatWeb.WSHandlerTest do
     assert is_integer(get_in(event, ["body", "timestamp"]))
   end
 
+  test "authenticated delivered receipts update delivered cursors and broadcast once" do
+    {:ok, message} =
+      Store.send_message("bob", %{
+        "receiver" => "alice",
+        "receiverType" => "user",
+        "data" => %{"text" => "please deliver"}
+      })
+
+    OpenChat.PubSub.subscribe({:user, "bob"})
+    state = %{uid: "alice", token: "uid:alice", device_id: "device-1"}
+
+    assert {:ok, ^state} =
+             WSHandler.websocket_handle(
+               {:text,
+                Jason.encode!(%{
+                  "type" => "receipts",
+                  "receiver" => "bob",
+                  "receiverType" => "user",
+                  "body" => %{"messageId" => message["id"], "action" => "delivered"}
+                })},
+               state
+             )
+
+    assert {:ok, conversation} = Store.conversation("alice", "user", "bob")
+    assert conversation["lastDeliveredMessageId"] == to_string(message["id"])
+
+    assert_receive {:comet_event, event}
+    assert event["type"] == "receipts"
+    assert get_in(event, ["body", "action"]) == "delivered"
+    assert get_in(event, ["body", "messageId"]) == to_string(message["id"])
+    refute_receive {:comet_event, _event}, 20
+  end
+
   test "receipt events are ignored until the websocket is authenticated" do
     {:ok, message} =
       Store.send_message("bob", %{

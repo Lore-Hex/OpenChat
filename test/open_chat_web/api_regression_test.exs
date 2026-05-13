@@ -343,6 +343,9 @@ defmodule OpenChatWeb.ApiRegressionTest do
     assert admin_conn(:post, "/v3/groups/api-list-a/bannedusers/bob").status == 200
     assert admin_conn(:post, "/v3/groups/api-list-a/bannedusers/carol").status == 200
 
+    assert admin_conn(:post, "/v3/groups/api-list-a/members", %{"participants" => ["alice"]}).status ==
+             200
+
     conn = admin_conn(:get, "/v3/groups/api-list-a/bannedusers?search=bo")
     assert [%{"uid" => "bob"}] = json(conn)["data"]
 
@@ -355,12 +358,6 @@ defmodule OpenChatWeb.ApiRegressionTest do
     conn = auth_conn(:get, "/v3.0/blockedusers?direction=hasBlockedMe", %{}, "uid:alice")
     assert [%{"uid" => "bob", "hasBlockedMe" => true}] = json(conn)["data"]
 
-    assert auth_conn(:post, "/v3.0/users/bob/conversation/delivered", %{}, "uid:alice").status ==
-             200
-
-    assert auth_conn(:post, "/v3.0/groups/api-list-a/conversation/delivered", %{}, "uid:alice").status ==
-             200
-
     message =
       auth_conn(:post, "/v3.0/messages", %{
         "receiver" => "bob",
@@ -369,6 +366,47 @@ defmodule OpenChatWeb.ApiRegressionTest do
       })
       |> json()
       |> get_in(["data"])
+
+    conn =
+      auth_conn(
+        :post,
+        "/v3.0/users/alice/conversation/delivered",
+        %{"messageId" => message["id"]},
+        "uid:bob"
+      )
+
+    assert conn.status == 200
+    assert json(conn)["data"]["conversationId"] == "user_alice_bob"
+    assert json(conn)["data"]["messageId"] == to_string(message["id"])
+    assert is_integer(json(conn)["data"]["deliveredAt"])
+
+    conn = auth_conn(:get, "/v3.0/users/alice/conversation", %{}, "uid:bob")
+    assert json(conn)["data"]["lastDeliveredMessageId"] == to_string(message["id"])
+
+    group_message =
+      auth_conn(
+        :post,
+        "/v3.0/messages",
+        %{
+          "receiver" => "api-list-a",
+          "receiverType" => "group",
+          "data" => %{"text" => "group delivered"}
+        },
+        "uid:alice"
+      )
+      |> json()
+      |> get_in(["data"])
+
+    conn =
+      auth_conn(
+        :post,
+        "/v3.0/groups/api-list-a/conversation/delivered",
+        %{"messageId" => group_message["id"]},
+        "uid:alice"
+      )
+
+    assert conn.status == 200
+    assert json(conn)["data"]["conversationId"] == "group_api-list-a"
 
     conn = auth_conn(:delete, "/v3.0/users/bob/conversation", %{}, "uid:alice")
     assert conn.status == 200

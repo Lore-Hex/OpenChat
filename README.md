@@ -19,7 +19,7 @@ OpenChat is a BEAM/Elixir replacement for the covered subset of CometChat. It is
 | Messages | Text, custom, media-shaped messages, multipart media upload, admin sends, validation, deterministic pagination, cursor metadata | `POST /messages`, `GET /users/:uid/messages`, `GET /groups/:guid/messages`, `GET /messages/:messageId`, `GET /user/messages/:muid` | Covered by store tests, API tests, media upload tests, and Playwright SDK contract tests. |
 | Threads | Send replies and fetch thread messages | `POST /messages/:parentId/thread`, `GET /messages/:parentId/thread` | Covered by API regression tests. |
 | Message actions | Edit/delete action messages and hidden deleted-message fetch behavior | `PUT /messages/:messageId`, `DELETE /messages/:messageId` | Covered by store/API tests and SDK delete contract tests. |
-| Unread and read state | Unread count fetches, mark read, mark unread, read cursor rewind | `GET /messages?unread=1&count=1`, `POST /users/:uid/conversation/read`, `POST /groups/:guid/conversation/read`, `DELETE /users/:uid/conversation/read`, `DELETE /groups/:guid/conversation/read` | Covered by store/API tests and WebSocket receipt tests. SDK v4 can also send read receipts over WebSocket, which update read state. |
+| Unread and receipt state | Unread count fetches, mark read, mark unread, delivered cursors, read cursor rewind | `GET /messages?unread=1&count=1`, `POST /users/:uid/conversation/read`, `POST /groups/:guid/conversation/read`, `DELETE /users/:uid/conversation/read`, `DELETE /groups/:guid/conversation/read`, `POST /users/:uid/conversation/delivered`, `POST /groups/:guid/conversation/delivered` | Covered by store/API/Redis tests and WebSocket receipt tests. SDK v4 can also send read/delivered receipts over WebSocket, which update receipt state. |
 | Conversations | List conversations, fetch user/group conversation, hide a conversation for the current user, delete a conversation by canonical conversation id | `GET /conversations`, `GET /users/:uid/conversation`, `GET /groups/:guid/conversation`, `DELETE /users/:uid/conversation`, `DELETE /groups/:guid/conversation`, `DELETE /conversations/:conversationId` | Covered by store/API/Redis tests and SDK conversation contract tests. |
 | Reactions | Native reaction add/remove/list/filter and `callExtension("reactions", ...)` fallback | `POST /messages/:messageId/reactions/:reaction`, `DELETE /messages/:messageId/reactions/:reaction`, `GET /messages/:messageId/reactions`, `GET /messages/:messageId/reactions/:reaction`, `MATCH /extensions/:name/*path`, `MATCH /v1/*path` | Covered by store/API tests. The real SDK extension contract is optional and requires wildcard HTTPS DNS. |
 | Media serving | Serve uploaded media files | `GET /media/:file` | Covered by API regression tests. |
@@ -29,7 +29,6 @@ OpenChat is a BEAM/Elixir replacement for the covered subset of CometChat. It is
 
 | Area | Routes/API | Current behavior | Status |
 |---|---|---|---|
-| Delivery receipts | `POST /users/:uid/conversation/delivered`, `POST /groups/:guid/conversation/delivered` | Returns success in the SDK shape. It does not persist a delivered cursor or broadcast delivered events. | Stub |
 | Generic message list | `GET /messages` without `unread=1&count=1` | Returns an empty list. Use `GET /users/:uid/messages`, `GET /groups/:guid/messages`, or thread routes for real message history. | Partial |
 | Extensions beyond reactions | `MATCH /extensions/:name/*path`, extension-host fallback | All extension calls are interpreted as reaction add/remove requests. Non-reaction extensions are not implemented. | Partial |
 | SDK sessions and JWTs | `POST /user_sessions`, `POST /me/jwt` | Returns local compatibility payloads only. There is no external CometChat session registry or signed CometChat JWT issuer. | Partial |
@@ -120,6 +119,7 @@ By default all state is in one OTP GenServer. If `REDIS_URL` is set, each mutati
 - `open_chat:conversation_messages:<conversationId>`
 - `open_chat:thread_messages:<parentMessageId>`
 - `open_chat:reads:<uid>`
+- `open_chat:delivered:<uid>`
 - `open_chat:hidden_conversations:<uid>`
 - `open_chat:reactions:<messageId>`
 - `open_chat:blocks:<uid>`
@@ -129,7 +129,7 @@ By default all state is in one OTP GenServer. If `REDIS_URL` is set, each mutati
 
 On startup, OpenChat reloads state from those Redis keys. Normal mutations write only the touched records, indexes, and counters; reset and legacy imports replace the namespace. If no per-key namespace has been initialized but `REDIS_SNAPSHOT_KEY` exists, OpenChat imports that legacy JSON snapshot into the per-key layout.
 
-Redis writes are per operation and per key, but one OTP GenServer still serializes mutation ordering. For horizontal write scale, split write ownership by entity or move command handlers to Redis/Postgres with optimistic concurrency while preserving the same route/test contract.
+When Redis is enabled, mutating Store calls take a short Redis lock and refresh state before writing so multiple OpenChat nodes do not race counters or overwrite stale records. Read-only calls stay local. WebSocket events are also fanned out through Redis Pub/Sub so instances behind a load balancer can notify each other's connected clients. For heavier horizontal write scale, split write ownership by entity or move command handlers to Redis/Postgres with optimistic concurrency while preserving the same route/test contract.
 
 ## AWS deployment sketch
 
@@ -165,8 +165,8 @@ REDIS_URL=redis://<elasticache-endpoint>:6379/0
 - Group join and group message membership checks
 - Text/custom/media-shaped messages
 - Message edit/delete action payloads
-- Conversations and unread counts
-- Read/unread transitions
+- Conversations, unread counts, and delivered cursors
+- Read/unread/delivered transitions
 - Native reactions
 
 ### Playwright contract tests against the real SDK
