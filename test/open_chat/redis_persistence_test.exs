@@ -308,6 +308,8 @@ defmodule OpenChat.RedisPersistenceTest do
         ["SET", redis_key(context, "users", "externally-updated"), external_user]
       )
 
+      Redix.command!(context.redis, ["INCR", redis_key(context, "meta", "revision")])
+
       assert {:ok, _auth} = Store.create_auth_token("externally-updated")
       assert {:ok, updated} = Store.get_user("externally-updated")
       assert updated["name"] == "After Redis Update"

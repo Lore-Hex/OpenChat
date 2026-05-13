@@ -46,9 +46,9 @@ defmodule OpenChat.Store.RedisPersistence do
 
   def refresh(default_state, fallback_state) do
     if enabled?() do
-      case command(["GET", meta_key()]) do
+      case command(["GET", revision_key()]) do
         {:ok, nil} -> fallback_state
-        {:ok, _version} -> read_state(default_state)
+        {:ok, revision} -> maybe_refresh_state(default_state, fallback_state, to_int(revision))
         {:error, reason} -> redis_failed("state refresh", reason, fn -> fallback_state end)
       end
     else
@@ -84,7 +84,9 @@ defmodule OpenChat.Store.RedisPersistence do
       |> List.wrap()
       |> Enum.flat_map(&commands_for_op/1)
       |> Kernel.++([["SET", meta_key(), @version]])
+      |> Kernel.++([["INCR", revision_key()]])
       |> run_pipeline()
+      |> remember_pipeline_revision()
     else
       :ok
     end
@@ -99,7 +101,9 @@ defmodule OpenChat.Store.RedisPersistence do
       delete_prefix_commands()
       |> Kernel.++(state_commands(state))
       |> Kernel.++([["SET", meta_key(), @version]])
+      |> Kernel.++([["INCR", revision_key()]])
       |> run_pipeline()
+      |> remember_pipeline_revision()
     else
       :ok
     end
@@ -172,13 +176,55 @@ defmodule OpenChat.Store.RedisPersistence do
         Map.put(acc, bucket, read_bucket(bucket))
       end)
 
-    Enum.reduce(@counters, state, fn counter, acc ->
-      case command(["GET", counter_key(counter)]) do
-        {:ok, nil} -> acc
-        {:ok, value} -> Map.put(acc, counter, max(to_int(value), default_state[counter]))
-        {:error, _reason} -> acc
-      end
-    end)
+    state =
+      Enum.reduce(@counters, state, fn counter, acc ->
+        case command(["GET", counter_key(counter)]) do
+          {:ok, nil} -> acc
+          {:ok, value} -> Map.put(acc, counter, max(to_int(value), default_state[counter]))
+          {:error, _reason} -> acc
+        end
+      end)
+
+    remember_remote_revision()
+    state
+  end
+
+  defp maybe_refresh_state(_default_state, fallback_state, revision) when revision == 0 do
+    fallback_state
+  end
+
+  defp maybe_refresh_state(default_state, fallback_state, revision) do
+    if revision == local_revision() do
+      fallback_state
+    else
+      read_state(default_state)
+    end
+  end
+
+  defp remember_remote_revision do
+    case command(["GET", revision_key()]) do
+      {:ok, revision} -> remember_revision(revision)
+      _ -> :ok
+    end
+  end
+
+  defp remember_pipeline_revision({:ok, results}) do
+    results
+    |> List.last()
+    |> remember_revision()
+
+    :ok
+  end
+
+  defp remember_pipeline_revision(_result), do: :ok
+
+  defp remember_revision(revision) do
+    Process.put(:open_chat_redis_revision, to_int(revision))
+    :ok
+  end
+
+  defp local_revision do
+    Process.get(:open_chat_redis_revision, 0)
   end
 
   defp read_bucket(bucket) do
@@ -265,12 +311,16 @@ defmodule OpenChat.Store.RedisPersistence do
     end
   end
 
-  defp run_pipeline([]), do: :ok
+  defp run_pipeline([]), do: {:ok, []}
 
   defp run_pipeline(commands) do
     case Redix.pipeline(OpenChat.Redis, commands) do
-      {:ok, _results} -> :ok
-      {:error, reason} -> Logger.warning("Redis pipeline failed: #{inspect(reason)}")
+      {:ok, results} ->
+        {:ok, results}
+
+      {:error, reason} ->
+        Logger.warning("Redis pipeline failed: #{inspect(reason)}")
+        {:error, reason}
     end
   end
 
@@ -317,6 +367,7 @@ defmodule OpenChat.Store.RedisPersistence do
     do: [Config.redis_key_prefix() | parts] |> Enum.map(&to_s/1) |> Enum.join(":")
 
   defp meta_key, do: key(["meta", "version"])
+  defp revision_key, do: key(["meta", "revision"])
   defp lock_key, do: key(["lock", "store"])
   defp index_key(bucket), do: key(["index", bucket])
   defp record_key(bucket, id), do: key([bucket, id])
