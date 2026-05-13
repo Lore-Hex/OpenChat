@@ -101,6 +101,7 @@ defmodule OpenChat.Store.RequestPlan do
     refresh =
       [{"users", sender_uid}, {:counter, "next_id"}] ++
         conversation_record_keys(sender_uid, receiver_type, receiver) ++
+        parent_message_keys(params) ++
         if(receiver_type == "group", do: group_keys(receiver), else: user_record_keys(receiver))
 
     mutate(conversation_scope(sender_uid, receiver_type, receiver), refresh)
@@ -123,7 +124,10 @@ defmodule OpenChat.Store.RequestPlan do
   end
 
   def build({:get_message, id}), do: read([{"messages", id}, {"reactions", id}])
+  def build({:get_message_for, _uid, id, _opts}), do: read([{"messages", id}, {"reactions", id}])
+
   def build({:find_message_by_muid, muid}), do: read([{"message_muids", muid}])
+  def build({:find_message_by_muid_for, _uid, muid, _opts}), do: read([{"message_muids", muid}])
 
   def build({:messages_for_user, uid, peer_uid, _params}),
     do: read([{"conversation_messages", Conversations.user_conversation_id(uid, peer_uid)}])
@@ -135,20 +139,20 @@ defmodule OpenChat.Store.RequestPlan do
       )
 
   def build({:messages_for_thread, _uid, parent_id, _params}),
-    do: read([{"thread_messages", parent_id}])
+    do: read([{"messages", parent_id}, {"thread_messages", parent_id}])
 
-  def build({receipt, uid, receiver_type, receiver_id, _message_id})
+  def build({receipt, uid, receiver_type, receiver_id, message_id})
       when receipt in [:mark_read, :mark_unread] do
     mutate(
       conversation_scope(uid, receiver_type, receiver_id) ++ user_scope(uid),
-      conversation_record_keys(uid, receiver_type, receiver_id) ++ [{"reads", uid}]
+      receipt_refresh_keys(uid, receiver_type, receiver_id, message_id) ++ [{"reads", uid}]
     )
   end
 
-  def build({:mark_delivered, uid, receiver_type, receiver_id, _message_id}) do
+  def build({:mark_delivered, uid, receiver_type, receiver_id, message_id}) do
     mutate(
       conversation_scope(uid, receiver_type, receiver_id) ++ user_scope(uid),
-      conversation_record_keys(uid, receiver_type, receiver_id) ++ [{"delivered", uid}]
+      receipt_refresh_keys(uid, receiver_type, receiver_id, message_id) ++ [{"delivered", uid}]
     )
   end
 
@@ -229,6 +233,24 @@ defmodule OpenChat.Store.RequestPlan do
       []
     end
   end
+
+  defp receipt_refresh_keys(uid, receiver_type, receiver_id, message_id) do
+    conversation_record_keys(uid, receiver_type, receiver_id) ++
+      if(receiver_type == "group",
+        do: group_keys(receiver_id),
+        else: user_record_keys(receiver_id)
+      ) ++
+      message_record_keys(message_id)
+  end
+
+  defp parent_message_keys(params) do
+    params
+    |> Map.get("parentId", Map.get(params, "parentMessageId"))
+    |> message_record_keys()
+  end
+
+  defp message_record_keys(value),
+    do: if(blank?(value) or to_s(value) == "0", do: [], else: [{"messages", value}])
 
   defp valid_receiver?(receiver_type, receiver_id),
     do: receiver_type in ["user", "group"] and not blank?(receiver_id)

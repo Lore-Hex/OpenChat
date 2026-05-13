@@ -3,6 +3,14 @@ defmodule OpenChat.Config do
 
   def app_id, do: Application.fetch_env!(:open_chat, :app_id)
   def api_key, do: Application.fetch_env!(:open_chat, :api_key)
+
+  def local_jwt_secret do
+    case Application.get_env(:open_chat, :local_jwt_secret) do
+      value when value in [nil, ""] -> runtime_secret(:open_chat_local_jwt_secret)
+      value -> value
+    end
+  end
+
   def region, do: Application.fetch_env!(:open_chat, :region)
   def host, do: Application.fetch_env!(:open_chat, :host)
   def ws_port, do: Application.fetch_env!(:open_chat, :ws_port)
@@ -43,5 +51,17 @@ defmodule OpenChat.Config do
       "settingsHash" => "open-chat-0.1.0",
       "settingsHashReceivedAt" => OpenChat.Time.now()
     }
+  end
+
+  defp runtime_secret(key) do
+    case :persistent_term.get(key, nil) do
+      nil ->
+        secret = Base.url_encode64(:crypto.strong_rand_bytes(32), padding: false)
+        :persistent_term.put(key, secret)
+        secret
+
+      secret ->
+        secret
+    end
   end
 end

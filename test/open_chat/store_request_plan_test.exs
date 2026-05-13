@@ -1,7 +1,7 @@
 defmodule OpenChat.StoreRequestPlanTest do
   use ExUnit.Case, async: true
 
-  alias OpenChat.Store.{Conversations, RequestPlan}
+  alias OpenChat.Store.{AuthTokens, Conversations, RequestPlan}
 
   test "message writes lock one conversation and refresh only touched records" do
     conversation_id = Conversations.user_conversation_id("plan-a", "plan-b")
@@ -32,10 +32,7 @@ defmodule OpenChat.StoreRequestPlanTest do
   end
 
   test "local JWT auth plans against the underlying token" do
-    jwt =
-      "local." <>
-        Base.url_encode64(Jason.encode!(%{"token" => "uid:jwt-plan-user"}), padding: false) <>
-        ".unsigned"
+    jwt = AuthTokens.local_jwt("jwt-plan-user", "uid:jwt-plan-user")
 
     plan = RequestPlan.build({:authenticate, jwt})
 
@@ -83,7 +80,14 @@ defmodule OpenChat.StoreRequestPlanTest do
       {:list_groups, %{}},
       {:delete_group, "room"},
       {:groups_for_user, "alice"},
+      {:get_message_for, "alice", "1", []},
       {:find_message_by_muid, "client-id"},
+      {:find_message_by_muid_for, "alice", "client-id", []},
+      {:messages_for_thread, "alice", "1", %{}},
+      {:mark_read, "alice", "user", "bob", "1"},
+      {:mark_delivered, "alice", "user", "bob", "1"},
+      {:add_reaction, "alice", "1", "👍"},
+      {:reactions, "alice", "1", nil},
       {:unread_counts, "alice", %{}},
       {:conversations, "alice", %{}},
       {:delete_conversation, "user_alice_bob"}

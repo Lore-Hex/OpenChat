@@ -11,12 +11,12 @@ OpenChat is a BEAM/Elixir replacement for the covered subset of CometChat. It is
 | Area | SDK/API surface | Routes | Coverage |
 |---|---|---|---|
 | Settings and auth | SDK init settings, `CometChat.login(authToken)`, `getLoggedinUser`, logout token revocation | `GET /settings`, `POST /users/:uid/auth_tokens`, `POST /admin/users/auth`, `DELETE /admin/users/auth/:authToken`, `GET /me`, `PUT /me`, `DELETE /me` | Covered by ExUnit API tests and Playwright SDK contract tests. `PUT /me` returns the user, authToken, jwt/fat placeholders, wsChannel, and SDK settings. |
-| Local JWT and sessions | SDK session/JWT compatibility payloads | `POST /me/jwt`, `POST /user_sessions` | Covered by ExUnit API tests. These are local compatibility payloads, not CometChat-issued credentials. |
+| Local JWT and sessions | SDK session/JWT compatibility payloads | `POST /me/jwt`, `POST /user_sessions` | Covered by ExUnit API tests. Local JWTs are HMAC-signed compatibility tokens with a 24-hour expiry. |
 | Users | List, search, paginate, create, update, deactivate, reactivate, fetch with block state | `GET /users`, `POST /users`, `PUT /users`, `GET /users/:uid`, `PUT /users/:uid`, `DELETE /users/:uid` | Covered by store and API regression tests. |
 | Blocks | Block, unblock, list blocked users, `blockedByMe`, `hasBlockedMe` | `GET /blockedusers`, `POST /blockedusers`, `DELETE /blockedusers` | Covered by ExUnit API tests and Playwright SDK contract tests. |
 | Groups and membership | List, search, paginate, create, update, fetch, delete, join public/password groups, member list, add/remove members, update scopes, owner/moderator member management | `GET /groups`, `POST /groups`, `GET /groups/:guid`, `PUT /groups/:guid`, `DELETE /groups/:guid`, `GET /groups/:guid/members`, `POST /groups/:guid/members`, `PUT /groups/:guid/members`, `DELETE /groups/:guid/members`, `PUT /groups/:guid/members/:uid`, `DELETE /groups/:guid/members/:uid` | Covered by store/API/Redis tests and SDK group join contract tests. User-token member writes require group owner/admin/moderator/coOwner privileges. |
 | Group bans | Ban, unban, list/search banned users | `GET /groups/:guid/bannedusers`, `POST /groups/:guid/bannedusers/:uid`, `DELETE /groups/:guid/bannedusers/:uid` | Covered by API regression and Redis cleanup tests. |
-| Messages | Text, custom, media-shaped messages, multipart media upload, admin sends, validation, deterministic pagination, cursor metadata | `POST /messages`, `GET /users/:uid/messages`, `GET /groups/:guid/messages`, `GET /messages/:messageId`, `GET /user/messages/:muid` | Covered by store tests, API tests, media upload tests, and Playwright SDK contract tests. |
+| Messages | Text, custom, media-shaped messages, multipart media upload, admin sends, validation, deterministic pagination, cursor metadata | `POST /messages`, `GET /users/:uid/messages`, `GET /groups/:guid/messages`, `GET /messages/:messageId`, `GET /user/messages/:muid` | Covered by store tests, API tests, media upload tests, and Playwright SDK contract tests. Message reads, MUID lookup, threads, reactions, and receipts require conversation participation. |
 | Threads | Send replies and fetch thread messages | `POST /messages/:parentId/thread`, `GET /messages/:parentId/thread` | Covered by API regression tests. |
 | Message actions | Edit/delete action messages, sender/group-moderator authorization, full-access API-key moderation, and hidden deleted-message fetch behavior | `PUT /messages/:messageId`, `DELETE /messages/:messageId` | Covered by store/API tests and SDK delete contract tests. |
 | Unread and receipt state | Unread count fetches, mark read, mark unread, delivered cursors, read cursor rewind | `GET /messages?unread=1&count=1`, `POST /users/:uid/conversation/read`, `POST /groups/:guid/conversation/read`, `DELETE /users/:uid/conversation/read`, `DELETE /groups/:guid/conversation/read`, `POST /users/:uid/conversation/delivered`, `POST /groups/:guid/conversation/delivered` | Covered by store/API/Redis tests and WebSocket receipt tests. SDK v4 can also send read/delivered receipts over WebSocket, which update receipt state. |
@@ -31,7 +31,7 @@ OpenChat is a BEAM/Elixir replacement for the covered subset of CometChat. It is
 |---|---|---|---|
 | Generic message list | `GET /messages` without `unread=1&count=1` | Returns an empty list. Use `GET /users/:uid/messages`, `GET /groups/:guid/messages`, or thread routes for real message history. | Partial |
 | Extensions beyond reactions | `MATCH /extensions/:name/*path`, extension-host fallback | All extension calls are interpreted as reaction add/remove requests. Non-reaction extensions are not implemented. | Partial |
-| SDK sessions and JWTs | `POST /user_sessions`, `POST /me/jwt` | Returns local compatibility payloads only. There is no external CometChat session registry or signed CometChat JWT issuer. | Partial |
+| SDK sessions | `POST /user_sessions` | Returns a local compatibility payload only. There is no external CometChat session registry. | Partial |
 | Broader CometChat product areas | Calls, typing indicators, live presence/occupancy, push notifications, moderation workflows, webhooks, roles, polls, message translations | No route-level implementation unless listed in the covered matrix above. | Not done |
 
 ## WebSocket
@@ -96,15 +96,16 @@ For a literal zero-code swizzle, deploy TLS and DNS so the SDK's existing CometC
 | `PUBLIC_HOST` | `localhost` | Host returned to SDK in `/me.settings.CHAT_HOST` |
 | `PUBLIC_WS_PORT` | `PORT` | Port returned as `/me.settings.CHAT_WSS_PORT` |
 | `COMETCHAT_APP_ID` | `local-app` | App ID accepted/reported by the clone |
-| `COMETCHAT_API_KEY` | `local-api-key` | Admin API key for server-side routes. Blank disables admin API-key access rather than opening routes. |
+| `COMETCHAT_API_KEY` | `local-api-key` outside prod, blank in prod | Admin API key for server-side routes. Blank disables admin API-key access rather than opening routes. |
+| `LOCAL_JWT_SECRET` | `COMETCHAT_API_KEY` fallback, runtime random if neither is set in prod | HMAC secret for local JWT compatibility tokens. Set this explicitly for stable multi-node deployments. |
 | `COMETCHAT_REGION` | `us` | Region returned to SDK settings |
 | `EXTENSION_DOMAIN` | `PUBLIC_HOST` | Extension domain used by `callExtension` URL generation |
 | `REDIS_URL` | unset | Optional Redis URL for durable per-record storage |
 | `REDIS_KEY_PREFIX` | `open_chat` | Redis namespace prefix for record keys, indexes, and counters |
 | `REDIS_SNAPSHOT_KEY` | `open_chat:snapshot:v1` | Legacy import key for older single-snapshot deployments |
-| `SEED_USERS_JSON` | built-in Alice/Bob/Carol | Initial users. List or map. Users may include `authToken`. |
+| `SEED_USERS_JSON` | built-in Alice/Bob/Carol without auth tokens | Initial users. List or map. Users may include `authToken`. |
 | `SEED_GROUPS_JSON` | built-in public `lobby` | Initial groups. List or map. |
-| `ACCEPT_UID_TOKENS` | `true` | Accept `uid:<uid>` tokens for local/dev and contract tests |
+| `ACCEPT_UID_TOKENS` | `false` outside tests | Accept `uid:<uid>` developer tokens. Enable only for local contract tests. |
 | `UPLOAD_DIR` | `priv/static/uploads` | Uploaded media storage directory |
 | `PUBLIC_MEDIA_BASE_URL` | unset | Absolute media URL base; otherwise `/media/<file>` |
 

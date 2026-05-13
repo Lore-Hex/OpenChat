@@ -3,6 +3,7 @@ defmodule OpenChatWeb.ApiRouter do
   use Plug.Router
   import Plug.Conn
   alias OpenChat.{Config, Errors, Store, Time}
+  alias OpenChat.Store.AuthTokens
   alias OpenChatWeb.{Auth, JSON}
 
   plug(:match)
@@ -65,12 +66,7 @@ defmodule OpenChatWeb.ApiRouter do
   post "/me/jwt" do
     with_user(conn, fn conn, user, token ->
       JSON.ok(conn, %{
-        "jwt" =>
-          "local." <>
-            Base.url_encode64(
-              Jason.encode!(%{"uid" => user["uid"], "token" => token, "iat" => Time.now()}),
-              padding: false
-            ) <> ".unsigned"
+        "jwt" => AuthTokens.local_jwt(user["uid"], token)
       })
     end)
   end
@@ -310,8 +306,10 @@ defmodule OpenChatWeb.ApiRouter do
 
   get "/messages/:list_id/thread" do
     with_user(conn, fn conn, user, _token ->
-      {:ok, messages} = Store.messages_for_thread(user["uid"], list_id, conn.query_params)
-      messages_response(conn, messages, conn.query_params)
+      case Store.messages_for_thread(user["uid"], list_id, conn.query_params) do
+        {:ok, messages} -> messages_response(conn, messages, conn.query_params)
+        {:error, e} -> JSON.error(conn, e, error_status(e, 400))
+      end
     end)
   end
 
@@ -324,15 +322,13 @@ defmodule OpenChatWeb.ApiRouter do
 
   get "/messages/:message_id/reactions/:reaction" do
     with_user(conn, fn conn, user, _token ->
-      {:ok, rows} = Store.reactions(user["uid"], message_id, reaction)
-      JSON.ok(conn, rows)
+      store_response(conn, Store.reactions(user["uid"], message_id, reaction), 200, 404)
     end)
   end
 
   get "/messages/:message_id/reactions" do
     with_user(conn, fn conn, user, _token ->
-      {:ok, rows} = Store.reactions(user["uid"], message_id)
-      JSON.ok(conn, rows)
+      store_response(conn, Store.reactions(user["uid"], message_id), 200, 404)
     end)
   end
 
@@ -377,9 +373,10 @@ defmodule OpenChatWeb.ApiRouter do
   end
 
   get "/messages/:message_id" do
-    with_user(conn, fn conn, _user, _token ->
-      case Store.get_message(message_id) do
+    with_user(conn, fn conn, user, _token ->
+      case Store.get_message_for(user["uid"], message_id) do
         {:ok, message} -> JSON.ok(conn, message)
+        {:error, e} -> JSON.error(conn, e, error_status(e, 400))
         :error -> JSON.error(conn, Errors.message_not_found(message_id), 404)
       end
     end)
@@ -417,9 +414,10 @@ defmodule OpenChatWeb.ApiRouter do
   end
 
   get "/user/messages/:muid" do
-    with_user(conn, fn conn, _user, _token ->
-      case Store.find_message_by_muid(muid) do
+    with_user(conn, fn conn, user, _token ->
+      case Store.find_message_by_muid_for(user["uid"], muid) do
         {:ok, message} -> JSON.ok(conn, message)
+        {:error, e} -> JSON.error(conn, e, error_status(e, 400))
         :error -> JSON.error(conn, Errors.message_not_found(muid), 404)
       end
     end)
@@ -539,8 +537,7 @@ defmodule OpenChatWeb.ApiRouter do
       message_id =
         conn.body_params["messageId"] || conn.body_params["id"] || conn.params["messageId"] || "0"
 
-      {:ok, data} = marker.(user["uid"], receiver_type, receiver_id, message_id)
-      JSON.ok(conn, data)
+      store_response(conn, marker.(user["uid"], receiver_type, receiver_id, message_id), 200, 404)
     end)
   end
 

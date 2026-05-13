@@ -268,6 +268,49 @@ defmodule OpenChatWeb.ApiRegressionTest do
     assert [%{"entityId" => "alice", "count" => 1}] = json(conn)["data"]
   end
 
+  test "message read, thread, reaction, and receipt APIs enforce participant privacy" do
+    parent =
+      auth_conn(:post, "/v3.0/messages", %{
+        "receiver" => "bob",
+        "receiverType" => "user",
+        "muid" => "api-private-muid",
+        "data" => %{"text" => "private"}
+      })
+      |> json()
+      |> get_in(["data"])
+
+    for {method, path, body} <- [
+          {:get, "/v3.0/messages/#{parent["id"]}", %{}},
+          {:get, "/v3.0/user/messages/api-private-muid", %{}},
+          {:get, "/v3.0/messages/#{parent["id"]}/thread", %{}},
+          {:get, "/v3.0/messages/#{parent["id"]}/reactions", %{}},
+          {:post, "/v3.0/messages/#{parent["id"]}/reactions/%F0%9F%91%8D", %{}},
+          {:post, "/v3.0/users/alice/conversation/read", %{"messageId" => parent["id"]}},
+          {:post, "/v3.0/users/alice/conversation/delivered", %{"messageId" => parent["id"]}}
+        ] do
+      conn = auth_conn(method, path, body, "uid:carol")
+      assert conn.status == 403
+      assert json(conn)["error"]["code"] == "ERR_FORBIDDEN"
+    end
+
+    conn =
+      auth_conn(
+        :post,
+        "/v3.0/messages/#{parent["id"]}/thread",
+        %{
+          "receiver" => "alice",
+          "receiverType" => "user",
+          "data" => %{"text" => "bad thread"}
+        },
+        "uid:carol"
+      )
+
+    assert conn.status == 403
+    assert json(conn)["error"]["code"] == "ERR_FORBIDDEN"
+
+    assert auth_conn(:get, "/v3.0/messages/#{parent["id"]}", %{}, "uid:bob").status == 200
+  end
+
   test "native and extension reaction routes support list, filter, add, and remove" do
     message =
       auth_conn(:post, "/v3.0/messages", %{
@@ -297,7 +340,7 @@ defmodule OpenChatWeb.ApiRegressionTest do
           "reaction" => "🔥",
           "action" => "add"
         },
-        "uid:carol"
+        "uid:alice"
       )
 
     assert Enum.any?(get_in(json(conn), ["data", "data", "reactions"]), &(&1["reaction"] == "🔥"))
@@ -311,7 +354,7 @@ defmodule OpenChatWeb.ApiRegressionTest do
           "reaction" => "🔥",
           "action" => "remove"
         },
-        "uid:carol"
+        "uid:alice"
       )
 
     refute Enum.any?(get_in(json(conn), ["data", "data", "reactions"]), &(&1["reaction"] == "🔥"))
@@ -320,6 +363,17 @@ defmodule OpenChatWeb.ApiRegressionTest do
       auth_conn(:delete, "/v3.0/messages/#{message["id"]}/reactions/%F0%9F%91%8D", %{}, "uid:bob")
 
     assert get_in(json(conn), ["data", "data", "reactions"]) == []
+
+    conn =
+      auth_conn(
+        :post,
+        "/v3.0/messages/#{message["id"]}/reactions/%F0%9F%91%8D",
+        %{},
+        "uid:carol"
+      )
+
+    assert conn.status == 403
+    assert json(conn)["error"]["code"] == "ERR_FORBIDDEN"
   end
 
   test "media upload route stores files, serves them, and returns 404 for missing media" do
@@ -386,6 +440,7 @@ defmodule OpenChatWeb.ApiRegressionTest do
     conn = auth_conn(:post, "/v3.0/me/jwt", %{}, token)
     assert conn.status == 200
     jwt = json(conn)["data"]["jwt"]
+    refute String.ends_with?(jwt, ".unsigned")
 
     conn = auth_conn(:get, "/v3.0/me", %{}, jwt)
     assert json(conn)["data"]["uid"] == "session-user"

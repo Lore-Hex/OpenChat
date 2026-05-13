@@ -1,7 +1,8 @@
 defmodule OpenChat.StoreRegressionTest do
   use ExUnit.Case, async: false
 
-  alias OpenChat.Store
+  alias OpenChat.{Store, Time}
+  alias OpenChat.Store.AuthTokens
 
   setup do
     Store.reset!()
@@ -48,10 +49,37 @@ defmodule OpenChat.StoreRegressionTest do
 
     assert {:ok, %{"uid" => "alice"}} = Store.me(token)
     assert {:ok, %{"uid" => "alice"}} = Store.me(jwt)
+    refute String.ends_with?(jwt, ".unsigned")
+
+    tampered = String.replace(jwt, "local.", "localx.", global: false)
+    assert {:error, %{"code" => "ERR_NO_AUTH"}} = Store.me(tampered)
+
+    expired = AuthTokens.local_jwt("alice", token, Time.now() - 90_000)
+    assert {:error, %{"code" => "ERR_NO_AUTH"}} = Store.me(expired)
 
     assert {:ok, %{"success" => true}} = Store.revoke_auth_token(token)
     assert {:error, %{"code" => "ERR_NO_AUTH"}} = Store.authenticate(token)
     assert {:error, %{"code" => "ERR_NO_AUTH"}} = Store.me(jwt)
+  end
+
+  test "uid developer tokens are runtime gated and not embedded in default seed users" do
+    old_accept_uid_tokens = Application.fetch_env!(:open_chat, :accept_uid_tokens)
+
+    on_exit(fn ->
+      Application.put_env(:open_chat, :accept_uid_tokens, old_accept_uid_tokens)
+      Store.reset!()
+    end)
+
+    Application.put_env(:open_chat, :accept_uid_tokens, false)
+    Store.reset!()
+
+    assert {:error, %{"code" => "ERR_NO_AUTH"}} = Store.me("uid:alice")
+    assert {:error, %{"code" => "ERR_NO_AUTH"}} = Store.me("uid:not-seeded")
+
+    Application.put_env(:open_chat, :accept_uid_tokens, true)
+    Store.reset!()
+
+    assert {:ok, %{"uid" => "alice", "authToken" => "uid:alice"}} = Store.me("uid:alice")
   end
 
   test "group permissions, password joins, scopes, bans, and user group listings" do
@@ -405,7 +433,10 @@ defmodule OpenChat.StoreRegressionTest do
     assert :error = Store.get_message(parent["id"])
     assert :error = Store.get_message(reply["id"])
     assert {:ok, []} = Store.messages_for_thread("alice", parent["id"])
-    assert {:ok, []} = Store.reactions("bob", parent["id"], "👍")
+
+    assert {:error, %{"code" => "ERR_MESSAGE_NOT_FOUND"}} =
+             Store.reactions("bob", parent["id"], "👍")
+
     assert {:ok, []} = Store.conversations("bob", %{"conversationType" => "group"})
   end
 
@@ -471,22 +502,60 @@ defmodule OpenChat.StoreRegressionTest do
              })
 
     assert {:ok, _message} = Store.add_reaction("bob", message["id"], "👍")
-    assert {:ok, _reacted} = Store.add_reaction("carol", message["id"], "👍")
+    assert {:ok, _reacted} = Store.add_reaction("alice", message["id"], "👍")
     assert {:ok, reacted} = Store.add_reaction("bob", message["id"], "🔥")
 
     assert Enum.find(reacted["data"]["reactions"], &(&1["reaction"] == "👍"))["count"] == 2
     assert Enum.find(reacted["data"]["reactions"], &(&1["reaction"] == "🔥"))["count"] == 1
 
     assert {:ok, rows} = Store.reactions("bob", message["id"], "👍")
-    assert Enum.map(rows, & &1["uid"]) |> Enum.sort() == ["bob", "carol"]
+    assert Enum.map(rows, & &1["uid"]) |> Enum.sort() == ["alice", "bob"]
 
     assert {:ok, after_remove} = Store.remove_reaction("bob", message["id"], "👍")
     thumbs_up = Enum.find(after_remove["data"]["reactions"], &(&1["reaction"] == "👍"))
     assert thumbs_up["count"] == 1
     assert thumbs_up["reactedByMe"] == false
 
-    assert {:ok, after_final_remove} = Store.remove_reaction("carol", message["id"], "👍")
+    assert {:ok, after_final_remove} = Store.remove_reaction("alice", message["id"], "👍")
     refute Enum.any?(after_final_remove["data"]["reactions"], &(&1["reaction"] == "👍"))
+  end
+
+  test "message reads, threads, reactions, and receipts require conversation participation" do
+    assert {:ok, parent} =
+             Store.send_message("alice", %{
+               "receiver" => "bob",
+               "receiverType" => "user",
+               "muid" => "private-parent",
+               "data" => %{"text" => "private"}
+             })
+
+    assert {:error, %{"code" => "ERR_FORBIDDEN"}} =
+             Store.get_message_for("carol", parent["id"])
+
+    assert {:error, %{"code" => "ERR_FORBIDDEN"}} =
+             Store.find_message_by_muid_for("carol", "private-parent")
+
+    assert {:error, %{"code" => "ERR_FORBIDDEN"}} =
+             Store.messages_for_thread("carol", parent["id"])
+
+    assert {:error, %{"code" => "ERR_FORBIDDEN"}} =
+             Store.add_reaction("carol", parent["id"], "👍")
+
+    assert {:error, %{"code" => "ERR_FORBIDDEN"}} =
+             Store.reactions("carol", parent["id"])
+
+    assert {:error, %{"code" => "ERR_FORBIDDEN"}} =
+             Store.mark_read("carol", "user", "alice", parent["id"])
+
+    assert {:ok, _read} = Store.mark_read("bob", "user", "alice", parent["id"])
+
+    assert {:error, %{"code" => "ERR_FORBIDDEN"}} =
+             Store.send_message("carol", %{
+               "receiver" => "alice",
+               "receiverType" => "user",
+               "parentId" => parent["id"],
+               "data" => %{"text" => "snoop reply"}
+             })
   end
 
   test "missing users, groups, messages, muids, and reactions return stable errors" do

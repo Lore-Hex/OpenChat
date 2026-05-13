@@ -12,6 +12,7 @@ defmodule OpenChat.Store do
   alias OpenChat.{Config, Errors, Time}
 
   alias OpenChat.Store.{
+    Access,
     AuthTokens,
     Conversations,
     Entities,
@@ -119,8 +120,14 @@ defmodule OpenChat.Store do
 
   def get_message(id), do: call({:get_message, to_s(id)})
 
+  def get_message_for(uid, id, opts \\ []),
+    do: call({:get_message_for, to_s(uid), to_s(id), opts})
+
   def find_message_by_muid(muid),
     do: call({:find_message_by_muid, to_s(muid)})
+
+  def find_message_by_muid_for(uid, muid, opts \\ []),
+    do: call({:find_message_by_muid_for, to_s(uid), to_s(muid), opts})
 
   def messages_for_user(uid, peer_uid, params \\ %{}),
     do: call({:messages_for_user, to_s(uid), to_s(peer_uid), params})
@@ -757,6 +764,22 @@ defmodule OpenChat.Store do
     {:reply, Map.fetch(state["messages"], id), state}
   end
 
+  def handle_call({:get_message_for, uid, id, opts}, _from, state) do
+    reply =
+      case Map.fetch(state["messages"], id) do
+        {:ok, message} ->
+          case Access.message(state, uid, message, opts) do
+            :ok -> {:ok, message}
+            {:error, error} -> {:error, error}
+          end
+
+        :error ->
+          :error
+      end
+
+    {:reply, reply, state}
+  end
+
   def handle_call({:delete_conversation, conversation_id}, _from, state) do
     ids =
       [conversation_id]
@@ -774,9 +797,15 @@ defmodule OpenChat.Store do
   end
 
   def handle_call({:hide_conversation, uid, receiver_type, receiver_id}, _from, state) do
-    {state, payload} = Conversations.hide(state, uid, receiver_type, receiver_id, Time.now())
-    persist_ops(PersistenceOps.hidden_conversations(state, uid))
-    {:reply, {:ok, payload}, state}
+    case Access.conversation(state, uid, receiver_type, receiver_id) do
+      :ok ->
+        {state, payload} = Conversations.hide(state, uid, receiver_type, receiver_id, Time.now())
+        persist_ops(PersistenceOps.hidden_conversations(state, uid))
+        {:reply, {:ok, payload}, state}
+
+      {:error, error} ->
+        {:reply, {:error, error}, state}
+    end
   end
 
   def handle_call({:find_message_by_muid, muid}, _from, state) do
@@ -787,6 +816,28 @@ defmodule OpenChat.Store do
       end
 
     {:reply, if(result, do: {:ok, result}, else: :error), state}
+  end
+
+  def handle_call({:find_message_by_muid_for, uid, muid, opts}, _from, state) do
+    result =
+      case get_in(state, ["message_muids", muid]) do
+        nil -> Enum.find(Map.values(state["messages"]), fn m -> to_s(m["muid"]) == muid end)
+        id -> get_in(state, ["messages", to_s(id)])
+      end
+
+    reply =
+      case result do
+        nil ->
+          :error
+
+        message ->
+          case Access.message(state, uid, message, opts) do
+            :ok -> {:ok, message}
+            {:error, error} -> {:error, error}
+          end
+      end
+
+    {:reply, reply, state}
   end
 
   def handle_call({:messages_for_user, uid, peer_uid, params}, _from, state) do
@@ -805,43 +856,81 @@ defmodule OpenChat.Store do
     end
   end
 
-  def handle_call({:messages_for_thread, _uid, parent_id, params}, _from, state) do
-    ids = Map.get(state["thread_messages"], parent_id, [])
+  def handle_call({:messages_for_thread, uid, parent_id, params}, _from, state) do
+    with {:ok, parent} <- Map.fetch(state["messages"], parent_id),
+         :ok <- Access.message(state, uid, parent) do
+      ids = Map.get(state["thread_messages"], parent_id, [])
 
-    messages =
-      ids
-      |> Enum.map(&state["messages"][&1])
-      |> Enum.reject(&is_nil/1)
-      |> filter_messages(params)
-      |> paginate_messages(params)
+      messages =
+        ids
+        |> Enum.map(&state["messages"][&1])
+        |> Enum.reject(&is_nil/1)
+        |> filter_messages(params)
+        |> paginate_messages(params)
 
-    {:reply, {:ok, messages}, state}
+      {:reply, {:ok, messages}, state}
+    else
+      :error -> {:reply, {:ok, []}, state}
+      {:error, error} -> {:reply, {:error, error}, state}
+    end
   end
 
   def handle_call({:mark_read, uid, receiver_type, receiver_id, message_id}, _from, state) do
-    {state, payload} =
-      Conversations.mark_read(state, uid, receiver_type, receiver_id, message_id, Time.now())
+    case Access.receipt(state, uid, receiver_type, receiver_id, message_id) do
+      :ok ->
+        {state, payload} =
+          Conversations.mark_read(state, uid, receiver_type, receiver_id, message_id, Time.now())
 
-    persist_ops(PersistenceOps.reads(state, uid))
-    {:reply, {:ok, payload}, state}
+        persist_ops(PersistenceOps.reads(state, uid))
+        {:reply, {:ok, payload}, state}
+
+      {:error, error} ->
+        {:reply, {:error, error}, state}
+    end
   end
 
   def handle_call({:mark_delivered, uid, receiver_type, receiver_id, message_id}, _from, state) do
-    {state, payload} =
-      Conversations.mark_delivered(state, uid, receiver_type, receiver_id, message_id, Time.now())
+    case Access.receipt(state, uid, receiver_type, receiver_id, message_id) do
+      :ok ->
+        {state, payload} =
+          Conversations.mark_delivered(
+            state,
+            uid,
+            receiver_type,
+            receiver_id,
+            message_id,
+            Time.now()
+          )
 
-    persist_ops(PersistenceOps.delivered(state, uid))
-    publish_receipt(payload, uid, receiver_type, receiver_id, "delivered")
-    {:reply, {:ok, payload}, state}
+        persist_ops(PersistenceOps.delivered(state, uid))
+        publish_receipt(payload, uid, receiver_type, receiver_id, "delivered")
+        {:reply, {:ok, payload}, state}
+
+      {:error, error} ->
+        {:reply, {:error, error}, state}
+    end
   end
 
   def handle_call({:mark_unread, uid, receiver_type, receiver_id, message_id}, _from, state) do
-    {state, conv_id} =
-      Conversations.mark_unread(state, uid, receiver_type, receiver_id, message_id, Time.now())
+    case Access.receipt(state, uid, receiver_type, receiver_id, message_id) do
+      :ok ->
+        {state, conv_id} =
+          Conversations.mark_unread(
+            state,
+            uid,
+            receiver_type,
+            receiver_id,
+            message_id,
+            Time.now()
+          )
 
-    conv = build_conversation(state, uid, conv_id)
-    persist_ops(PersistenceOps.reads(state, uid))
-    {:reply, {:ok, %{"conversation" => conv}}, state}
+        conv = build_conversation(state, uid, conv_id)
+        persist_ops(PersistenceOps.reads(state, uid))
+        {:reply, {:ok, %{"conversation" => conv}}, state}
+
+      {:error, error} ->
+        {:reply, {:error, error}, state}
+    end
   end
 
   def handle_call({:unread_counts, uid, params}, _from, state) do
@@ -886,12 +975,19 @@ defmodule OpenChat.Store do
   end
 
   def handle_call({:conversation, uid, receiver_type, receiver_id}, _from, state) do
-    conv_id = conversation_id_for(uid, receiver_type, receiver_id)
-    {:reply, {:ok, build_conversation(state, uid, conv_id)}, state}
+    case Access.conversation(state, uid, receiver_type, receiver_id) do
+      :ok ->
+        conv_id = conversation_id_for(uid, receiver_type, receiver_id)
+        {:reply, {:ok, build_conversation(state, uid, conv_id)}, state}
+
+      {:error, error} ->
+        {:reply, {:error, error}, state}
+    end
   end
 
   def handle_call({:add_reaction, uid, id, reaction}, _from, state) do
-    with {:ok, message} <- Map.fetch(state["messages"], id) do
+    with {:ok, message} <- Map.fetch(state["messages"], id),
+         :ok <- Access.message(state, uid, message) do
       reaction = URI.decode(to_s(reaction))
       now = Time.now()
       {reaction_id, state} = take_counter(state, "next_reaction_id")
@@ -926,11 +1022,13 @@ defmodule OpenChat.Store do
       {:reply, {:ok, message}, state}
     else
       :error -> {:reply, {:error, Errors.message_not_found(id)}, state}
+      {:error, error} -> {:reply, {:error, error}, state}
     end
   end
 
   def handle_call({:remove_reaction, uid, id, reaction}, _from, state) do
-    with {:ok, message} <- Map.fetch(state["messages"], id) do
+    with {:ok, message} <- Map.fetch(state["messages"], id),
+         :ok <- Access.message(state, uid, message) do
       reaction = URI.decode(to_s(reaction))
 
       reaction_obj =
@@ -956,21 +1054,33 @@ defmodule OpenChat.Store do
       {:reply, {:ok, message}, state}
     else
       :error -> {:reply, {:error, Errors.message_not_found(id)}, state}
+      {:error, error} -> {:reply, {:error, error}, state}
     end
   end
 
   def handle_call({:reactions, uid, id, reaction}, _from, state) do
-    rows =
-      state
-      |> get_in(["reactions", id])
-      |> case do
-        nil -> []
-        map when is_binary(reaction) -> map |> Map.get(URI.decode(reaction), %{}) |> Map.values()
-        map -> map |> Map.values() |> Enum.flat_map(&Map.values/1)
-      end
-      |> Enum.map(fn r -> Map.put(r, "reactedByMe", r["uid"] == uid) end)
+    with {:ok, message} <- Map.fetch(state["messages"], id),
+         :ok <- Access.message(state, uid, message) do
+      rows =
+        state
+        |> get_in(["reactions", id])
+        |> case do
+          nil ->
+            []
 
-    {:reply, {:ok, rows}, state}
+          map when is_binary(reaction) ->
+            map |> Map.get(URI.decode(reaction), %{}) |> Map.values()
+
+          map ->
+            map |> Map.values() |> Enum.flat_map(&Map.values/1)
+        end
+        |> Enum.map(fn r -> Map.put(r, "reactedByMe", r["uid"] == uid) end)
+
+      {:reply, {:ok, rows}, state}
+    else
+      :error -> {:reply, {:error, Errors.message_not_found(id)}, state}
+      {:error, error} -> {:reply, {:error, error}, state}
+    end
   end
 
   # Loading/persistence
@@ -1088,13 +1198,23 @@ defmodule OpenChat.Store do
           |> maybe_put("parentId", params["parentId"] || params["parentMessageId"])
           |> maybe_put("tags", params["tags"])
 
-        data =
-          data
-          |> Map.put_new("reactions", [])
-          |> put_entity("sender", "user", public_user(sender))
-          |> put_entity("receiver", receiver_type, receiver_entity)
+        parent_id = params["parentId"] || params["parentMessageId"]
 
-        {:ok, Map.put(message, "data", data), state}
+        case Access.parent_message(state, sender_uid, parent_id, message["conversationId"],
+               admin?: admin?
+             ) do
+          :ok ->
+            data =
+              data
+              |> Map.put_new("reactions", [])
+              |> put_entity("sender", "user", public_user(sender))
+              |> put_entity("receiver", receiver_type, receiver_entity)
+
+            {:ok, Map.put(message, "data", data), state}
+
+          {:error, error} ->
+            {:error, error}
+        end
     end
   end
 
@@ -1776,8 +1896,7 @@ defmodule OpenChat.Store do
   end
 
   defp jwt_for(user, token) do
-    payload = Jason.encode!(%{"uid" => user["uid"], "token" => token, "iat" => Time.now()})
-    "local." <> Base.url_encode64(payload, padding: false) <> ".unsigned"
+    AuthTokens.local_jwt(user["uid"], token)
   end
 
   defp ensure_user_in_state(state, uid) do
@@ -1968,9 +2087,9 @@ defmodule OpenChat.Store do
 
   defp default_users do
     [
-      %{"uid" => "alice", "name" => "Alice Example", "authToken" => "uid:alice"},
-      %{"uid" => "bob", "name" => "Bob Example", "authToken" => "uid:bob"},
-      %{"uid" => "carol", "name" => "Carol Example", "authToken" => "uid:carol"},
+      %{"uid" => "alice", "name" => "Alice Example"},
+      %{"uid" => "bob", "name" => "Bob Example"},
+      %{"uid" => "carol", "name" => "Carol Example"},
       %{"uid" => "system", "name" => "System"}
     ]
   end
