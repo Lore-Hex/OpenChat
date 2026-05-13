@@ -1,4 +1,4 @@
-FROM elixir:1.17-otp-27-slim
+FROM public.ecr.aws/docker/library/elixir:1.17-otp-27-slim
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential git openssl ca-certificates \
