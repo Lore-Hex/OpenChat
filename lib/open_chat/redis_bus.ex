@@ -56,10 +56,7 @@ defmodule OpenChat.RedisBus do
         "event" => event
       })
 
-    if Process.whereis(OpenChat.Redis) do
-      Redix.command(OpenChat.Redis, ["PUBLISH", state.channel, payload])
-    end
-
+    publish_to_redis(state.channel, payload)
     {:noreply, state}
   end
 
@@ -82,6 +79,23 @@ defmodule OpenChat.RedisBus do
   def handle_info(_message, state), do: {:noreply, state}
 
   defp channel, do: Config.redis_key_prefix() <> ":events"
+
+  defp publish_to_redis(channel, payload) do
+    if Process.whereis(OpenChat.Redis) do
+      case safe_command(["PUBLISH", channel, payload]) do
+        {:ok, _subscribers} -> :ok
+        {:error, reason} -> Logger.debug("Redis event publish skipped: #{inspect(reason)}")
+      end
+    end
+
+    :ok
+  end
+
+  defp safe_command(command) do
+    Redix.command(OpenChat.Redis, command)
+  catch
+    :exit, reason -> {:error, reason}
+  end
 
   defp encode_key({type, id}), do: [to_string(type), to_string(id)]
   defp encode_key(other), do: ["raw", inspect(other)]

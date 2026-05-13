@@ -1,0 +1,294 @@
+defmodule OpenChat.Store.RequestPlan do
+  @moduledoc false
+
+  alias OpenChat.Store.{AuthTokens, Conversations}
+
+  defstruct mutating?: false, locks: [], refresh: []
+
+  def build(:reset), do: mutate([:global], [])
+
+  def build({:get_user, uid}), do: read([{"users", uid}])
+
+  def build({:get_user_for, viewer_uid, uid}) do
+    read([{"users", uid}, {"blocks", viewer_uid}, {"blocks", uid}])
+  end
+
+  def build({:ensure_user, uid}), do: mutate(user_scope(uid), [{"users", uid}])
+
+  def build({:upsert_user, attrs}) do
+    attrs = stringify_keys(attrs)
+    uid = attrs["uid"] || attrs["id"]
+    mutate(user_scope(uid), user_record_keys(uid))
+  end
+
+  def build({:list_users, _params}), do: read([:all])
+  def build({:delete_user, uid}), do: mutate(user_scope(uid), [{"users", uid}])
+
+  def build({:reactivate_users, uids}) do
+    mutate(
+      Enum.flat_map(List.wrap(uids), &user_scope/1),
+      Enum.flat_map(List.wrap(uids), &user_record_keys/1)
+    )
+  end
+
+  def build({:block_users, uid, uids}) do
+    mutate(
+      user_scope(uid),
+      [{"blocks", uid}] ++ Enum.flat_map(List.wrap(uids), &user_record_keys/1)
+    )
+  end
+
+  def build({:unblock_users, uid, _uids}), do: mutate(user_scope(uid), [{"blocks", uid}])
+  def build({:blocked_users, _uid, _params}), do: read([:all])
+  def build({:create_auth_token, uid}), do: mutate(user_scope(uid), [{"users", uid}])
+  def build({:revoke_auth_token, token}), do: mutate(token_scope(token), [{"tokens", token}])
+  def build({:authenticate, token}), do: mutate(token_scopes(token), token_refresh_keys(token))
+  def build({:me, token}), do: mutate(token_scopes(token), token_refresh_keys(token))
+
+  def build({:upsert_group, attrs}) do
+    attrs = stringify_keys(attrs)
+    guid = attrs["guid"] || attrs["id"]
+    mutate(group_scope(guid), group_keys(guid))
+  end
+
+  def build({:get_group, guid}), do: read(group_keys(guid))
+  def build({:list_groups, _params}), do: read([:all])
+  def build({:delete_group, _guid}), do: mutate([:global], [:all])
+
+  def build({:join_group, guid, uid, _params}),
+    do: mutate(group_scope(guid), group_keys(guid) ++ user_record_keys(uid))
+
+  def build({:leave_group, guid, _uid}), do: mutate(group_scope(guid), group_keys(guid))
+
+  def build({:add_group_members, guid, uids, _scope}) do
+    mutate(
+      group_scope(guid),
+      group_keys(guid) ++ Enum.flat_map(List.wrap(uids), &user_record_keys/1)
+    )
+  end
+
+  def build({:group_members, guid, _params}), do: read(group_keys(guid))
+  def build({:groups_for_user, _uid}), do: read([:all])
+
+  def build({:set_group_scopes, guid, scope_map}) do
+    mutate(
+      group_scope(guid),
+      group_keys(guid) ++ Enum.flat_map(uids_from_scope_map(scope_map), &user_record_keys/1)
+    )
+  end
+
+  def build({:ban_group_member, guid, uid}),
+    do: mutate(group_scope(guid), group_keys(guid) ++ user_record_keys(uid))
+
+  def build({:unban_group_member, guid, _uid}), do: mutate(group_scope(guid), [{"banned", guid}])
+  def build({:banned_group_members, guid, _params}), do: read([{"banned", guid}])
+
+  def build({:send_message, sender_uid, params, _uploads, _opts}) do
+    params = stringify_keys(params)
+    receiver = params["receiver"] || params["receiverId"]
+    receiver_type = receiver_type(params)
+
+    refresh =
+      [{"users", sender_uid}, {:counter, "next_id"}] ++
+        conversation_record_keys(sender_uid, receiver_type, receiver) ++
+        if(receiver_type == "group", do: group_keys(receiver), else: user_record_keys(receiver))
+
+    mutate(conversation_scope(sender_uid, receiver_type, receiver), refresh)
+  end
+
+  def build({:edit_message, _uid, id, _params}),
+    do: mutate(message_scope(id), [{"messages", id}, {:counter, "next_id"}])
+
+  def build({:delete_message, _uid, id}),
+    do: mutate(message_scope(id), [{"messages", id}, {:counter, "next_id"}])
+
+  def build({:delete_conversation, conversation_id}),
+    do: mutate([{:conversation, conversation_id}], [:all])
+
+  def build({:hide_conversation, uid, receiver_type, receiver_id}) do
+    mutate(
+      conversation_scope(uid, receiver_type, receiver_id),
+      conversation_record_keys(uid, receiver_type, receiver_id) ++ [{"hidden_conversations", uid}]
+    )
+  end
+
+  def build({:get_message, id}), do: read([{"messages", id}, {"reactions", id}])
+  def build({:find_message_by_muid, _muid}), do: read([:all])
+
+  def build({:messages_for_user, uid, peer_uid, _params}),
+    do: read([{"conversation_messages", Conversations.user_conversation_id(uid, peer_uid)}])
+
+  def build({:messages_for_group, _uid, guid, _params}),
+    do:
+      read(
+        group_keys(guid) ++ [{"conversation_messages", Conversations.group_conversation_id(guid)}]
+      )
+
+  def build({:messages_for_thread, _uid, parent_id, _params}),
+    do: read([{"thread_messages", parent_id}])
+
+  def build({receipt, uid, receiver_type, receiver_id, _message_id})
+      when receipt in [:mark_read, :mark_unread] do
+    mutate(
+      conversation_scope(uid, receiver_type, receiver_id) ++ user_scope(uid),
+      conversation_record_keys(uid, receiver_type, receiver_id) ++ [{"reads", uid}]
+    )
+  end
+
+  def build({:mark_delivered, uid, receiver_type, receiver_id, _message_id}) do
+    mutate(
+      conversation_scope(uid, receiver_type, receiver_id) ++ user_scope(uid),
+      conversation_record_keys(uid, receiver_type, receiver_id) ++ [{"delivered", uid}]
+    )
+  end
+
+  def build({:unread_counts, _uid, _params}), do: read([:all])
+  def build({:conversations, _uid, _params}), do: read([:all])
+
+  def build({:conversation, uid, receiver_type, receiver_id}) do
+    refresh =
+      [
+        {"reads", uid},
+        {"delivered", uid},
+        {"hidden_conversations", uid}
+      ] ++
+        conversation_record_keys(uid, receiver_type, receiver_id) ++
+        if(receiver_type == "group",
+          do: group_keys(receiver_id),
+          else: user_record_keys(receiver_id)
+        )
+
+    read(refresh)
+  end
+
+  def build({:add_reaction, uid, id, _reaction}) do
+    mutate(message_scope(id), [
+      {"messages", id},
+      {"reactions", id},
+      {"users", uid},
+      {:counter, "next_reaction_id"}
+    ])
+  end
+
+  def build({:remove_reaction, uid, id, _reaction}) do
+    mutate(message_scope(id), [{"messages", id}, {"reactions", id}, {"users", uid}])
+  end
+
+  def build({:reactions, _uid, id, _reaction}), do: read([{"messages", id}, {"reactions", id}])
+  def build(_request), do: read([:all])
+
+  def followup_refresh({request, token}, state) when request in [:authenticate, :me] do
+    token
+    |> AuthTokens.lookup_tokens()
+    |> Enum.flat_map(&auth_user_refresh_keys(&1, state))
+    |> Enum.uniq()
+  end
+
+  def followup_refresh(_request, _state), do: []
+
+  defp read(refresh), do: %__MODULE__{refresh: refresh}
+  defp mutate(locks, refresh), do: %__MODULE__{mutating?: true, locks: locks, refresh: refresh}
+
+  defp receiver_type(params),
+    do: (params["receiverType"] || "user") |> to_s() |> String.downcase()
+
+  defp conversation_scope(uid, receiver_type, receiver_id) do
+    if valid_receiver?(receiver_type, receiver_id) do
+      [{:conversation, Conversations.conversation_id_for(uid, receiver_type, receiver_id)}]
+    else
+      [:global]
+    end
+  end
+
+  defp conversation_record_keys(uid, receiver_type, receiver_id) do
+    if valid_receiver?(receiver_type, receiver_id) do
+      [
+        {"conversation_messages",
+         Conversations.conversation_id_for(uid, receiver_type, receiver_id)}
+      ]
+    else
+      []
+    end
+  end
+
+  defp valid_receiver?(receiver_type, receiver_id),
+    do: receiver_type in ["user", "group"] and not blank?(receiver_id)
+
+  defp token_scopes(token) do
+    token
+    |> AuthTokens.lookup_tokens()
+    |> Enum.flat_map(&single_token_scopes/1)
+    |> Enum.uniq()
+  end
+
+  defp single_token_scopes(token) do
+    case AuthTokens.uid_token(token) do
+      {:ok, uid} -> [{:token, token}, {:user, uid}]
+      :error -> token_scope(token)
+    end
+  end
+
+  defp user_scope(value), do: if(blank?(value), do: [:global], else: [{:user, value}])
+  defp group_scope(value), do: if(blank?(value), do: [:global], else: [{:group, value}])
+  defp token_scope(value), do: if(blank?(value), do: [:global], else: [{:token, value}])
+  defp message_scope(value), do: if(blank?(value), do: [:global], else: [{:message, value}])
+
+  defp token_refresh_keys(token) do
+    token
+    |> AuthTokens.lookup_tokens()
+    |> Enum.flat_map(&single_token_refresh_keys/1)
+    |> Enum.uniq()
+  end
+
+  defp single_token_refresh_keys(token) do
+    case AuthTokens.uid_token(token) do
+      {:ok, uid} -> [{"users", uid}, {"tokens", token}]
+      :error -> [{"tokens", token}]
+    end
+  end
+
+  defp auth_user_refresh_keys(token, state) do
+    case AuthTokens.uid_token(token) do
+      {:ok, uid} ->
+        user_record_keys(uid)
+
+      :error ->
+        state
+        |> get_in(["tokens", token])
+        |> user_record_keys()
+    end
+  end
+
+  defp user_record_keys(value), do: if(blank?(value), do: [], else: [{"users", value}])
+  defp group_keys(guid), do: [{"groups", guid}, {"members", guid}, {"banned", guid}]
+
+  defp uids_from_scope_map(scope_map) do
+    scope_map = stringify_keys(scope_map || %{})
+
+    [
+      scope_map["participants"],
+      scope_map["members"],
+      scope_map["moderators"],
+      scope_map["admins"],
+      scope_map["uids"]
+    ]
+    |> Enum.flat_map(&List.wrap/1)
+    |> Enum.reject(&blank?/1)
+    |> Enum.uniq()
+  end
+
+  defp stringify_keys(%{__struct__: _} = struct), do: struct
+
+  defp stringify_keys(map) when is_map(map) do
+    Map.new(map, fn {k, v} -> {to_s(k), stringify_keys(v)} end)
+  end
+
+  defp stringify_keys(list) when is_list(list), do: Enum.map(list, &stringify_keys/1)
+  defp stringify_keys(other), do: other
+
+  defp blank?(value), do: value in [nil, "", false]
+
+  defp to_s(nil), do: ""
+  defp to_s(value) when is_binary(value), do: value
+  defp to_s(value), do: to_string(value)
+end

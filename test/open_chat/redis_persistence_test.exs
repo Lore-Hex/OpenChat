@@ -80,6 +80,76 @@ defmodule OpenChat.RedisPersistenceTest do
     end)
   end
 
+  test "uid-token auth persists generated users and token mappings per key", context do
+    with_redis(context, fn ->
+      assert {:ok, me} = Store.me("uid:redis-uid-token-user")
+      assert me["uid"] == "redis-uid-token-user"
+
+      assert redis_json(context, "users", "redis-uid-token-user")["uid"] ==
+               "redis-uid-token-user"
+
+      assert redis_json(context, "tokens", "uid:redis-uid-token-user") ==
+               "redis-uid-token-user"
+
+      assert "redis-uid-token-user" in redis_members(context, "index", "users")
+      assert "uid:redis-uid-token-user" in redis_members(context, "index", "tokens")
+    end)
+  end
+
+  test "auth token lookups refresh mapped users without stale writeback", context do
+    with_redis(context, fn ->
+      assert {:ok, _user} =
+               Store.upsert_user(%{
+                 "uid" => "auth-refresh-user",
+                 "name" => "Before External Update"
+               })
+
+      assert {:ok, auth} = Store.create_auth_token("auth-refresh-user")
+
+      external_user =
+        context
+        |> redis_json("users", "auth-refresh-user")
+        |> Map.put("name", "After External Update")
+
+      Redix.command!(
+        context.redis,
+        ["SET", redis_key(context, "users", "auth-refresh-user"), Jason.encode!(external_user)]
+      )
+
+      assert {:ok, me} = Store.me(auth["authToken"])
+      assert me["name"] == "After External Update"
+      assert redis_json(context, "users", "auth-refresh-user")["name"] == "After External Update"
+    end)
+  end
+
+  test "local JWT auth refreshes the underlying token and user keys", context do
+    with_redis(context, fn ->
+      assert {:ok, first_me} = Store.me("uid:local-jwt-refresh-user")
+      assert first_me["jwt"] =~ "local."
+
+      external_user =
+        context
+        |> redis_json("users", "local-jwt-refresh-user")
+        |> Map.put("name", "JWT Refreshed User")
+
+      Redix.command!(
+        context.redis,
+        [
+          "SET",
+          redis_key(context, "users", "local-jwt-refresh-user"),
+          Jason.encode!(external_user)
+        ]
+      )
+
+      assert {:ok, me} = Store.me(first_me["jwt"])
+      assert me["uid"] == "local-jwt-refresh-user"
+      assert me["name"] == "JWT Refreshed User"
+
+      assert redis_json(context, "users", "local-jwt-refresh-user")["name"] ==
+               "JWT Refreshed User"
+    end)
+  end
+
   test "reloads users, tokens, groups, messages, counters, and reactions from per-key Redis",
        context do
     with_redis(context, fn ->

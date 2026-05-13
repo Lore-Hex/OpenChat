@@ -10,7 +10,7 @@ defmodule OpenChat.Store do
   use GenServer
 
   alias OpenChat.{Config, Errors, Time}
-  alias OpenChat.Store.{Conversations, RedisPersistence}
+  alias OpenChat.Store.{AuthTokens, Conversations, PersistenceOps, RedisPersistence, RequestPlan}
 
   @default_state %{
     "users" => %{},
@@ -145,301 +145,15 @@ defmodule OpenChat.Store do
     do: call({:reactions, to_s(uid), to_s(id), reaction})
 
   defp call(request) do
-    if mutating_request?(request) do
-      RedisPersistence.with_locks(lock_scopes(request), fn ->
-        GenServer.call(__MODULE__, {:locked_call, request}, :infinity)
+    plan = RequestPlan.build(request)
+
+    if plan.mutating? do
+      RedisPersistence.with_locks(plan.locks, fn ->
+        GenServer.call(__MODULE__, {:locked_call, request, plan.refresh}, :infinity)
       end)
     else
-      GenServer.call(__MODULE__, {:cache_call, request}, :infinity)
+      GenServer.call(__MODULE__, {:cache_call, request, plan.refresh}, :infinity)
     end
-  end
-
-  @mutating_requests MapSet.new([
-                       :add_group_members,
-                       :add_reaction,
-                       :authenticate,
-                       :ban_group_member,
-                       :block_users,
-                       :create_auth_token,
-                       :delete_conversation,
-                       :delete_group,
-                       :delete_message,
-                       :delete_user,
-                       :edit_message,
-                       :ensure_user,
-                       :hide_conversation,
-                       :join_group,
-                       :leave_group,
-                       :mark_delivered,
-                       :mark_read,
-                       :mark_unread,
-                       :me,
-                       :reactivate_users,
-                       :remove_reaction,
-                       :reset,
-                       :revoke_auth_token,
-                       :send_message,
-                       :set_group_scopes,
-                       :unban_group_member,
-                       :unblock_users,
-                       :upsert_group,
-                       :upsert_user
-                     ])
-
-  defp mutating_request?(:reset), do: true
-  defp mutating_request?({name, _}), do: MapSet.member?(@mutating_requests, name)
-  defp mutating_request?({name, _, _}), do: MapSet.member?(@mutating_requests, name)
-  defp mutating_request?({name, _, _, _}), do: MapSet.member?(@mutating_requests, name)
-  defp mutating_request?({name, _, _, _, _}), do: MapSet.member?(@mutating_requests, name)
-  defp mutating_request?(_request), do: false
-
-  defp lock_scopes(:reset), do: [:global]
-  defp lock_scopes({:delete_group, _guid}), do: [:global]
-
-  defp lock_scopes({:delete_conversation, conversation_id}),
-    do: [{:conversation, conversation_id}]
-
-  defp lock_scopes({:upsert_user, attrs}) do
-    attrs = stringify_keys(attrs)
-    user_scope(attrs["uid"] || attrs["id"])
-  end
-
-  defp lock_scopes({:delete_user, uid}), do: user_scope(uid)
-  defp lock_scopes({:reactivate_users, uids}), do: Enum.flat_map(List.wrap(uids), &user_scope/1)
-  defp lock_scopes({:block_users, uid, _uids}), do: user_scope(uid)
-  defp lock_scopes({:unblock_users, uid, _uids}), do: user_scope(uid)
-  defp lock_scopes({:create_auth_token, uid}), do: user_scope(uid)
-  defp lock_scopes({:revoke_auth_token, token}), do: token_scope(token)
-  defp lock_scopes({:authenticate, token}), do: token_scopes(token)
-  defp lock_scopes({:me, token}), do: token_scopes(token)
-
-  defp lock_scopes({:upsert_group, attrs}) do
-    attrs = stringify_keys(attrs)
-    group_scope(attrs["guid"] || attrs["id"])
-  end
-
-  defp lock_scopes({:join_group, guid, _uid, _params}), do: group_scope(guid)
-  defp lock_scopes({:leave_group, guid, _uid}), do: group_scope(guid)
-  defp lock_scopes({:add_group_members, guid, _uids, _scope}), do: group_scope(guid)
-  defp lock_scopes({:set_group_scopes, guid, _scope_map}), do: group_scope(guid)
-  defp lock_scopes({:ban_group_member, guid, _uid}), do: group_scope(guid)
-  defp lock_scopes({:unban_group_member, guid, _uid}), do: group_scope(guid)
-
-  defp lock_scopes({:send_message, sender_uid, params, _uploads, _opts}) do
-    params = stringify_keys(params)
-    receiver = params["receiver"] || params["receiverId"]
-    receiver_type = receiver_type(params)
-
-    conversation_scope(sender_uid, receiver_type, receiver)
-  end
-
-  defp lock_scopes({:edit_message, _uid, id, _params}), do: message_scope(id)
-  defp lock_scopes({:delete_message, _uid, id}), do: message_scope(id)
-
-  defp lock_scopes({:hide_conversation, uid, receiver_type, receiver_id}) do
-    conversation_scope(uid, receiver_type, receiver_id)
-  end
-
-  defp lock_scopes({:mark_read, uid, receiver_type, receiver_id, _message_id}) do
-    conversation_scope(uid, receiver_type, receiver_id) ++ [{:user, uid}]
-  end
-
-  defp lock_scopes({:mark_unread, uid, receiver_type, receiver_id, _message_id}) do
-    conversation_scope(uid, receiver_type, receiver_id) ++ [{:user, uid}]
-  end
-
-  defp lock_scopes({:mark_delivered, uid, receiver_type, receiver_id, _message_id}) do
-    conversation_scope(uid, receiver_type, receiver_id) ++ [{:user, uid}]
-  end
-
-  defp lock_scopes({:add_reaction, _uid, id, _reaction}), do: message_scope(id)
-  defp lock_scopes({:remove_reaction, _uid, id, _reaction}), do: message_scope(id)
-  defp lock_scopes(_request), do: [:global]
-
-  defp cache_keys(:reset), do: []
-  defp cache_keys({:get_user, uid}), do: [{"users", uid}]
-
-  defp cache_keys({:get_user_for, viewer_uid, uid}) do
-    [{"users", uid}, {"blocks", viewer_uid}, {"blocks", uid}]
-  end
-
-  defp cache_keys({:ensure_user, uid}), do: [{"users", uid}]
-
-  defp cache_keys({:upsert_user, attrs}) do
-    attrs = stringify_keys(attrs)
-    user_record_keys(attrs["uid"] || attrs["id"])
-  end
-
-  defp cache_keys({:list_users, _params}), do: [:all]
-  defp cache_keys({:delete_user, uid}), do: [{"users", uid}]
-
-  defp cache_keys({:reactivate_users, uids}),
-    do: Enum.flat_map(List.wrap(uids), &user_record_keys/1)
-
-  defp cache_keys({:block_users, uid, uids}) do
-    [{"blocks", uid}] ++ Enum.flat_map(List.wrap(uids), &user_record_keys/1)
-  end
-
-  defp cache_keys({:unblock_users, uid, _uids}), do: [{"blocks", uid}]
-  defp cache_keys({:blocked_users, _uid, _params}), do: [:all]
-  defp cache_keys({:create_auth_token, uid}), do: [{"users", uid}]
-
-  defp cache_keys({:revoke_auth_token, token}), do: [{"tokens", token}]
-  defp cache_keys({:authenticate, token}), do: token_cache_keys(token)
-  defp cache_keys({:me, token}), do: token_cache_keys(token)
-
-  defp cache_keys({:upsert_group, attrs}) do
-    attrs = stringify_keys(attrs)
-    guid = attrs["guid"] || attrs["id"]
-    group_keys(guid)
-  end
-
-  defp cache_keys({:get_group, guid}), do: group_keys(guid)
-  defp cache_keys({:list_groups, _params}), do: [:all]
-  defp cache_keys({:delete_group, _guid}), do: [:all]
-
-  defp cache_keys({:join_group, guid, uid, _params}),
-    do: group_keys(guid) ++ user_record_keys(uid)
-
-  defp cache_keys({:leave_group, guid, _uid}), do: group_keys(guid)
-
-  defp cache_keys({:add_group_members, guid, uids, _scope}) do
-    group_keys(guid) ++ Enum.flat_map(List.wrap(uids), &user_record_keys/1)
-  end
-
-  defp cache_keys({:group_members, guid, _params}), do: group_keys(guid)
-  defp cache_keys({:groups_for_user, _uid}), do: [:all]
-
-  defp cache_keys({:set_group_scopes, guid, scope_map}) do
-    group_keys(guid) ++ Enum.flat_map(uids_from_scope_map(scope_map), &user_record_keys/1)
-  end
-
-  defp cache_keys({:ban_group_member, guid, uid}), do: group_keys(guid) ++ user_record_keys(uid)
-  defp cache_keys({:unban_group_member, guid, _uid}), do: [{"banned", guid}]
-  defp cache_keys({:banned_group_members, guid, _params}), do: [{"banned", guid}]
-
-  defp cache_keys({:send_message, sender_uid, params, _uploads, _opts}) do
-    params = stringify_keys(params)
-    receiver = params["receiver"] || params["receiverId"]
-    receiver_type = receiver_type(params)
-
-    base =
-      [{"users", sender_uid}, {:counter, "next_id"}] ++
-        conversation_record_keys(sender_uid, receiver_type, receiver)
-
-    case receiver_type do
-      "group" -> base ++ group_keys(receiver)
-      _user -> base ++ user_record_keys(receiver)
-    end
-  end
-
-  defp cache_keys({:edit_message, _uid, id, _params}),
-    do: [{"messages", id}, {:counter, "next_id"}]
-
-  defp cache_keys({:delete_message, _uid, id}), do: [{"messages", id}, {:counter, "next_id"}]
-  defp cache_keys({:delete_conversation, _conversation_id}), do: [:all]
-
-  defp cache_keys({:hide_conversation, uid, receiver_type, receiver_id}) do
-    conversation_record_keys(uid, receiver_type, receiver_id) ++ [{"hidden_conversations", uid}]
-  end
-
-  defp cache_keys({:get_message, id}), do: [{"messages", id}, {"reactions", id}]
-  defp cache_keys({:find_message_by_muid, _muid}), do: [:all]
-
-  defp cache_keys({:messages_for_user, uid, peer_uid, _params}),
-    do: [{"conversation_messages", user_conversation_id(uid, peer_uid)}]
-
-  defp cache_keys({:messages_for_group, _uid, guid, _params}),
-    do: group_keys(guid) ++ [{"conversation_messages", group_conversation_id(guid)}]
-
-  defp cache_keys({:messages_for_thread, _uid, parent_id, _params}),
-    do: [{"thread_messages", parent_id}]
-
-  defp cache_keys({:mark_read, uid, receiver_type, receiver_id, _message_id}) do
-    conversation_record_keys(uid, receiver_type, receiver_id) ++ [{"reads", uid}]
-  end
-
-  defp cache_keys({:mark_unread, uid, receiver_type, receiver_id, _message_id}) do
-    conversation_record_keys(uid, receiver_type, receiver_id) ++ [{"reads", uid}]
-  end
-
-  defp cache_keys({:mark_delivered, uid, receiver_type, receiver_id, _message_id}) do
-    conversation_record_keys(uid, receiver_type, receiver_id) ++ [{"delivered", uid}]
-  end
-
-  defp cache_keys({:unread_counts, _uid, _params}), do: [:all]
-  defp cache_keys({:conversations, _uid, _params}), do: [:all]
-
-  defp cache_keys({:conversation, uid, receiver_type, receiver_id}) do
-    [
-      {"reads", uid},
-      {"delivered", uid},
-      {"hidden_conversations", uid}
-    ] ++
-      conversation_record_keys(uid, receiver_type, receiver_id) ++
-      if(receiver_type == "group",
-        do: group_keys(receiver_id),
-        else: user_record_keys(receiver_id)
-      )
-  end
-
-  defp cache_keys({:add_reaction, uid, id, _reaction}),
-    do: [{"messages", id}, {"reactions", id}, {"users", uid}, {:counter, "next_reaction_id"}]
-
-  defp cache_keys({:remove_reaction, uid, id, _reaction}),
-    do: [{"messages", id}, {"reactions", id}, {"users", uid}]
-
-  defp cache_keys({:reactions, _uid, id, _reaction}), do: [{"messages", id}, {"reactions", id}]
-  defp cache_keys(_request), do: [:all]
-
-  defp receiver_type(params),
-    do: (params["receiverType"] || "user") |> to_s() |> String.downcase()
-
-  defp conversation_scope(uid, receiver_type, receiver_id) do
-    if valid_receiver?(receiver_type, receiver_id) do
-      [{:conversation, conversation_id_for(uid, receiver_type, receiver_id)}]
-    else
-      [:global]
-    end
-  end
-
-  defp conversation_record_keys(uid, receiver_type, receiver_id) do
-    if valid_receiver?(receiver_type, receiver_id) do
-      [{"conversation_messages", conversation_id_for(uid, receiver_type, receiver_id)}]
-    else
-      []
-    end
-  end
-
-  defp valid_receiver?(receiver_type, receiver_id),
-    do: receiver_type in ["user", "group"] and not blank?(receiver_id)
-
-  defp token_scopes("uid:" <> uid), do: [{:token, "uid:#{uid}"}, {:user, uid}]
-  defp token_scopes(token), do: token_scope(token)
-
-  defp user_scope(value), do: if(blank?(value), do: [:global], else: [{:user, value}])
-  defp group_scope(value), do: if(blank?(value), do: [:global], else: [{:group, value}])
-  defp token_scope(value), do: if(blank?(value), do: [:global], else: [{:token, value}])
-  defp message_scope(value), do: if(blank?(value), do: [:global], else: [{:message, value}])
-
-  defp token_cache_keys("uid:" <> uid), do: [{"users", uid}, {"tokens", "uid:#{uid}"}]
-  defp token_cache_keys(token), do: [{"tokens", token}]
-  defp user_record_keys(value), do: if(blank?(value), do: [], else: [{"users", value}])
-  defp group_keys(guid), do: [{"groups", guid}, {"members", guid}, {"banned", guid}]
-
-  defp uids_from_scope_map(scope_map) do
-    scope_map = stringify_keys(scope_map || %{})
-
-    [
-      scope_map["participants"],
-      scope_map["members"],
-      scope_map["moderators"],
-      scope_map["admins"],
-      scope_map["uids"]
-    ]
-    |> Enum.flat_map(&List.wrap/1)
-    |> Enum.reject(&blank?/1)
-    |> Enum.uniq()
   end
 
   # GenServer
@@ -451,19 +165,19 @@ defmodule OpenChat.Store do
   end
 
   @impl true
-  def handle_call({:locked_call, request}, from, state) do
+  def handle_call({:locked_call, request, refresh}, from, state) do
     request
     |> handle_call(
       from,
-      RedisPersistence.refresh_keys(@default_state, state, cache_keys(request))
+      refresh_request_state(request, state, refresh)
     )
   end
 
-  def handle_call({:cache_call, request}, from, state) do
+  def handle_call({:cache_call, request, refresh}, from, state) do
     request
     |> handle_call(
       from,
-      RedisPersistence.refresh_keys(@default_state, state, cache_keys(request))
+      refresh_request_state(request, state, refresh)
     )
   end
 
@@ -483,7 +197,7 @@ defmodule OpenChat.Store do
 
   def handle_call({:ensure_user, uid}, _from, state) do
     {user, state} = ensure_user_in_state(state, uid)
-    persist_ops(user_ops(state, [user["uid"]]))
+    persist_ops(PersistenceOps.user(state, [user["uid"]]))
     {:reply, {:ok, user}, state}
   end
 
@@ -497,7 +211,7 @@ defmodule OpenChat.Store do
       user = normalise_user(Map.merge(Map.get(state["users"], to_s(uid), %{}), attrs))
       state = put_in(state, ["users", user["uid"]], user)
       state = maybe_store_embedded_token(state, user)
-      persist_ops(user_with_embedded_token_ops(user))
+      persist_ops(PersistenceOps.user_with_embedded_token(user))
       {:reply, {:ok, public_user(user)}, state}
     end
   end
@@ -510,7 +224,7 @@ defmodule OpenChat.Store do
       {:ok, user} ->
         user = user |> Map.put("deactivatedAt", Time.now()) |> Map.put("status", "offline")
         state = put_in(state, ["users", uid], user)
-        persist_ops(user_ops(state, [uid]))
+        persist_ops(PersistenceOps.user(state, [uid]))
         {:reply, {:ok, %{"success" => true, "uid" => uid}}, state}
     end
   end
@@ -526,7 +240,7 @@ defmodule OpenChat.Store do
         {st, Map.put(acc, uid, %{"success" => true})}
       end)
 
-    persist_ops(user_ops(state, Map.keys(result)))
+    persist_ops(PersistenceOps.user(state, Map.keys(result)))
     {:reply, {:ok, %{"success" => result}}, state}
   end
 
@@ -556,7 +270,7 @@ defmodule OpenChat.Store do
         {st, Map.put(acc, blocked_uid, %{"success" => true, "message" => "User blocked."})}
       end)
 
-    persist_ops(user_ops(state, Map.keys(result)) ++ blocks_ops(state, uid))
+    persist_ops(PersistenceOps.user(state, Map.keys(result)) ++ PersistenceOps.blocks(state, uid))
     {:reply, {:ok, result}, state}
   end
 
@@ -569,7 +283,7 @@ defmodule OpenChat.Store do
         {st, Map.put(acc, blocked_uid, %{"success" => true, "message" => "User unblocked."})}
       end)
 
-    persist_ops(blocks_ops(state, uid))
+    persist_ops(PersistenceOps.blocks(state, uid))
     {:reply, {:ok, result}, state}
   end
 
@@ -611,7 +325,7 @@ defmodule OpenChat.Store do
     {user, state} = ensure_user_in_state(state, uid)
     token = "auth_" <> Base.url_encode64(:crypto.strong_rand_bytes(32), padding: false)
     state = put_in(state, ["tokens", token], user["uid"])
-    persist_ops(user_ops(state, [user["uid"]]) ++ token_ops(state, token))
+    persist_ops(PersistenceOps.user(state, [user["uid"]]) ++ PersistenceOps.token(state, token))
     {:reply, {:ok, me_payload(user, token)}, state}
   end
 
@@ -623,14 +337,14 @@ defmodule OpenChat.Store do
 
   def handle_call({:authenticate, token}, _from, state) do
     {reply, state} = authenticate_in_state(state, token)
-    persist_ops(token_ops(state, token))
+    persist_ops(PersistenceOps.auth_token(state, token))
     {:reply, reply, state}
   end
 
   def handle_call({:me, token}, _from, state) do
     case authenticate_in_state(state, token) do
       {{:ok, user}, state} ->
-        persist_ops(token_ops(state, token))
+        persist_ops(PersistenceOps.auth_token(state, token))
         {:reply, {:ok, me_payload(user, token)}, state}
 
       {error, state} ->
@@ -648,7 +362,11 @@ defmodule OpenChat.Store do
       group = normalise_group(Map.merge(Map.get(state["groups"], to_s(guid), %{}), attrs))
       state = put_in(state, ["groups", group["guid"]], group)
       state = ensure_group_member_map(state, group["guid"])
-      persist_ops(group_ops(state, group["guid"]) ++ members_ops(state, group["guid"]))
+
+      persist_ops(
+        PersistenceOps.group(state, group["guid"]) ++ PersistenceOps.members(state, group["guid"])
+      )
+
       {:reply, {:ok, group}, state}
     end
   end
@@ -728,7 +446,7 @@ defmodule OpenChat.Store do
 
             action = group_action(state, uid, group, uid, "joined")
             publish_to_group(state, guid, action, except: uid)
-            persist_ops(user_ops(state, [uid]) ++ members_ops(state, guid))
+            persist_ops(PersistenceOps.user(state, [uid]) ++ PersistenceOps.members(state, guid))
             {:reply, {:ok, group}, state}
         end
     end
@@ -743,7 +461,7 @@ defmodule OpenChat.Store do
       publish_to_group(state, guid, action, except: uid)
     end
 
-    persist_ops(members_ops(state, guid))
+    persist_ops(PersistenceOps.members(state, guid))
     {:reply, {:ok, %{"success" => true}}, state}
   end
 
@@ -758,7 +476,11 @@ defmodule OpenChat.Store do
         end)
 
       group = with_members_count(group, state)
-      persist_ops(user_ops(state, Map.keys(result)) ++ members_ops(state, guid))
+
+      persist_ops(
+        PersistenceOps.user(state, Map.keys(result)) ++ PersistenceOps.members(state, guid)
+      )
+
       {:reply, {:ok, %{"success" => result, "group" => group}}, state}
     else
       :error -> {:reply, {:error, Errors.group_not_found(guid)}, state}
@@ -833,8 +555,9 @@ defmodule OpenChat.Store do
     first = List.first(Enum.reverse(touched)) || %{"guid" => guid}
 
     persist_ops(
-      group_ops(state, guid) ++
-        members_ops(state, guid) ++ user_ops(state, Enum.map(touched, & &1["uid"]))
+      PersistenceOps.group(state, guid) ++
+        PersistenceOps.members(state, guid) ++
+        PersistenceOps.user(state, Enum.map(touched, & &1["uid"]))
     )
 
     {:reply, {:ok, Map.merge(%{"success" => true, "members" => Enum.reverse(touched)}, first)},
@@ -856,8 +579,9 @@ defmodule OpenChat.Store do
     state = update_in(state, ["members", guid], &Map.delete(&1 || %{}, uid))
 
     persist_ops(
-      group_ops(state, guid) ++
-        user_ops(state, [uid]) ++ banned_ops(state, guid) ++ members_ops(state, guid)
+      PersistenceOps.group(state, guid) ++
+        PersistenceOps.user(state, [uid]) ++
+        PersistenceOps.banned(state, guid) ++ PersistenceOps.members(state, guid)
     )
 
     {:reply,
@@ -867,7 +591,7 @@ defmodule OpenChat.Store do
 
   def handle_call({:unban_group_member, guid, uid}, _from, state) do
     state = update_in(state, ["banned", guid], &Map.delete(&1 || %{}, uid))
-    persist_ops(banned_ops(state, guid))
+    persist_ops(PersistenceOps.banned(state, guid))
 
     {:reply,
      {:ok, %{"success" => true, "message" => "User unbanned.", "uid" => uid, "guid" => guid}},
@@ -914,7 +638,7 @@ defmodule OpenChat.Store do
       {:ok, message, state} ->
         state = store_message_in_state(state, message)
         publish_message(state, message)
-        persist_ops(message_create_ops(state, message))
+        persist_ops(PersistenceOps.message_create(state, message))
         {:reply, {:ok, message}, state}
     end
   end
@@ -944,7 +668,7 @@ defmodule OpenChat.Store do
 
         persist_ops(
           [RedisPersistence.put("messages", id, message)] ++
-            stored_message_ops(state, action) ++ next_id_ops(state)
+            PersistenceOps.stored_message(state, action) ++ PersistenceOps.next_id(state)
         )
 
         {:reply, {:ok, action}, state}
@@ -972,7 +696,7 @@ defmodule OpenChat.Store do
 
         persist_ops(
           [RedisPersistence.put("messages", id, message)] ++
-            stored_message_ops(state, action) ++ next_id_ops(state)
+            PersistenceOps.stored_message(state, action) ++ PersistenceOps.next_id(state)
         )
 
         {:reply, {:ok, action}, state}
@@ -1001,7 +725,7 @@ defmodule OpenChat.Store do
 
   def handle_call({:hide_conversation, uid, receiver_type, receiver_id}, _from, state) do
     {state, payload} = Conversations.hide(state, uid, receiver_type, receiver_id, Time.now())
-    persist_ops(hidden_conversations_ops(state, uid))
+    persist_ops(PersistenceOps.hidden_conversations(state, uid))
     {:reply, {:ok, payload}, state}
   end
 
@@ -1043,7 +767,7 @@ defmodule OpenChat.Store do
     {state, payload} =
       Conversations.mark_read(state, uid, receiver_type, receiver_id, message_id, Time.now())
 
-    persist_ops(reads_ops(state, uid))
+    persist_ops(PersistenceOps.reads(state, uid))
     {:reply, {:ok, payload}, state}
   end
 
@@ -1051,7 +775,7 @@ defmodule OpenChat.Store do
     {state, payload} =
       Conversations.mark_delivered(state, uid, receiver_type, receiver_id, message_id, Time.now())
 
-    persist_ops(delivered_ops(state, uid))
+    persist_ops(PersistenceOps.delivered(state, uid))
     publish_receipt(payload, uid, receiver_type, receiver_id, "delivered")
     {:reply, {:ok, payload}, state}
   end
@@ -1061,7 +785,7 @@ defmodule OpenChat.Store do
       Conversations.mark_unread(state, uid, receiver_type, receiver_id, message_id, Time.now())
 
     conv = build_conversation(state, uid, conv_id)
-    persist_ops(reads_ops(state, uid))
+    persist_ops(PersistenceOps.reads(state, uid))
     {:reply, {:ok, %{"conversation" => conv}}, state}
   end
 
@@ -1139,8 +863,9 @@ defmodule OpenChat.Store do
       publish_reaction(state, message, reaction_obj, "message_reaction_added", uid)
 
       persist_ops(
-        reactions_ops(state, id) ++
-          [RedisPersistence.put("messages", id, message)] ++ next_reaction_id_ops(state)
+        PersistenceOps.reactions(state, id) ++
+          [RedisPersistence.put("messages", id, message)] ++
+          PersistenceOps.next_reaction_id(state)
       )
 
       {:reply, {:ok, message}, state}
@@ -1168,7 +893,11 @@ defmodule OpenChat.Store do
       message = refresh_message_reactions(state, message, uid)
       state = put_in(state, ["messages", id], message)
       publish_reaction(state, message, reaction_obj, "message_reaction_removed", uid)
-      persist_ops(reactions_ops(state, id) ++ [RedisPersistence.put("messages", id, message)])
+
+      persist_ops(
+        PersistenceOps.reactions(state, id) ++ [RedisPersistence.put("messages", id, message)]
+      )
+
       {:reply, {:ok, message}, state}
     else
       :error -> {:reply, {:error, Errors.message_not_found(id)}, state}
@@ -1201,129 +930,22 @@ defmodule OpenChat.Store do
 
   defp persist_ops(ops), do: RedisPersistence.write(ops)
 
+  defp refresh_request_state(request, state, refresh) do
+    state = RedisPersistence.refresh_keys(@default_state, state, refresh)
+
+    RedisPersistence.refresh_keys(
+      @default_state,
+      state,
+      RequestPlan.followup_refresh(request, state)
+    )
+  end
+
   defp take_counter(state, counter) do
     fallback = max(to_int(state[counter]), 1)
     value = RedisPersistence.take_counter(counter, fallback)
     value = if value < 1, do: fallback, else: value
     {value, Map.put(state, counter, max(fallback, value + 1))}
   end
-
-  defp user_ops(state, uids) do
-    uids
-    |> List.wrap()
-    |> Enum.map(&to_s/1)
-    |> Enum.reject(&blank?/1)
-    |> Enum.uniq()
-    |> Enum.flat_map(fn uid ->
-      case get_in(state, ["users", uid]) do
-        nil -> []
-        user -> [RedisPersistence.put("users", uid, user)]
-      end
-    end)
-  end
-
-  defp user_with_embedded_token_ops(user) do
-    [RedisPersistence.put("users", user["uid"], user)] ++ embedded_token_ops(user)
-  end
-
-  defp embedded_token_ops(%{"authToken" => token, "uid" => uid})
-       when is_binary(token) and token != "",
-       do: [RedisPersistence.put("tokens", token, uid)]
-
-  defp embedded_token_ops(_user), do: []
-
-  defp token_ops(state, token) do
-    case get_in(state, ["tokens", to_s(token)]) do
-      nil -> []
-      uid -> [RedisPersistence.put("tokens", token, uid)] ++ user_ops(state, [uid])
-    end
-  end
-
-  defp group_ops(state, guid) do
-    guid = to_s(guid)
-
-    case get_in(state, ["groups", guid]) do
-      nil -> []
-      group -> [RedisPersistence.put("groups", guid, group)]
-    end
-  end
-
-  defp members_ops(state, guid),
-    do: [RedisPersistence.put_or_delete("members", guid, get_in(state, ["members", to_s(guid)]))]
-
-  defp blocks_ops(state, uid),
-    do: [RedisPersistence.put_or_delete("blocks", uid, get_in(state, ["blocks", to_s(uid)]))]
-
-  defp banned_ops(state, guid),
-    do: [RedisPersistence.put_or_delete("banned", guid, get_in(state, ["banned", to_s(guid)]))]
-
-  defp reads_ops(state, uid),
-    do: [RedisPersistence.put_or_delete("reads", uid, get_in(state, ["reads", to_s(uid)]))]
-
-  defp delivered_ops(state, uid),
-    do: [
-      RedisPersistence.put_or_delete("delivered", uid, get_in(state, ["delivered", to_s(uid)]))
-    ]
-
-  defp hidden_conversations_ops(state, uid) do
-    [
-      RedisPersistence.put_or_delete(
-        "hidden_conversations",
-        uid,
-        get_in(state, ["hidden_conversations", to_s(uid)])
-      )
-    ]
-  end
-
-  defp reactions_ops(state, message_id),
-    do: [
-      RedisPersistence.put_or_delete(
-        "reactions",
-        message_id,
-        get_in(state, ["reactions", to_s(message_id)])
-      )
-    ]
-
-  defp stored_message_ops(state, message) do
-    id = to_s(message["id"])
-    conv_id = message["conversationId"]
-
-    ops = [
-      RedisPersistence.put("messages", id, message),
-      RedisPersistence.put(
-        "conversation_messages",
-        conv_id,
-        state["conversation_messages"][conv_id]
-      )
-    ]
-
-    if parent_id = message["parentId"] || message["parentMessageId"] do
-      parent_id = to_s(parent_id)
-
-      [
-        RedisPersistence.put("thread_messages", parent_id, state["thread_messages"][parent_id])
-        | ops
-      ]
-    else
-      ops
-    end
-  end
-
-  defp message_create_ops(state, message) do
-    participant_ops =
-      case message["receiverType"] do
-        "user" -> user_ops(state, [message["sender"], message["receiver"]])
-        "group" -> user_ops(state, [message["sender"]]) ++ group_ops(state, message["receiver"])
-        _other -> []
-      end
-
-    participant_ops ++ stored_message_ops(state, message) ++ next_id_ops(state)
-  end
-
-  defp next_id_ops(state), do: [RedisPersistence.counter("next_id", state["next_id"])]
-
-  defp next_reaction_id_ops(state),
-    do: [RedisPersistence.counter("next_reaction_id", state["next_reaction_id"])]
 
   defp seed_state do
     users = decode_seed(Config.seed_users_json(), default_users()) |> Enum.map(&normalise_user/1)
@@ -1643,9 +1265,12 @@ defmodule OpenChat.Store do
 
     ops =
       Enum.map(conv_ids, &RedisPersistence.delete("conversation_messages", &1)) ++
-        Enum.flat_map(touched["reads"], &reads_ops(state, &1)) ++
-        Enum.flat_map(touched["delivered"], &delivered_ops(state, &1)) ++
-        Enum.flat_map(touched["hidden_conversations"], &hidden_conversations_ops(state, &1))
+        Enum.flat_map(touched["reads"], &PersistenceOps.reads(state, &1)) ++
+        Enum.flat_map(touched["delivered"], &PersistenceOps.delivered(state, &1)) ++
+        Enum.flat_map(
+          touched["hidden_conversations"],
+          &PersistenceOps.hidden_conversations(state, &1)
+        )
 
     {state, ops}
   end
@@ -2042,9 +1667,7 @@ defmodule OpenChat.Store do
   end
 
   defp authenticate_local_jwt(state, token) do
-    with ["local", payload, "unsigned"] <- String.split(token, ".", parts: 3),
-         {:ok, json} <- Base.url_decode64(payload, padding: false),
-         {:ok, %{"token" => auth_token}} <- Jason.decode(json) do
+    with {:ok, auth_token} <- AuthTokens.local_jwt_token(token) do
       authenticate_in_state(state, auth_token)
     else
       _ -> {{:error, Errors.no_auth()}, state}
