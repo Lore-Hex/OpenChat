@@ -9,7 +9,7 @@ defmodule OpenChat.Store do
 
   use GenServer
 
-  alias OpenChat.{Config, Errors, Media, Time}
+  alias OpenChat.{Config, Errors, Time}
 
   alias OpenChat.Store.{
     Access,
@@ -19,6 +19,7 @@ defmodule OpenChat.Store do
     Entities,
     GroupPermissions,
     Indexes,
+    MessageData,
     MessagePermissions,
     PersistenceOps,
     RedisPersistence,
@@ -646,16 +647,7 @@ defmodule OpenChat.Store do
                 {_user, st2} = ensure_user_in_state(st2, uid)
                 st2 = add_member_to_state(st2, guid, uid, scope)
 
-                {st2,
-                 [
-                   %{
-                     "uid" => uid,
-                     "scope" => normalise_scope(scope),
-                     "guid" => guid,
-                     "joinedAt" => Time.now()
-                   }
-                   | acc2
-                 ], failed2}
+                {st2, [Entities.member(guid, uid, scope, Time.now()) | acc2], failed2}
               end
             end)
           end)
@@ -695,11 +687,7 @@ defmodule OpenChat.Store do
     now = Time.now()
 
     state =
-      update_in(
-        state,
-        ["banned", guid],
-        &Map.put(&1 || %{}, uid, %{"uid" => uid, "guid" => guid, "bannedAt" => now})
-      )
+      update_in(state, ["banned", guid], &Map.put(&1 || %{}, uid, Entities.ban(guid, uid, now)))
 
     state = remove_member_from_state(state, guid, uid)
 
@@ -785,7 +773,7 @@ defmodule OpenChat.Store do
         case MessagePermissions.authorize(state, uid, message, :edit, opts) do
           :ok ->
             now = Time.now()
-            data = merge_message_data(message["data"] || %{}, params["data"] || params)
+            data = MessageData.merge(message["data"] || %{}, params["data"] || params)
 
             message =
               message
@@ -1084,14 +1072,15 @@ defmodule OpenChat.Store do
       {reaction_id, state} = take_counter(state, "next_reaction_id")
       user = public_user(state["users"][uid] || normalise_user(%{"uid" => uid}))
 
-      reaction_obj = %{
-        "id" => reaction_id,
-        "messageId" => message["id"],
-        "reaction" => reaction,
-        "uid" => uid,
-        "reactedAt" => now,
-        "reactedBy" => user
-      }
+      reaction_obj =
+        Entities.reaction(%{
+          "id" => reaction_id,
+          "messageId" => message["id"],
+          "reaction" => reaction,
+          "uid" => uid,
+          "reactedAt" => now,
+          "reactedBy" => user
+        })
 
       state =
         update_in(state, ["reactions", id], fn reaction_map ->
@@ -1124,13 +1113,13 @@ defmodule OpenChat.Store do
 
       reaction_obj =
         get_in(state, ["reactions", id, reaction, uid]) ||
-          %{
+          Entities.reaction(%{
             "messageId" => message["id"],
             "reaction" => reaction,
             "uid" => uid,
             "reactedAt" => Time.now(),
             "reactedBy" => public_user(state["users"][uid] || normalise_user(%{"uid" => uid}))
-          }
+          })
 
       state = remove_reaction_from_state(state, id, reaction, uid)
 
@@ -1272,30 +1261,28 @@ defmodule OpenChat.Store do
         {state, receiver_entity} = ensure_receiver_entity(state, receiver_type, to_s(receiver))
         {id, state} = take_counter(state, "next_id")
         now = Time.now()
-        type = params["type"] || infer_type(params, uploads)
+        type = params["type"] || MessageData.infer_type(params, uploads)
         category = params["category"] || "message"
 
-        case normalise_message_data(params, uploads) do
+        case MessageData.normalise(params, uploads) do
           {:ok, data} ->
-            message = %{
-              "id" => id,
-              "muid" => params["muid"],
-              "sender" => sender["uid"],
-              "receiver" => to_s(receiver),
-              "receiverType" => receiver_type,
-              "type" => type,
-              "category" => category,
-              "data" => %{},
-              "sentAt" => now,
-              "updatedAt" => now,
-              "conversationId" => conversation_id_for(sender_uid, receiver_type, receiver),
-              "resource" => params["resource"]
-            }
-
             message =
-              message
-              |> maybe_put("parentId", params["parentId"] || params["parentMessageId"])
-              |> maybe_put("tags", params["tags"])
+              Entities.message(%{
+                "id" => id,
+                "muid" => params["muid"],
+                "sender" => sender["uid"],
+                "receiver" => to_s(receiver),
+                "receiverType" => receiver_type,
+                "type" => type,
+                "category" => category,
+                "data" => %{},
+                "sentAt" => now,
+                "updatedAt" => now,
+                "conversationId" => conversation_id_for(sender_uid, receiver_type, receiver),
+                "resource" => params["resource"],
+                "parentId" => params["parentId"] || params["parentMessageId"],
+                "tags" => params["tags"]
+              })
 
             parent_id = params["parentId"] || params["parentMessageId"]
 
@@ -1306,8 +1293,8 @@ defmodule OpenChat.Store do
                 data =
                   data
                   |> Map.put_new("reactions", [])
-                  |> put_entity("sender", "user", public_user(sender))
-                  |> put_entity("receiver", receiver_type, receiver_entity)
+                  |> MessageData.put_entity("sender", "user", public_user(sender))
+                  |> MessageData.put_entity("receiver", receiver_type, receiver_entity)
 
                 {:ok, Map.put(message, "data", data), state}
 
@@ -1348,106 +1335,6 @@ defmodule OpenChat.Store do
     end
   end
 
-  defp infer_type(params, uploads) do
-    data = normalise_data(params["data"] || %{})
-
-    cond do
-      params["category"] == "custom" -> params["type"] || "custom"
-      Map.has_key?(data, "customData") -> "custom"
-      uploads != [] -> params["type"] || "file"
-      Map.has_key?(data, "url") -> params["type"] || "file"
-      true -> "text"
-    end
-  end
-
-  defp normalise_message_data(params, uploads) do
-    base = normalise_data(params["data"] || %{})
-
-    base =
-      cond do
-        Map.has_key?(params, "text") and not Map.has_key?(base, "text") ->
-          Map.put(base, "text", params["text"])
-
-        Map.has_key?(params, "caption") and not Map.has_key?(base, "text") ->
-          Map.put(base, "text", params["caption"])
-
-        true ->
-          base
-      end
-
-    base =
-      if Map.has_key?(params, "metadata") and not Map.has_key?(base, "metadata") do
-        Map.put(base, "metadata", normalise_data(params["metadata"]))
-      else
-        base
-      end
-
-    base =
-      if Map.has_key?(params, "customData") and not Map.has_key?(base, "customData") do
-        Map.put(base, "customData", normalise_data(params["customData"]))
-      else
-        base
-      end
-
-    case upload_attachments(uploads) do
-      {:ok, []} ->
-        {:ok, base}
-
-      {:ok, attachments} ->
-        {:ok,
-         base
-         |> Map.put("attachments", attachments)
-         |> Map.put_new("url", List.first(attachments)["url"])}
-
-      {:error, error} ->
-        {:error, error}
-    end
-  end
-
-  defp normalise_data(value) when is_binary(value) do
-    case Jason.decode(value) do
-      {:ok, decoded} when is_map(decoded) -> stringify_keys(decoded)
-      {:ok, decoded} -> decoded
-      _ -> value
-    end
-  end
-
-  defp normalise_data(value) when is_map(value), do: stringify_keys(value)
-  defp normalise_data(nil), do: %{}
-  defp normalise_data(other), do: other
-
-  defp upload_attachments(uploads) do
-    uploads
-    |> List.wrap()
-    |> List.flatten()
-    |> Enum.reject(&is_nil/1)
-    |> Enum.reduce_while({:ok, []}, fn upload, {:ok, acc} ->
-      case Media.persist_upload(upload) do
-        {:ok, attachment} -> {:cont, {:ok, [attachment | acc]}}
-        {:error, error} -> {:halt, {:error, error}}
-      end
-    end)
-    |> case do
-      {:ok, attachments} -> {:ok, Enum.reverse(attachments)}
-      {:error, error} -> {:error, error}
-    end
-  end
-
-  defp merge_message_data(old, new) do
-    new = normalise_data(new)
-
-    cond do
-      is_map(new) and Map.has_key?(new, "data") ->
-        Map.merge(old || %{}, normalise_data(new["data"]))
-
-      is_map(new) ->
-        Map.merge(old || %{}, new)
-
-      true ->
-        old || %{}
-    end
-  end
-
   defp enrich_data_entities(state, message, data) do
     sender =
       state["users"][to_s(message["sender"])] || normalise_user(%{"uid" => message["sender"]})
@@ -1457,19 +1344,8 @@ defmodule OpenChat.Store do
 
     data
     |> Map.put_new("reactions", get_in(message, ["data", "reactions"]) || [])
-    |> put_entity("sender", "user", public_user(sender))
-    |> put_entity("receiver", message["receiverType"], receiver_entity)
-  end
-
-  defp put_entity(data, key, entity_type, entity) do
-    Map.update(
-      data,
-      "entities",
-      %{key => %{"entityType" => entity_type, "entity" => entity}},
-      fn entities ->
-        Map.put(entities || %{}, key, %{"entityType" => entity_type, "entity" => entity})
-      end
-    )
+    |> MessageData.put_entity("sender", "user", public_user(sender))
+    |> MessageData.put_entity("receiver", message["receiverType"], receiver_entity)
   end
 
   defp delete_conversation_indexes(state, conv_ids) do
@@ -1597,7 +1473,7 @@ defmodule OpenChat.Store do
       elem(ensure_receiver_entity(state, message["receiverType"], message["receiver"]), 1)
 
     {
-      %{
+      Entities.message(%{
         "id" => id,
         "sender" => actor_uid,
         "receiver" => message["receiver"],
@@ -1614,7 +1490,7 @@ defmodule OpenChat.Store do
             "on" => %{"entityType" => "message", "entity" => message}
           }
         }
-      },
+      }),
       state
     }
   end
@@ -1625,7 +1501,7 @@ defmodule OpenChat.Store do
     on_user = public_user(state["users"][on_uid] || normalise_user(%{"uid" => on_uid}))
 
     {
-      %{
+      Entities.message(%{
         "id" => id,
         "sender" => actor_uid,
         "receiver" => group["guid"],
@@ -1642,7 +1518,7 @@ defmodule OpenChat.Store do
             "on" => %{"entityType" => "user", "entity" => on_user}
           }
         }
-      },
+      }),
       state
     }
   end
@@ -1987,19 +1863,14 @@ defmodule OpenChat.Store do
 
   defp mark_group_presence(state, guid, uid) do
     now = Time.now()
-    expires_at = now + Config.group_presence_ttl_seconds()
+    presence = Entities.presence(guid, uid, now, Config.group_presence_ttl_seconds())
 
     update_in(state, ["presence", guid], fn rows ->
       rows
       |> Kernel.||(%{})
       |> Enum.reject(fn {_uid, presence} -> to_int(presence["expiresAt"]) <= now end)
       |> Map.new()
-      |> Map.put(uid, %{
-        "uid" => uid,
-        "guid" => guid,
-        "lastSeenAt" => now,
-        "expiresAt" => expires_at
-      })
+      |> Map.put(uid, presence)
       |> cap_presence()
     end)
   end
@@ -2034,8 +1905,6 @@ defmodule OpenChat.Store do
   defp with_members_count(group, state) do
     Entities.with_members_count(group, state)
   end
-
-  defp normalise_scope(scope), do: Entities.scope(scope)
 
   # Generic helpers
 
@@ -2109,10 +1978,6 @@ defmodule OpenChat.Store do
 
     {page_rows, meta}
   end
-
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, _key, ""), do: map
-  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
   defp decode_seed(json, default) do
     case Jason.decode(json || "") do

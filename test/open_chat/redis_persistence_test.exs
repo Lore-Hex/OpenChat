@@ -2,7 +2,7 @@ defmodule OpenChat.RedisPersistenceTest do
   use ExUnit.Case, async: false
 
   alias OpenChat.Store
-  alias OpenChat.Store.Conversations
+  alias OpenChat.Store.{Conversations, RedisPersistence}
 
   @redis_url System.get_env("REDIS_TEST_URL") || "redis://localhost:6379/15"
 
@@ -116,6 +116,28 @@ defmodule OpenChat.RedisPersistenceTest do
 
       assert "redis-uid-token-user" in redis_members(context, "index", "users")
       assert "uid:redis-uid-token-user" in redis_members(context, "index", "tokens")
+    end)
+  end
+
+  test "redis writes persist multi-key batches under one revision", context do
+    with_redis(context, fn ->
+      before_revision = redis_get(context, "meta", "revision") |> to_int()
+
+      assert :ok =
+               RedisPersistence.write([
+                 RedisPersistence.put("users", "atomic-a", %{"uid" => "atomic-a"}),
+                 RedisPersistence.put("users", "atomic-b", %{"uid" => "atomic-b"}),
+                 RedisPersistence.delete("users", "atomic-deleted"),
+                 RedisPersistence.counter("next_id", 999)
+               ])
+
+      assert redis_json(context, "users", "atomic-a") == %{"uid" => "atomic-a"}
+      assert redis_json(context, "users", "atomic-b") == %{"uid" => "atomic-b"}
+      assert "atomic-a" in redis_members(context, "index", "users")
+      assert "atomic-b" in redis_members(context, "index", "users")
+      refute "atomic-deleted" in redis_members(context, "index", "users")
+      assert redis_get(context, "counter", "next_id") == "999"
+      assert redis_get(context, "meta", "revision") |> to_int() == before_revision + 1
     end)
   end
 
@@ -1164,6 +1186,17 @@ defmodule OpenChat.RedisPersistenceTest do
 
   defp redis_key(context, parts) when is_list(parts), do: Enum.join([context.prefix | parts], ":")
   defp redis_key(context, part_a, part_b), do: redis_key(context, [part_a, part_b])
+
+  defp to_int(nil), do: 0
+
+  defp to_int(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {int, _rest} -> int
+      :error -> 0
+    end
+  end
+
+  defp to_int(value) when is_integer(value), do: value
 
   defp delete_prefix(redis, prefix, cursor \\ "0") do
     {:ok, [next_cursor, keys]} =

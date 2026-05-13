@@ -2,7 +2,7 @@ defmodule OpenChat.Store.Indexes do
   @moduledoc false
 
   alias OpenChat.Config
-  alias OpenChat.Store.Conversations
+  alias OpenChat.Store.{Conversations, Entities}
   alias OpenChat.Time
 
   @secondary_buckets [
@@ -45,17 +45,11 @@ defmodule OpenChat.Store.Indexes do
   def put_member(state, guid, uid, scope, now \\ Time.now()) do
     guid = to_s(guid)
     uid = to_s(uid)
-    scope = normalise_scope(scope)
+    member = Entities.member(guid, uid, scope, now)
 
     state
     |> update_in(["members", guid], &(&1 || %{}))
-    |> put_in(["members", guid, uid], %{
-      "uid" => uid,
-      "scope" => scope,
-      "role" => scope,
-      "joinedAt" => now,
-      "guid" => guid
-    })
+    |> put_in(["members", guid, uid], member)
     |> put_user_group(uid, guid)
   end
 
@@ -249,15 +243,6 @@ defmodule OpenChat.Store.Indexes do
       map_keys(members) ++ [sender]
     end
   end
-
-  defp normalise_scope("participants"), do: "participant"
-  defp normalise_scope("members"), do: "participant"
-
-  defp normalise_scope(scope) when scope in ["owner", "admin", "moderator", "participant"],
-    do: scope
-
-  defp normalise_scope("coOwner"), do: "coOwner"
-  defp normalise_scope(_scope), do: "participant"
 
   defp blank?(value), do: value in [nil, "", false]
 

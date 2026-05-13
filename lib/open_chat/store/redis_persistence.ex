@@ -31,6 +31,41 @@ defmodule OpenChat.Store.RedisPersistence do
   @version "7"
   @lock_ttl_ms 60_000
   @lock_attempts 600
+  @atomic_write_script """
+  local prefix = ARGV[1]
+  local version = ARGV[2]
+  local ops = cjson.decode(ARGV[3])
+
+  local function key(...)
+    local parts = {prefix, ...}
+    return table.concat(parts, ":")
+  end
+
+  for i = 1, #ops do
+    local op = ops[i]
+
+    if op["op"] == "put" then
+      redis.call("SET", key(op["bucket"], op["id"]), op["value"])
+      redis.call("SADD", key("index", op["bucket"]), op["id"])
+    elseif op["op"] == "delete" then
+      redis.call("DEL", key(op["bucket"], op["id"]))
+      redis.call("SREM", key("index", op["bucket"]), op["id"])
+    elseif op["op"] == "counter" then
+      local current = redis.call("GET", key("counter", op["counter"]))
+      local current_number = tonumber(current)
+      local candidate = tonumber(op["value"]) or 1
+
+      if not current_number or current_number < candidate then
+        redis.call("SET", key("counter", op["counter"]), tostring(candidate))
+      end
+    else
+      error("unknown Redis write op: " .. tostring(op["op"]))
+    end
+  end
+
+  redis.call("SET", key("meta", "version"), version)
+  return redis.call("INCR", key("meta", "revision"))
+  """
 
   def load_or_seed(default_state, seed_fun) do
     case Config.redis_url() do
@@ -141,11 +176,8 @@ defmodule OpenChat.Store.RedisPersistence do
     if Process.whereis(OpenChat.Redis) do
       ops
       |> List.wrap()
-      |> Enum.flat_map(&commands_for_op/1)
-      |> Kernel.++([["SET", meta_key(), @version]])
-      |> Kernel.++([["INCR", revision_key()]])
-      |> run_pipeline()
-      |> pipeline_to_ok()
+      |> Enum.flat_map(&atomic_op/1)
+      |> atomic_write()
     else
       :ok
     end
@@ -276,8 +308,6 @@ defmodule OpenChat.Store.RedisPersistence do
   end
 
   defp remember_pipeline_full_revision(_result), do: :ok
-  defp pipeline_to_ok({:ok, _results}), do: :ok
-  defp pipeline_to_ok(_result), do: :ok
 
   defp remember_full_revision(revision) do
     Process.put(:open_chat_redis_full_revision, to_int(revision))
@@ -626,6 +656,48 @@ defmodule OpenChat.Store.RedisPersistence do
     do: delete_prefix_commands() ++ state_commands(state)
 
   defp commands_for_op(_op), do: []
+
+  defp atomic_op({:put, bucket, id, value}) do
+    [
+      %{
+        "op" => "put",
+        "bucket" => to_s(bucket),
+        "id" => to_s(id),
+        "value" => Jason.encode!(value)
+      }
+    ]
+  end
+
+  defp atomic_op({:delete, bucket, id}) do
+    [%{"op" => "delete", "bucket" => to_s(bucket), "id" => to_s(id)}]
+  end
+
+  defp atomic_op({:counter, counter, value}) do
+    [%{"op" => "counter", "counter" => to_s(counter), "value" => to_s(value)}]
+  end
+
+  defp atomic_op(_op), do: []
+
+  defp atomic_write([]), do: :ok
+
+  defp atomic_write(ops) do
+    case command([
+           "EVAL",
+           @atomic_write_script,
+           "0",
+           Config.redis_key_prefix(),
+           @version,
+           Jason.encode!(ops)
+         ]) do
+      {:ok, revision} ->
+        remember_full_revision(revision)
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("Redis atomic persist failed: #{inspect(reason)}")
+        :ok
+    end
+  end
 
   defp state_commands(state) do
     bucket_commands =
