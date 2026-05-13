@@ -20,6 +20,9 @@ Parameters:
   AdminApiKey:
     Type: String
     NoEcho: true
+  CorsAllowedOrigins:
+    Type: String
+    Default: ""
   DesiredCount:
     Type: Number
     Default: 2
@@ -331,6 +334,8 @@ Resources:
               Value: /app/priv/static/uploads
             - Name: EXTENSION_DOMAIN
               Value: !Ref DomainName
+            - Name: CORS_ALLOWED_ORIGINS
+              Value: !Ref CorsAllowedOrigins
           LogConfiguration:
             LogDriver: awslogs
             Options:
