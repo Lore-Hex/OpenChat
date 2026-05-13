@@ -496,4 +496,114 @@ defmodule OpenChatWeb.ApiRegressionTest do
     assert conn.status == 200
     assert get_in(json(conn), ["data", "data", "action"]) == "deleted"
   end
+
+  test "API-key moderation can edit without auth token and rejects bad API keys" do
+    conn =
+      auth_conn(:post, "/v3.0/messages", %{
+        "receiver" => "bob",
+        "receiverType" => "user",
+        "data" => %{"text" => "before admin edit"}
+      })
+
+    assert conn.status == 201
+    message = json(conn)["data"]
+
+    conn =
+      conn(:put, "/v3/messages/#{message["id"]}", Jason.encode!(%{"data" => %{"text" => "bad"}}))
+      |> Plug.Conn.put_req_header("content-type", "application/json")
+      |> Plug.Conn.put_req_header("apikey", "not-the-key")
+      |> Endpoint.call([])
+
+    assert conn.status == 403
+    assert json(conn)["error"]["code"] == "ERR_FORBIDDEN"
+
+    conn =
+      admin_conn(:put, "/v3/messages/#{message["id"]}", %{
+        "data" => %{"text" => "after admin edit"}
+      })
+
+    assert conn.status == 200
+    action = json(conn)["data"]
+    assert action["sender"] == "system"
+    assert action["data"]["action"] == "edited"
+
+    assert get_in(action, ["data", "entities", "on", "entity", "data", "text"]) ==
+             "after admin edit"
+  end
+
+  test "group message mutation APIs allow room moderators and owners only" do
+    assert admin_conn(:post, "/v3/groups", %{
+             "guid" => "api-secure-room",
+             "type" => "public",
+             "ownerUid" => "api-owner"
+           }).status == 201
+
+    assert admin_conn(:post, "/v3/groups/api-secure-room/members", %{
+             "participants" => ["alice", "bob"],
+             "moderators" => ["api-mod"],
+             "admins" => ["api-admin"]
+           }).status == 200
+
+    assert admin_conn(:put, "/v3/groups/api-secure-room/members/api-co-owner", %{
+             "scope" => "coOwner"
+           }).status == 200
+
+    conn =
+      auth_conn(:post, "/v3.0/messages", %{
+        "receiver" => "api-secure-room",
+        "receiverType" => "group",
+        "data" => %{"text" => "group moderation"}
+      })
+
+    assert conn.status == 201
+    message = json(conn)["data"]
+
+    conn = auth_conn(:delete, "/v3.0/messages/#{message["id"]}", %{}, "uid:bob")
+    assert conn.status == 403
+
+    conn =
+      auth_conn(
+        :put,
+        "/v3.0/messages/#{message["id"]}",
+        %{"data" => %{"text" => "moderator edit"}},
+        "uid:api-mod"
+      )
+
+    assert conn.status == 200
+    assert get_in(json(conn), ["data", "data", "action"]) == "edited"
+
+    conn =
+      auth_conn(:post, "/v3.0/messages", %{
+        "receiver" => "api-secure-room",
+        "receiverType" => "group",
+        "data" => %{"text" => "group moderation 2"}
+      })
+
+    second = json(conn)["data"]
+
+    assert auth_conn(:delete, "/v3.0/messages/#{second["id"]}", %{}, "uid:api-admin").status ==
+             200
+
+    conn =
+      auth_conn(:post, "/v3.0/messages", %{
+        "receiver" => "api-secure-room",
+        "receiverType" => "group",
+        "data" => %{"text" => "group moderation 3"}
+      })
+
+    third = json(conn)["data"]
+    assert auth_conn(:delete, "/v3.0/messages/#{third["id"]}", %{}, "uid:api-owner").status == 200
+
+    conn =
+      auth_conn(:post, "/v3.0/messages", %{
+        "receiver" => "api-secure-room",
+        "receiverType" => "group",
+        "data" => %{"text" => "group moderation 4"}
+      })
+
+    fourth = json(conn)["data"]
+
+    assert auth_conn(:delete, "/v3.0/messages/#{fourth["id"]}", %{}, "uid:api-co-owner").status ==
+             200
+  end
 end

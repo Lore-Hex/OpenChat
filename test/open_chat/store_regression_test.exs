@@ -179,6 +179,7 @@ defmodule OpenChat.StoreRegressionTest do
     assert {:ok, _members} = Store.add_group_members(guid, ["alice", "bob"], "participant")
     assert {:ok, _mod} = Store.add_group_members(guid, ["mod"], "moderator")
     assert {:ok, _admin} = Store.add_group_members(guid, ["admin"], "admin")
+    assert {:ok, _co_owner} = Store.add_group_members(guid, ["co-owner"], "coOwner")
 
     assert {:ok, group_message} =
              Store.send_message("alice", %{
@@ -216,6 +217,61 @@ defmodule OpenChat.StoreRegressionTest do
              })
 
     assert admin_edited["data"]["action"] == "edited"
+
+    assert {:ok, fourth_group_message} =
+             Store.send_message("alice", %{
+               "receiver" => guid,
+               "receiverType" => "group",
+               "data" => %{"text" => "group 4"}
+             })
+
+    assert {:ok, co_owner_deleted} = Store.delete_message("co-owner", fourth_group_message["id"])
+    assert co_owner_deleted["data"]["action"] == "deleted"
+  end
+
+  test "server-side admin option can moderate without message ownership" do
+    assert {:ok, direct} =
+             Store.send_message("alice", %{
+               "receiver" => "bob",
+               "receiverType" => "user",
+               "data" => %{"text" => "before admin edit"}
+             })
+
+    assert {:ok, edited} =
+             Store.edit_message(
+               "moderation-service",
+               direct["id"],
+               %{
+                 "data" => %{"text" => "after admin edit"}
+               },
+               admin?: true
+             )
+
+    assert edited["sender"] == "moderation-service"
+    assert get_in(edited, ["data", "action"]) == "edited"
+
+    assert get_in(edited, ["data", "entities", "on", "entity", "editedBy"]) ==
+             "moderation-service"
+
+    assert {:ok, group} =
+             Store.upsert_group(%{
+               "guid" => "owner-uid-room",
+               "type" => "public",
+               "ownerUid" => "owner-uid"
+             })
+
+    assert group["owner"] == "owner-uid"
+    assert {:ok, _members} = Store.add_group_members("owner-uid-room", ["alice"], "participant")
+
+    assert {:ok, group_message} =
+             Store.send_message("alice", %{
+               "receiver" => "owner-uid-room",
+               "receiverType" => "group",
+               "data" => %{"text" => "owned room"}
+             })
+
+    assert {:ok, owner_deleted} = Store.delete_message("owner-uid", group_message["id"])
+    assert owner_deleted["data"]["action"] == "deleted"
   end
 
   test "threads, muid lookup, unread filters, conversations, and conversation deletion" do

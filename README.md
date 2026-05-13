@@ -108,6 +108,26 @@ For a literal zero-code swizzle, deploy TLS and DNS so the SDK's existing CometC
 | `UPLOAD_DIR` | `priv/static/uploads` | Uploaded media storage directory |
 | `PUBLIC_MEDIA_BASE_URL` | unset | Absolute media URL base; otherwise `/media/<file>` |
 
+## Admin moderation
+
+Server-side moderation uses the CometChat-style admin API key. Send the configured
+`COMETCHAT_API_KEY` in the `apikey` or `apiKey` header. Admin requests do not need an
+`authToken`, and message mutations run with full moderation access:
+
+```bash
+curl -X PUT "$OPENCHAT_URL/v3/messages/$MESSAGE_ID" \
+  -H "apikey: $COMETCHAT_API_KEY" \
+  -H "content-type: application/json" \
+  -d '{"data":{"text":"moderated text"}}'
+
+curl -X DELETE "$OPENCHAT_URL/v3/messages/$MESSAGE_ID" \
+  -H "apikey: $COMETCHAT_API_KEY"
+```
+
+User-token requests keep SDK-style permissions: direct messages can be edited or
+deleted only by their sender; group messages can be edited or deleted by their sender
+or by a group `owner`, `admin`, `moderator`, or `coOwner`.
+
 ## Persistence strategy
 
 By default all state is in one OTP GenServer. If `REDIS_URL` is set, each mutation is also persisted into Redis as per-record keys under `REDIS_KEY_PREFIX`:
