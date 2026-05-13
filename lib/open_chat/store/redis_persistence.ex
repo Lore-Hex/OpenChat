@@ -56,23 +56,78 @@ defmodule OpenChat.Store.RedisPersistence do
     end
   end
 
-  def with_lock(fun) when is_function(fun, 0) do
+  def refresh_keys(default_state, fallback_state, keys) do
     if enabled?() do
+      keys = normalize_refresh_keys(keys)
+
+      cond do
+        keys == [] -> fallback_state
+        :all in keys -> refresh(default_state, fallback_state)
+        true -> refresh_records(default_state, fallback_state, keys)
+      end
+    else
+      fallback_state
+    end
+  end
+
+  def with_lock(fun) when is_function(fun, 0) do
+    with_locks([:global], fun)
+  end
+
+  def with_locks(scopes, fun) when is_function(fun, 0) do
+    if enabled?() do
+      scopes = normalize_lock_scopes(scopes)
       lock_value = Base.url_encode64(:crypto.strong_rand_bytes(24), padding: false)
 
-      case acquire_lock(lock_value, @lock_attempts) do
-        :ok ->
+      case acquire_locks(scopes, lock_value, []) do
+        {:ok, acquired} ->
           try do
             fun.()
           after
-            release_lock(lock_value)
+            release_locks(acquired, lock_value)
           end
 
         {:error, reason} ->
-          raise "Redis lock failed: #{inspect(reason)}"
+          raise "Redis lock failed for #{inspect(scopes)}: #{inspect(reason)}"
       end
     else
       fun.()
+    end
+  end
+
+  def take_counter(name, fallback_next) do
+    if enabled?() do
+      script = """
+      local current = redis.call("GET", KEYS[1])
+      if not current then
+        current = ARGV[1]
+      end
+      current = tonumber(current) or tonumber(ARGV[1]) or 1
+      redis.call("SET", KEYS[1], current + 1)
+      redis.call("SET", KEYS[2], ARGV[2])
+      redis.call("INCR", KEYS[3])
+      return current
+      """
+
+      case command([
+             "EVAL",
+             script,
+             "3",
+             counter_key(name),
+             meta_key(),
+             revision_key(),
+             to_s(fallback_next),
+             @version
+           ]) do
+        {:ok, value} ->
+          to_int(value)
+
+        {:error, reason} ->
+          Logger.warning("Redis counter allocation failed: #{inspect(reason)}")
+          to_int(fallback_next)
+      end
+    else
+      to_int(fallback_next)
     end
   end
 
@@ -86,7 +141,7 @@ defmodule OpenChat.Store.RedisPersistence do
       |> Kernel.++([["SET", meta_key(), @version]])
       |> Kernel.++([["INCR", revision_key()]])
       |> run_pipeline()
-      |> remember_pipeline_revision()
+      |> pipeline_to_ok()
     else
       :ok
     end
@@ -103,7 +158,7 @@ defmodule OpenChat.Store.RedisPersistence do
       |> Kernel.++([["SET", meta_key(), @version]])
       |> Kernel.++([["INCR", revision_key()]])
       |> run_pipeline()
-      |> remember_pipeline_revision()
+      |> remember_pipeline_full_revision()
     else
       :ok
     end
@@ -185,7 +240,7 @@ defmodule OpenChat.Store.RedisPersistence do
         end
       end)
 
-    remember_remote_revision()
+    remember_remote_full_revision()
     state
   end
 
@@ -194,37 +249,190 @@ defmodule OpenChat.Store.RedisPersistence do
   end
 
   defp maybe_refresh_state(default_state, fallback_state, revision) do
-    if revision == local_revision() do
+    if revision == local_full_revision() do
       fallback_state
     else
       read_state(default_state)
     end
   end
 
-  defp remember_remote_revision do
+  defp remember_remote_full_revision do
     case command(["GET", revision_key()]) do
-      {:ok, revision} -> remember_revision(revision)
+      {:ok, revision} -> remember_full_revision(revision)
       _ -> :ok
     end
   end
 
-  defp remember_pipeline_revision({:ok, results}) do
+  defp remember_pipeline_full_revision({:ok, results}) do
     results
     |> List.last()
-    |> remember_revision()
+    |> remember_full_revision()
 
     :ok
   end
 
-  defp remember_pipeline_revision(_result), do: :ok
+  defp remember_pipeline_full_revision(_result), do: :ok
+  defp pipeline_to_ok({:ok, _results}), do: :ok
+  defp pipeline_to_ok(_result), do: :ok
 
-  defp remember_revision(revision) do
-    Process.put(:open_chat_redis_revision, to_int(revision))
+  defp remember_full_revision(revision) do
+    Process.put(:open_chat_redis_full_revision, to_int(revision))
     :ok
   end
 
-  defp local_revision do
-    Process.get(:open_chat_redis_revision, 0)
+  defp local_full_revision do
+    Process.get(:open_chat_redis_full_revision, 0)
+  end
+
+  defp refresh_records(default_state, state, keys) do
+    {record_keys, counter_keys} =
+      Enum.reduce(keys, {[], []}, fn
+        {:record, bucket, id}, {records, counters} -> {[{bucket, id} | records], counters}
+        {:counter, counter}, {records, counters} -> {records, [counter | counters]}
+        _other, acc -> acc
+      end)
+
+    record_keys = Enum.uniq(record_keys)
+
+    state
+    |> read_records(record_keys)
+    |> read_related_token_users(record_keys)
+    |> read_related_member_users(record_keys)
+    |> read_related_messages(record_keys)
+    |> read_related_message_participants(record_keys)
+    |> read_related_conversations(record_keys)
+    |> read_counters(default_state, Enum.uniq(counter_keys))
+  end
+
+  defp read_records(state, []), do: state
+
+  defp read_records(state, record_keys) do
+    commands = Enum.map(record_keys, fn {bucket, id} -> ["GET", record_key(bucket, id)] end)
+
+    case Redix.pipeline(OpenChat.Redis, commands) do
+      {:ok, results} ->
+        record_keys
+        |> Enum.zip(results)
+        |> Enum.reduce(state, fn {{bucket, id}, result}, acc ->
+          apply_record_result(acc, bucket, id, result)
+        end)
+
+      {:error, reason} ->
+        Logger.warning("Redis targeted refresh failed: #{inspect(reason)}")
+        state
+    end
+  end
+
+  defp read_related_messages(state, record_keys) do
+    message_keys =
+      record_keys
+      |> Enum.filter(fn {bucket, _id} ->
+        bucket in ["conversation_messages", "thread_messages"]
+      end)
+      |> Enum.flat_map(fn {bucket, id} -> state |> get_in([bucket, id]) |> List.wrap() end)
+      |> Enum.map(&{"messages", to_s(&1)})
+      |> Enum.reject(fn {_bucket, id} -> id == "" end)
+      |> Enum.reject(&(&1 in record_keys))
+      |> Enum.uniq()
+
+    read_records(state, message_keys)
+  end
+
+  defp read_related_token_users(state, record_keys) do
+    user_keys =
+      record_keys
+      |> Enum.filter(fn {bucket, _id} -> bucket == "tokens" end)
+      |> Enum.map(fn {_bucket, token} -> get_in(state, ["tokens", token]) end)
+      |> Enum.reject(&(&1 in [nil, ""]))
+      |> Enum.map(&{"users", to_s(&1)})
+      |> Enum.reject(&(&1 in record_keys))
+      |> Enum.uniq()
+
+    read_records(state, user_keys)
+  end
+
+  defp read_related_member_users(state, record_keys) do
+    user_keys =
+      record_keys
+      |> Enum.filter(fn {bucket, _id} -> bucket in ["members", "banned", "blocks"] end)
+      |> Enum.flat_map(fn {bucket, id} ->
+        state
+        |> get_in([bucket, id])
+        |> case do
+          map when is_map(map) -> Map.keys(map)
+          _other -> []
+        end
+      end)
+      |> Enum.map(&{"users", to_s(&1)})
+      |> Enum.reject(&(&1 in record_keys))
+      |> Enum.uniq()
+
+    read_records(state, user_keys)
+  end
+
+  defp read_related_message_participants(state, record_keys) do
+    participant_keys =
+      record_keys
+      |> Enum.filter(fn {bucket, _id} -> bucket == "messages" end)
+      |> Enum.flat_map(fn {_bucket, id} ->
+        case get_in(state, ["messages", id]) do
+          %{"receiverType" => "group", "receiver" => guid, "sender" => sender} ->
+            [{"users", sender}, {"groups", guid}, {"members", guid}]
+
+          %{"receiver" => receiver, "sender" => sender} ->
+            [{"users", sender}, {"users", receiver}]
+
+          _other ->
+            []
+        end
+      end)
+      |> Enum.reject(&(&1 in record_keys))
+      |> Enum.uniq()
+
+    read_records(state, participant_keys)
+  end
+
+  defp read_related_conversations(state, record_keys) do
+    conversation_keys =
+      record_keys
+      |> Enum.filter(fn {bucket, _id} -> bucket == "messages" end)
+      |> Enum.map(fn {_bucket, id} -> get_in(state, ["messages", id, "conversationId"]) end)
+      |> Enum.reject(&(&1 in [nil, ""]))
+      |> Enum.map(&{"conversation_messages", to_s(&1)})
+      |> Enum.reject(&(&1 in record_keys))
+      |> Enum.uniq()
+
+    read_records(state, conversation_keys)
+  end
+
+  defp read_counters(state, _default_state, []), do: state
+
+  defp read_counters(state, default_state, counters) do
+    commands = Enum.map(counters, fn counter -> ["GET", counter_key(counter)] end)
+
+    case Redix.pipeline(OpenChat.Redis, commands) do
+      {:ok, results} ->
+        counters
+        |> Enum.zip(results)
+        |> Enum.reduce(state, fn {counter, value}, acc ->
+          Map.put(acc, counter, max(to_int(value), default_state[counter] || 1))
+        end)
+
+      {:error, reason} ->
+        Logger.warning("Redis counter refresh failed: #{inspect(reason)}")
+        state
+    end
+  end
+
+  defp apply_record_result(state, bucket, id, nil) do
+    update_in(state, [bucket], &Map.delete(&1 || %{}, id))
+  end
+
+  defp apply_record_result(state, bucket, id, json) do
+    case Jason.decode(json) do
+      {:ok, value} -> put_in(state, [bucket, id], value)
+      {:error, _reason} -> state
+    end
   end
 
   defp read_bucket(bucket) do
@@ -264,7 +472,7 @@ defmodule OpenChat.Store.RedisPersistence do
   end
 
   defp commands_for_op({:counter, counter, value}) do
-    [["SET", counter_key(counter), to_s(value)]]
+    [counter_max_command(counter, value)]
   end
 
   defp commands_for_op({:replace_all, state}),
@@ -289,6 +497,21 @@ defmodule OpenChat.Store.RedisPersistence do
     bucket_commands ++ counter_commands
   end
 
+  defp counter_max_command(counter, value) do
+    script = """
+    local current = redis.call("GET", KEYS[1])
+    local current_number = tonumber(current)
+    local candidate = tonumber(ARGV[1]) or 1
+    if not current_number or current_number < candidate then
+      redis.call("SET", KEYS[1], ARGV[1])
+      return ARGV[1]
+    end
+    return current
+    """
+
+    ["EVAL", script, "1", counter_key(counter), to_s(value)]
+  end
+
   defp delete_prefix_commands(cursor \\ "0", commands \\ []) do
     case command(["SCAN", cursor, "MATCH", "#{Config.redis_key_prefix()}:*", "COUNT", "1000"]) do
       {:ok, [next_cursor, []]} when next_cursor != "0" ->
@@ -298,11 +521,11 @@ defmodule OpenChat.Store.RedisPersistence do
         commands
 
       {:ok, [next_cursor, keys]} when next_cursor != "0" ->
-        keys = Enum.reject(keys, &(&1 == lock_key()))
+        keys = Enum.reject(keys, &lock_key?/1)
         delete_prefix_commands(next_cursor, delete_command(keys, commands))
 
       {:ok, [_next_cursor, keys]} ->
-        keys = Enum.reject(keys, &(&1 == lock_key()))
+        keys = Enum.reject(keys, &lock_key?/1)
         delete_command(keys, commands)
 
       {:error, reason} ->
@@ -327,23 +550,41 @@ defmodule OpenChat.Store.RedisPersistence do
   defp delete_command([], commands), do: commands
   defp delete_command(keys, commands), do: [["DEL" | keys] | commands]
 
-  defp acquire_lock(_lock_value, 0), do: {:error, :timeout}
+  defp acquire_locks([], _lock_value, acquired), do: {:ok, acquired}
 
-  defp acquire_lock(lock_value, attempts) do
-    case command(["SET", lock_key(), lock_value, "NX", "PX", to_s(@lock_ttl_ms)]) do
+  defp acquire_locks([scope | rest], lock_value, acquired) do
+    case acquire_lock(scope, lock_value, @lock_attempts) do
+      :ok ->
+        acquire_locks(rest, lock_value, [scope | acquired])
+
+      {:error, reason} ->
+        release_locks(acquired, lock_value)
+        {:error, {scope, reason}}
+    end
+  end
+
+  defp acquire_lock(_scope, _lock_value, 0), do: {:error, :timeout}
+
+  defp acquire_lock(scope, lock_value, attempts) do
+    case command(["SET", lock_key(scope), lock_value, "NX", "PX", to_s(@lock_ttl_ms)]) do
       {:ok, "OK"} ->
         :ok
 
       {:ok, nil} ->
         Process.sleep(50)
-        acquire_lock(lock_value, attempts - 1)
+        acquire_lock(scope, lock_value, attempts - 1)
 
       {:error, reason} ->
         {:error, reason}
     end
   end
 
-  defp release_lock(lock_value) do
+  defp release_locks(scopes, lock_value) do
+    Enum.each(scopes, &release_lock(&1, lock_value))
+    :ok
+  end
+
+  defp release_lock(scope, lock_value) do
     script = """
     if redis.call("GET", KEYS[1]) == ARGV[1] then
       return redis.call("DEL", KEYS[1])
@@ -352,7 +593,7 @@ defmodule OpenChat.Store.RedisPersistence do
     end
     """
 
-    command(["EVAL", script, "1", lock_key(), lock_value])
+    command(["EVAL", script, "1", lock_key(scope), lock_value])
     :ok
   end
 
@@ -361,6 +602,54 @@ defmodule OpenChat.Store.RedisPersistence do
     seed_fun.()
   end
 
+  defp normalize_refresh_keys(keys) do
+    keys
+    |> List.wrap()
+    |> Enum.flat_map(fn
+      :all ->
+        [:all]
+
+      {:counter, counter} ->
+        [{:counter, to_s(counter)}]
+
+      {:record, bucket, id} ->
+        normalize_record_key(bucket, id)
+
+      {bucket, id} ->
+        normalize_record_key(bucket, id)
+
+      _other ->
+        []
+    end)
+    |> Enum.uniq()
+  end
+
+  defp normalize_record_key(bucket, id) do
+    bucket = to_s(bucket)
+    id = to_s(id)
+
+    if bucket in @buckets and id != "" do
+      [{:record, bucket, id}]
+    else
+      []
+    end
+  end
+
+  defp normalize_lock_scopes(scopes) do
+    scopes
+    |> List.wrap()
+    |> Enum.map(&lock_scope_parts/1)
+    |> Enum.reject(&(&1 == []))
+    |> Enum.uniq()
+    |> Enum.sort()
+  end
+
+  defp lock_scope_parts(:global), do: ["global"]
+  defp lock_scope_parts({type, id}), do: [type, id] |> Enum.map(&to_s/1)
+  defp lock_scope_parts({type, a, b}), do: [type, a, b] |> Enum.map(&to_s/1)
+  defp lock_scope_parts(scope) when is_list(scope), do: Enum.map(scope, &to_s/1)
+  defp lock_scope_parts(scope), do: [to_s(scope)]
+
   defp command(args), do: Redix.command(OpenChat.Redis, args)
 
   defp key(parts),
@@ -368,7 +657,8 @@ defmodule OpenChat.Store.RedisPersistence do
 
   defp meta_key, do: key(["meta", "version"])
   defp revision_key, do: key(["meta", "revision"])
-  defp lock_key, do: key(["lock", "store"])
+  defp lock_key(scope), do: key(["lock" | scope])
+  defp lock_key?(redis_key), do: String.starts_with?(redis_key, key(["lock"]) <> ":")
   defp index_key(bucket), do: key(["index", bucket])
   defp record_key(bucket, id), do: key([bucket, id])
   defp counter_key(counter), do: key(["counter", counter])

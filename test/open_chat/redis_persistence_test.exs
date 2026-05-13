@@ -316,6 +316,80 @@ defmodule OpenChat.RedisPersistenceTest do
     end)
   end
 
+  test "targeted conversation refresh preserves externally written messages", context do
+    with_redis(context, fn ->
+      assert {:ok, first} =
+               Store.send_message("refresh-a", %{
+                 "receiver" => "refresh-b",
+                 "receiverType" => "user",
+                 "data" => %{"text" => "local first"}
+               })
+
+      external =
+        first
+        |> Map.put("id", 500)
+        |> Map.put("sender", "refresh-b")
+        |> Map.put("receiver", "refresh-a")
+        |> put_in(["data", "text"], "external second")
+
+      Redix.command!(
+        context.redis,
+        ["SET", redis_key(context, "messages", 500), Jason.encode!(external)]
+      )
+
+      Redix.command!(context.redis, ["SADD", redis_key(context, "index", "messages"), "500"])
+
+      Redix.command!(
+        context.redis,
+        [
+          "SET",
+          redis_key(context, "conversation_messages", first["conversationId"]),
+          Jason.encode!([to_string(first["id"]), "500"])
+        ]
+      )
+
+      Redix.command!(
+        context.redis,
+        [
+          "SADD",
+          redis_key(context, "index", "conversation_messages"),
+          first["conversationId"]
+        ]
+      )
+
+      assert {:ok, second_local} =
+               Store.send_message("refresh-a", %{
+                 "receiver" => "refresh-b",
+                 "receiverType" => "user",
+                 "data" => %{"text" => "local third"}
+               })
+
+      assert redis_json(context, "messages", 500)["data"]["text"] == "external second"
+
+      assert redis_json(context, "conversation_messages", first["conversationId"]) == [
+               to_string(first["id"]),
+               "500",
+               to_string(second_local["id"])
+             ]
+    end)
+  end
+
+  test "Redis counter allocation ignores stale local next_id", context do
+    with_redis(context, fn ->
+      Redix.command!(context.redis, ["SET", redis_key(context, "counter", "next_id"), "1000"])
+
+      assert {:ok, message} =
+               Store.send_message("counter-a", %{
+                 "receiver" => "counter-b",
+                 "receiverType" => "user",
+                 "data" => %{"text" => "from redis counter"}
+               })
+
+      assert message["id"] == 1000
+      assert redis_get(context, "counter", "next_id") == "1001"
+    end)
+  end
+
   defp with_redis(%{skip_redis?: reason}, _fun) do
     IO.puts("Skipping Redis persistence test; Redis unavailable: #{inspect(reason)}")
     :ok

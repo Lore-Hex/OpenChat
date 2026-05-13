@@ -53,6 +53,7 @@ This implementation targets the inspected JavaScript SDK wire shape for `@cometc
 ```bash
 mix deps.get
 mix test
+mix test.load
 PORT=4000 PUBLIC_HOST=localhost PUBLIC_WS_PORT=8443 mix run --no-halt
 ```
 
@@ -129,7 +130,16 @@ By default all state is in one OTP GenServer. If `REDIS_URL` is set, each mutati
 
 On startup, OpenChat reloads state from those Redis keys. Normal mutations write only the touched records, indexes, and counters; reset and legacy imports replace the namespace. If no per-key namespace has been initialized but `REDIS_SNAPSHOT_KEY` exists, OpenChat imports that legacy JSON snapshot into the per-key layout.
 
-When Redis is enabled, mutating Store calls take a short Redis lock and refresh state before writing so multiple OpenChat nodes do not race counters or overwrite stale records. Read-only calls stay local. WebSocket events are also fanned out through Redis Pub/Sub so instances behind a load balancer can notify each other's connected clients. For heavier horizontal write scale, split write ownership by entity or move command handlers to Redis/Postgres with optimistic concurrency while preserving the same route/test contract.
+When Redis is enabled, Store behaves as a local read-through/write-through cache over the per-key Redis layout:
+
+- mutating calls take scoped Redis locks, usually by conversation, message, group, user, or token instead of a single global lock;
+- writes persist only touched records and index entries;
+- message and reaction IDs are allocated through Redis-backed monotonic counters so separate nodes do not race stale local counters;
+- targeted read-through refresh pulls only records a request can touch, such as a conversation message list plus its messages, a token plus its user, or a group plus its members;
+- broad scan paths such as user/group lists, unread count aggregation, and destructive group deletion still full-refresh before scanning because they depend on cross-bucket indexes;
+- reset and legacy imports remain namespace-wide operations.
+
+WebSocket events are also fanned out through Redis Pub/Sub so instances behind a load balancer can notify each other's connected clients.
 
 ## AWS deployment sketch
 
@@ -168,6 +178,31 @@ REDIS_URL=redis://<elasticache-endpoint>:6379/0
 - Conversations, unread counts, and delivered cursors
 - Read/unread/delivered transitions
 - Native reactions
+- Redis per-key persistence, targeted refresh, scoped write preservation, and monotonic Redis counters
+
+### Load and performance tests
+
+Load tests are excluded from the default `mix test` suite. Run them explicitly:
+
+```bash
+mix test.load
+```
+
+Useful knobs:
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `OPENCHAT_LOAD_USERS` | `100` | Distinct users for direct-message load |
+| `OPENCHAT_LOAD_MESSAGES` | `2000` | Direct Store messages |
+| `OPENCHAT_LOAD_GROUP_MEMBERS` | `150` | Members in the group fanout test |
+| `OPENCHAT_LOAD_GROUP_MESSAGES` | `600` | Group messages |
+| `OPENCHAT_LOAD_HTTP_MESSAGES` | `500` | Plug HTTP message sends |
+| `OPENCHAT_LOAD_REDIS_MESSAGES` | `300` | Redis-backed message sends |
+| `OPENCHAT_MIN_STORE_MSG_PER_SEC` | `300` | Minimum direct Store throughput |
+| `OPENCHAT_MIN_GROUP_MSG_PER_SEC` | `100` | Minimum group-message throughput |
+| `OPENCHAT_MIN_HTTP_MSG_PER_SEC` | `100` | Minimum Plug HTTP throughput |
+| `OPENCHAT_MIN_REDIS_MSG_PER_SEC` | `20` | Minimum Redis-backed throughput |
+| `REDIS_TEST_URL` | `redis://localhost:6379/15` | Redis URL for Redis load/persistence tests |
 
 ### Playwright contract tests against the real SDK
 

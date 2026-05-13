@@ -36,7 +36,8 @@ defmodule OpenChat.MixProject do
 
   defp aliases do
     [
-      test: ["test --trace"]
+      test: ["test --trace"],
+      "test.load": ["test --only load --trace"]
     ]
   end
 end
