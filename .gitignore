@@ -1,0 +1,14 @@
+_build/
+deps/
+.elixir_ls/
+
+contract/node_modules/
+contract/test-results/
+contract/playwright-report/
+contract/blob-report/
+
+priv/static/uploads/*
+!priv/static/uploads/.gitkeep
+
+.DS_Store
+*.log

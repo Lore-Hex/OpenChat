@@ -1,0 +1,40 @@
+services:
+  app:
+    build: .
+    environment:
+      PORT: "4000"
+      PUBLIC_HOST: "localhost"
+      PUBLIC_WS_PORT: "443"
+      COMETCHAT_APP_ID: "local-app"
+      COMETCHAT_REGION: "us"
+      EXTENSION_DOMAIN: "localhost"
+      REDIS_URL: "redis://redis:6379/0"
+      UPLOAD_DIR: "/app/priv/static/uploads"
+      NO_PROXY: "localhost,127.0.0.1,app,redis,caddy"
+      no_proxy: "localhost,127.0.0.1,app,redis,caddy"
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  caddy:
+    image: caddy:2-alpine
+    environment:
+      NO_PROXY: "localhost,127.0.0.1,app,redis,caddy"
+      no_proxy: "localhost,127.0.0.1,app,redis,caddy"
+    ports:
+      - "443:443"
+      - "8443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - app
+
+volumes:
+  caddy-data:
+  caddy-config:

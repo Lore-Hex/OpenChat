@@ -1,0 +1,11 @@
+_build
+deps
+.git
+
+contract/node_modules
+contract/test-results
+contract/playwright-report
+contract/blob-report
+
+.DS_Store
+*.log

@@ -1,0 +1,44 @@
+# AWS deployment notes
+
+## Recommended production topology
+
+- ECS Fargate service running the Docker image in this repo.
+- Application Load Balancer with HTTPS listener on 443.
+- ALB target group forwards to container port `4000`.
+- WebSocket upgrade support is automatic through ALB HTTP/1.1 targets.
+- Route 53 DNS:
+  - `chat.example.com` -> ALB
+  - Optional wildcard `*.chat.example.com` -> ALB for `CometChat.callExtension("reactions", ...)`.
+- ACM certificate:
+  - `chat.example.com`
+  - Optional `*.chat.example.com`
+- ElastiCache Redis if durable snapshots are desired.
+
+## Environment
+
+```text
+PORT=4000
+PUBLIC_HOST=chat.example.com
+PUBLIC_WS_PORT=443
+COMETCHAT_APP_ID=<your app id>
+COMETCHAT_API_KEY=<admin key for server-side token minting>
+COMETCHAT_REGION=us
+EXTENSION_DOMAIN=chat.example.com
+REDIS_URL=redis://<elasticache-primary-endpoint>:6379/0
+UPLOAD_DIR=/app/priv/static/uploads
+PUBLIC_MEDIA_BASE_URL=https://chat.example.com
+```
+
+For media durability, mount EFS at `/app/priv/static/uploads` or change media upload code to store files in S3 and return CloudFront URLs.
+
+## Health checks
+
+Use `GET /v3.0/settings` as a simple health check. It does not require auth.
+
+## Security hardening checklist
+
+- Set a non-empty `COMETCHAT_API_KEY` and keep it only in AWS secrets/config. Admin routes reject missing/invalid API keys unless this variable is intentionally set blank.
+- Replace `uid:<uid>` development tokens with server-minted auth tokens or signed JWT verification.
+- Put AWS WAF/rate limiting in front of public endpoints.
+- Use S3/CloudFront for media files.
+- Replace the Redis whole-state snapshot with normalized Redis/Postgres storage if high concurrency or multi-region operation is needed.

@@ -1,0 +1,716 @@
+defmodule OpenChatWeb.ApiRouter do
+  @moduledoc false
+  use Plug.Router
+  import Plug.Conn
+  alias OpenChat.{Config, Errors, Store, Time}
+  alias OpenChatWeb.JSON
+
+  plug(:match)
+  plug(:dispatch)
+
+  get "/settings" do
+    JSON.ok(conn, Config.settings())
+  end
+
+  post "/users/:uid/auth_tokens" do
+    with_admin_or_open(conn, fn conn ->
+      case Store.create_auth_token(uid) do
+        {:ok, data} -> JSON.ok(conn, data)
+        {:error, e} -> JSON.error(conn, e, 400)
+      end
+    end)
+  end
+
+  post "/admin/users/auth" do
+    with_admin_or_open(conn, fn conn ->
+      uid = conn.params["uid"] || get_in(conn.body_params, ["uid"])
+
+      if blank?(uid),
+        do: JSON.error(conn, Errors.missing("uid"), 400),
+        else: JSON.ok(conn, elem(Store.create_auth_token(uid), 1))
+    end)
+  end
+
+  delete "/admin/users/auth/:token" do
+    with_admin_or_open(conn, fn conn ->
+      {:ok, data} = Store.revoke_auth_token(token)
+      JSON.ok(conn, data)
+    end)
+  end
+
+  get "/me" do
+    with_user(conn, fn conn, _user, token ->
+      case Store.me(token) do
+        {:ok, me} -> JSON.ok(conn, me)
+        {:error, e} -> JSON.error(conn, e, 401)
+      end
+    end)
+  end
+
+  put "/me" do
+    with_user(conn, fn conn, _user, token ->
+      case Store.me(token) do
+        {:ok, me} -> JSON.ok(conn, me)
+        {:error, e} -> JSON.error(conn, e, 401)
+      end
+    end)
+  end
+
+  delete "/me" do
+    token = auth_token(conn)
+    if token, do: Store.revoke_auth_token(token)
+    JSON.ok(conn, %{"success" => true})
+  end
+
+  post "/me/jwt" do
+    with_user(conn, fn conn, user, token ->
+      JSON.ok(conn, %{
+        "jwt" =>
+          "local." <>
+            Base.url_encode64(
+              Jason.encode!(%{"uid" => user["uid"], "token" => token, "iat" => Time.now()}),
+              padding: false
+            ) <> ".unsigned"
+      })
+    end)
+  end
+
+  post "/user_sessions" do
+    with_user(conn, fn conn, user, _token ->
+      JSON.ok(conn, %{
+        "uid" => user["uid"],
+        "sessionId" => conn.params["deviceId"] || conn.params["sessionId"] || "session",
+        "createdAt" => Time.now()
+      })
+    end)
+  end
+
+  get "/users" do
+    with_user(conn, fn conn, _user, _token ->
+      {:ok, users} = Store.list_users(conn.query_params)
+      JSON.ok(conn, users)
+    end)
+  end
+
+  post "/users" do
+    with_admin_or_open(conn, fn conn ->
+      case Store.upsert_user(conn.body_params) do
+        {:ok, user} -> JSON.ok(conn, user, 201)
+        {:error, e} -> JSON.error(conn, e, 400)
+      end
+    end)
+  end
+
+  put "/users" do
+    with_admin_or_open(conn, fn conn ->
+      uids = conn.body_params["uidsToActivate"] || conn.body_params["uids"] || []
+      {:ok, data} = Store.reactivate_users(uids)
+      JSON.ok(conn, data)
+    end)
+  end
+
+  get "/users/:uid" do
+    with_user(conn, fn conn, user, _token ->
+      case Store.get_user_for(user["uid"], uid) do
+        {:ok, user} -> JSON.ok(conn, user)
+        :error -> JSON.error(conn, Errors.user_not_found(uid), 404)
+      end
+    end)
+  end
+
+  put "/users/:uid" do
+    with_admin_or_open(conn, fn conn ->
+      case Store.upsert_user(Map.put(conn.body_params, "uid", uid)) do
+        {:ok, user} -> JSON.ok(conn, user)
+        {:error, e} -> JSON.error(conn, e, 400)
+      end
+    end)
+  end
+
+  delete "/users/:uid" do
+    with_admin_or_open(conn, fn conn ->
+      case Store.delete_user(uid) do
+        {:ok, data} -> JSON.ok(conn, data)
+        {:error, e} -> JSON.error(conn, e, 404)
+      end
+    end)
+  end
+
+  get "/blockedusers" do
+    with_user(conn, fn conn, user, _token ->
+      {:ok, users, meta} = Store.blocked_users(user["uid"], conn.query_params)
+      JSON.raw(conn, %{"data" => users, "meta" => meta})
+    end)
+  end
+
+  post "/blockedusers" do
+    with_user(conn, fn conn, user, _token ->
+      blocked_uids = conn.body_params["blockedUids"] || conn.body_params["uids"] || []
+      {:ok, data} = Store.block_users(user["uid"], blocked_uids)
+      JSON.ok(conn, data)
+    end)
+  end
+
+  delete "/blockedusers" do
+    with_user(conn, fn conn, user, _token ->
+      blocked_uids = conn.body_params["blockedUids"] || conn.body_params["uids"] || []
+      {:ok, data} = Store.unblock_users(user["uid"], blocked_uids)
+      JSON.ok(conn, data)
+    end)
+  end
+
+  get "/groups" do
+    with_user(conn, fn conn, _user, _token ->
+      {:ok, groups} = Store.list_groups(conn.query_params)
+      JSON.ok(conn, groups)
+    end)
+  end
+
+  post "/groups" do
+    with_admin_or_open(conn, fn conn ->
+      case Store.upsert_group(conn.body_params) do
+        {:ok, group} -> JSON.ok(conn, group, 201)
+        {:error, e} -> JSON.error(conn, e, 400)
+      end
+    end)
+  end
+
+  get "/groups/:guid" do
+    with_user(conn, fn conn, _user, _token ->
+      case Store.get_group(guid) do
+        {:ok, group} -> JSON.ok(conn, group)
+        :error -> JSON.error(conn, Errors.group_not_found(guid), 404)
+      end
+    end)
+  end
+
+  put "/groups/:guid" do
+    with_admin_or_open(conn, fn conn ->
+      case Store.upsert_group(Map.put(conn.body_params, "guid", guid)) do
+        {:ok, group} -> JSON.ok(conn, group)
+        {:error, e} -> JSON.error(conn, e, 400)
+      end
+    end)
+  end
+
+  delete "/groups/:guid" do
+    JSON.ok(conn, %{"success" => true, "guid" => guid})
+  end
+
+  get "/groups/:guid/members" do
+    with_admin_or_user(
+      conn,
+      fn conn ->
+        case Store.group_members(guid, conn.query_params) do
+          {:ok, members} -> JSON.ok(conn, members)
+          {:error, e} -> JSON.error(conn, e, 404)
+        end
+      end,
+      fn conn ->
+        with_user(conn, fn conn, _user, _token ->
+          case Store.group_members(guid, conn.query_params) do
+            {:ok, members} -> JSON.ok(conn, members)
+            {:error, e} -> JSON.error(conn, e, 404)
+          end
+        end)
+      end
+    )
+  end
+
+  post "/groups/:guid/members" do
+    with_admin_or_user(
+      conn,
+      fn conn ->
+        case Store.set_group_scopes(guid, conn.body_params || %{}) do
+          {:ok, data} -> JSON.ok(conn, data)
+          {:error, e} -> JSON.error(conn, e, 400)
+        end
+      end,
+      fn conn ->
+        with_user(conn, fn conn, user, _token ->
+          params = Map.merge(conn.body_params || %{}, conn.params || %{})
+
+          case Store.join_group(guid, user["uid"], params) do
+            {:ok, group} -> JSON.ok(conn, join_group_payload(group))
+            {:error, e} -> JSON.error(conn, e, 400)
+          end
+        end)
+      end
+    )
+  end
+
+  put "/groups/:guid/members" do
+    with_admin_or_user(
+      conn,
+      fn conn ->
+        case Store.set_group_scopes(guid, conn.body_params || %{}) do
+          {:ok, data} -> JSON.ok(conn, data)
+          {:error, e} -> JSON.error(conn, e, 400)
+        end
+      end,
+      fn conn ->
+        with_user(conn, fn conn, _user, _token ->
+          uids = conn.body_params["uids"] || conn.body_params["participants"] || []
+          scope = conn.body_params["scope"] || "participant"
+
+          case Store.add_group_members(guid, uids, scope) do
+            {:ok, data} -> JSON.ok(conn, data)
+            {:error, e} -> JSON.error(conn, e, 400)
+          end
+        end)
+      end
+    )
+  end
+
+  delete "/groups/:guid/members" do
+    with_user(conn, fn conn, user, _token ->
+      {:ok, data} = Store.leave_group(guid, user["uid"])
+      JSON.ok(conn, data)
+    end)
+  end
+
+  delete "/groups/:guid/members/:uid" do
+    {:ok, data} = Store.leave_group(guid, uid)
+    JSON.ok(conn, data)
+  end
+
+  put "/groups/:guid/members/:uid" do
+    scope = conn.body_params["scope"] || "participant"
+
+    case Store.add_group_members(guid, [uid], scope) do
+      {:ok, data} -> JSON.ok(conn, data)
+      {:error, e} -> JSON.error(conn, e, 400)
+    end
+  end
+
+  get "/groups/:guid/bannedusers" do
+    with_admin_or_open(conn, fn conn ->
+      {:ok, data} = Store.banned_group_members(guid, conn.query_params)
+      JSON.ok(conn, data)
+    end)
+  end
+
+  post "/groups/:guid/bannedusers/:uid" do
+    with_admin_or_open(conn, fn conn ->
+      {:ok, data} = Store.ban_group_member(guid, uid)
+      JSON.ok(conn, data)
+    end)
+  end
+
+  delete "/groups/:guid/bannedusers/:uid" do
+    with_admin_or_open(conn, fn conn ->
+      {:ok, data} = Store.unban_group_member(guid, uid)
+      JSON.ok(conn, data)
+    end)
+  end
+
+  get "/users/:list_id/messages" do
+    with_user(conn, fn conn, user, _token ->
+      case Store.messages_for_user(user["uid"], list_id, conn.query_params) do
+        {:ok, messages} -> messages_response(conn, messages, conn.query_params)
+        {:error, e} -> JSON.error(conn, e, 400)
+      end
+    end)
+  end
+
+  get "/groups/:list_id/messages" do
+    with_user(conn, fn conn, user, _token ->
+      case Store.messages_for_group(user["uid"], list_id, conn.query_params) do
+        {:ok, messages} -> messages_response(conn, messages, conn.query_params)
+        {:error, e} -> JSON.error(conn, e, 400)
+      end
+    end)
+  end
+
+  get "/messages/:list_id/thread" do
+    with_user(conn, fn conn, user, _token ->
+      {:ok, messages} = Store.messages_for_thread(user["uid"], list_id, conn.query_params)
+      messages_response(conn, messages, conn.query_params)
+    end)
+  end
+
+  post "/messages/:parent_id/thread" do
+    with_user(conn, fn conn, user, _token ->
+      params = conn.body_params |> Map.put("parentId", parent_id)
+
+      case Store.send_message(user["uid"], params, uploads_from_params(conn.params)) do
+        {:ok, message} -> JSON.ok(conn, message)
+        {:error, e} -> JSON.error(conn, e, 400)
+      end
+    end)
+  end
+
+  get "/messages/:message_id/reactions/:reaction" do
+    with_user(conn, fn conn, user, _token ->
+      {:ok, rows} = Store.reactions(user["uid"], message_id, reaction)
+      JSON.ok(conn, rows)
+    end)
+  end
+
+  get "/messages/:message_id/reactions" do
+    with_user(conn, fn conn, user, _token ->
+      {:ok, rows} = Store.reactions(user["uid"], message_id)
+      JSON.ok(conn, rows)
+    end)
+  end
+
+  post "/messages/:message_id/reactions/:reaction" do
+    with_user(conn, fn conn, user, _token ->
+      case Store.add_reaction(user["uid"], message_id, reaction) do
+        {:ok, message} -> JSON.ok(conn, message)
+        {:error, e} -> JSON.error(conn, e, 400)
+      end
+    end)
+  end
+
+  delete "/messages/:message_id/reactions/:reaction" do
+    with_user(conn, fn conn, user, _token ->
+      case Store.remove_reaction(user["uid"], message_id, reaction) do
+        {:ok, message} -> JSON.ok(conn, message)
+        {:error, e} -> JSON.error(conn, e, 400)
+      end
+    end)
+  end
+
+  get "/messages" do
+    with_user(conn, fn conn, user, _token ->
+      params = Map.merge(conn.query_params, conn.params)
+
+      if truthy?(params["unread"]) and truthy?(params["count"]) do
+        {:ok, rows} = Store.unread_counts(user["uid"], params)
+        JSON.ok(conn, rows)
+      else
+        JSON.ok(conn, [])
+      end
+    end)
+  end
+
+  post "/messages" do
+    with_admin_or_user(
+      conn,
+      fn conn ->
+        sender_uid = conn.body_params["sender"] || conn.body_params["senderUid"] || "system"
+
+        case Store.send_message(sender_uid, conn.body_params, uploads_from_params(conn.params),
+               admin?: true
+             ) do
+          {:ok, message} -> JSON.ok(conn, message, 201)
+          {:error, e} -> JSON.error(conn, e, 400)
+        end
+      end,
+      fn conn ->
+        with_user(conn, fn conn, user, _token ->
+          case Store.send_message(user["uid"], conn.body_params, uploads_from_params(conn.params)) do
+            {:ok, message} -> JSON.ok(conn, message, 201)
+            {:error, e} -> JSON.error(conn, e, 400)
+          end
+        end)
+      end
+    )
+  end
+
+  get "/messages/:message_id" do
+    with_user(conn, fn conn, _user, _token ->
+      case Store.get_message(message_id) do
+        {:ok, message} -> JSON.ok(conn, message)
+        :error -> JSON.error(conn, Errors.message_not_found(message_id), 404)
+      end
+    end)
+  end
+
+  put "/messages/:message_id" do
+    with_user(conn, fn conn, user, _token ->
+      case Store.edit_message(user["uid"], message_id, conn.body_params) do
+        {:ok, action} -> JSON.ok(conn, action)
+        {:error, e} -> JSON.error(conn, e, 400)
+      end
+    end)
+  end
+
+  delete "/messages/:message_id" do
+    with_user(conn, fn conn, user, _token ->
+      case Store.delete_message(user["uid"], message_id) do
+        {:ok, action} -> JSON.ok(conn, action)
+        {:error, e} -> JSON.error(conn, e, 400)
+      end
+    end)
+  end
+
+  get "/user/messages/:muid" do
+    with_user(conn, fn conn, _user, _token ->
+      case Store.find_message_by_muid(muid) do
+        {:ok, message} -> JSON.ok(conn, message)
+        :error -> JSON.error(conn, Errors.message_not_found(muid), 404)
+      end
+    end)
+  end
+
+  get "/conversations" do
+    with_user(conn, fn conn, user, _token ->
+      {:ok, conversations} = Store.conversations(user["uid"], conn.query_params)
+
+      JSON.raw(conn, %{
+        "data" => conversations,
+        "meta" => pagination_meta(conversations, conn.query_params)
+      })
+    end)
+  end
+
+  get "/users/:uid/conversation" do
+    with_user(conn, fn conn, user, _token ->
+      {:ok, conversation} = Store.conversation(user["uid"], "user", uid)
+      JSON.ok(conn, conversation || %{})
+    end)
+  end
+
+  get "/groups/:guid/conversation" do
+    with_user(conn, fn conn, user, _token ->
+      {:ok, conversation} = Store.conversation(user["uid"], "group", guid)
+      JSON.ok(conn, conversation || %{})
+    end)
+  end
+
+  post "/users/:uid/conversation/read" do
+    mark_conversation_read(conn, "user", uid)
+  end
+
+  post "/groups/:guid/conversation/read" do
+    mark_conversation_read(conn, "group", guid)
+  end
+
+  delete "/users/:uid/conversation/read" do
+    mark_conversation_unread(conn, "user", uid)
+  end
+
+  delete "/groups/:guid/conversation/read" do
+    mark_conversation_unread(conn, "group", guid)
+  end
+
+  post "/users/:uid/conversation/delivered" do
+    JSON.ok(conn, %{"success" => true, "uid" => uid})
+  end
+
+  post "/groups/:guid/conversation/delivered" do
+    JSON.ok(conn, %{"success" => true, "guid" => guid})
+  end
+
+  delete "/users/:uid/conversation" do
+    JSON.ok(conn, %{"success" => true, "uid" => uid})
+  end
+
+  delete "/groups/:guid/conversation" do
+    JSON.ok(conn, %{"success" => true, "guid" => guid})
+  end
+
+  delete "/conversations/:conversation_id" do
+    with_admin_or_open(conn, fn conn ->
+      {:ok, data} = Store.delete_conversation(conversation_id)
+      JSON.ok(conn, data)
+    end)
+  end
+
+  match "/extensions/:name/*path" do
+    handle_extension(conn, name, Enum.join(path, "/"))
+  end
+
+  match "/v1/*path" do
+    handle_extension(conn, "reactions", "v1/" <> Enum.join(path, "/"))
+  end
+
+  get "/media/:file" do
+    serve_media(conn, file)
+  end
+
+  match "/*path" do
+    if extension_host?(conn) do
+      handle_extension(conn, extension_name_from_host(conn), Enum.join(path, "/"))
+    else
+      JSON.error(
+        conn,
+        Errors.error(
+          "ERR_ROUTE_NOT_FOUND",
+          "No OpenChat route matched #{conn.method} #{conn.request_path}"
+        ),
+        404
+      )
+    end
+  end
+
+  defp mark_conversation_read(conn, receiver_type, receiver_id) do
+    with_user(conn, fn conn, user, _token ->
+      message_id =
+        conn.body_params["messageId"] || conn.body_params["id"] || conn.params["messageId"] || "0"
+
+      {:ok, data} = Store.mark_read(user["uid"], receiver_type, receiver_id, message_id)
+      JSON.ok(conn, data)
+    end)
+  end
+
+  defp mark_conversation_unread(conn, receiver_type, receiver_id) do
+    with_user(conn, fn conn, user, _token ->
+      message_id =
+        conn.body_params["messageId"] || conn.body_params["id"] || conn.params["messageId"] || "0"
+
+      {:ok, data} = Store.mark_unread(user["uid"], receiver_type, receiver_id, message_id)
+      JSON.ok(conn, data)
+    end)
+  end
+
+  defp handle_extension(conn, _name, _path) do
+    with_user(conn, fn conn, user, _token ->
+      params = Map.merge(conn.query_params || %{}, conn.body_params || %{})
+      message_id = params["messageId"] || params["msgId"] || params["id"] || params["message_id"]
+      reaction = params["reaction"] || params["emoji"] || params["emojiCode"]
+      action = params["action"] || params["operation"] || String.downcase(conn.method)
+
+      cond do
+        blank?(message_id) ->
+          JSON.error(conn, Errors.missing("messageId"), 400)
+
+        blank?(reaction) ->
+          JSON.error(conn, Errors.missing("reaction"), 400)
+
+        action in ["delete", "remove", "removed", "unreact"] ->
+          case Store.remove_reaction(user["uid"], message_id, reaction) do
+            {:ok, message} -> JSON.ok(conn, message)
+            {:error, e} -> JSON.error(conn, e, 400)
+          end
+
+        true ->
+          case Store.add_reaction(user["uid"], message_id, reaction) do
+            {:ok, message} -> JSON.ok(conn, message)
+            {:error, e} -> JSON.error(conn, e, 400)
+          end
+      end
+    end)
+  end
+
+  defp serve_media(conn, file) do
+    path = Path.join(Config.upload_dir(), Path.basename(URI.decode(file)))
+
+    if File.exists?(path) do
+      conn
+      |> put_resp_content_type(MIME.from_path(path) || "application/octet-stream")
+      |> send_file(200, path)
+    else
+      JSON.error(conn, Errors.error("ERR_MEDIA_NOT_FOUND", "Media file was not found."), 404)
+    end
+  end
+
+  defp with_user(conn, fun) do
+    token = auth_token(conn)
+
+    case Store.authenticate(token) do
+      {:ok, user} -> fun.(conn, user, token)
+      {:error, e} -> JSON.error(conn, e, 401)
+    end
+  end
+
+  defp with_admin_or_open(conn, fun) do
+    api_key = header(conn, "apikey") || header(conn, "apiKey")
+    configured = Config.api_key()
+
+    if api_key == configured or (blank?(configured) and blank?(api_key)) do
+      fun.(conn)
+    else
+      JSON.error(conn, Errors.forbidden("Invalid apiKey."), 403)
+    end
+  end
+
+  defp with_admin_or_user(conn, admin_fun, user_fun) do
+    api_key = header(conn, "apikey") || header(conn, "apiKey")
+
+    cond do
+      blank?(api_key) ->
+        user_fun.(conn)
+
+      api_key == Config.api_key() ->
+        admin_fun.(conn)
+
+      true ->
+        JSON.error(conn, Errors.forbidden("Invalid apiKey."), 403)
+    end
+  end
+
+  defp auth_token(conn),
+    do: header(conn, "authtoken") || header(conn, "authToken") || conn.params["authToken"]
+
+  defp header(conn, key), do: conn |> get_req_header(String.downcase(key)) |> List.first()
+
+  defp uploads_from_params(params) do
+    [
+      params["files"],
+      params["files[]"],
+      params["file"],
+      params["attachment"],
+      params["attatchment"]
+    ]
+    |> List.flatten()
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp extension_host?(conn) do
+    host = conn.host || ""
+    String.starts_with?(host, "reactions-") or String.contains?(host, ".extensions.")
+  end
+
+  defp extension_name_from_host(conn) do
+    conn.host |> to_string() |> String.split("-") |> List.first() || "reactions"
+  end
+
+  defp messages_response(conn, messages, params) do
+    JSON.raw(conn, %{"data" => messages, "meta" => cursor_meta(messages, params)})
+  end
+
+  defp join_group_payload(group) do
+    Map.put(group, "data", %{
+      "entities" => %{
+        "for" => %{"entityType" => "group", "entity" => group}
+      }
+    })
+  end
+
+  defp cursor_meta(messages, params) do
+    limit = params["per_page"] || params["limit"] || 30
+    affix = params["cursorAffix"] || params["affix"] || "prepend"
+    cursor_message = List.first(messages) || %{}
+
+    pagination_meta(messages, Map.put(params, "limit", limit))
+    |> Map.put(
+      "cursor",
+      %{
+        "id" => cursor_message["id"] || 0,
+        "sentAt" => cursor_message["sentAt"] || 0,
+        "affix" => affix
+      }
+    )
+  end
+
+  defp pagination_meta(rows, params) do
+    limit = params["per_page"] || params["limit"] || 30
+
+    %{
+      "pagination" => %{
+        "total" => length(rows),
+        "count" => length(rows),
+        "per_page" => to_int(limit, 30),
+        "current_page" => to_int(params["page"], 1),
+        "total_pages" => 1
+      }
+    }
+  end
+
+  defp blank?(v), do: v in [nil, "", false]
+  defp truthy?(v), do: v in [true, 1, "1", "true", "TRUE", "yes"]
+
+  defp to_int(value, _default) when is_integer(value), do: value
+
+  defp to_int(value, default) when is_binary(value) do
+    case Integer.parse(value) do
+      {int, _} -> int
+      :error -> default
+    end
+  end
+
+  defp to_int(_value, default), do: default
+end
