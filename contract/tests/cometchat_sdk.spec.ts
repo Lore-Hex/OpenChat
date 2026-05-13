@@ -119,7 +119,7 @@ test('custom messages, media messages, group join, and native reactions', async 
   expect(result.reactions[0].reaction).toBe('👍');
 });
 
-test('blocked users APIs used by Hangout settings and DM flows', async ({ page }) => {
+test('blocked users APIs used by settings and DM flows', async ({ page }) => {
   await loadSdk(page, false);
 
   const result = await page.evaluate(async (token) => {
