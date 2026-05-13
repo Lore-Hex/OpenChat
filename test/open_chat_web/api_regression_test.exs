@@ -854,4 +854,179 @@ defmodule OpenChatWeb.ApiRegressionTest do
     assert auth_conn(:delete, "/v3.0/messages/#{fourth["id"]}", %{}, "uid:api-co-owner").status ==
              200
   end
+
+  test "TTFM socket admin-POST text message: data.metadata.chatMessage envelope and <@uid:>/<consumableId:> mentions round-trip" do
+    # Mirrors hangout/socket/src/initializers/cometChat.ts postSongMessage and
+    # postConsumableMessage. The admin POST to /v3/messages embeds a domain payload
+    # in data.metadata.chatMessage and uses <@uid:xxx>/<consumableId:yyy> mentions
+    # inside the visible text. OpenChat must accept this shape and return it
+    # verbatim through the user-facing fetch route so snowy converters can parse it.
+    room = "ttfm-socket-room"
+    assert admin_conn(:post, "/v3/groups", %{"guid" => room, "type" => "public"}).status == 201
+
+    assert auth_conn(:post, "/v3.0/groups/#{room}/members", %{}, "uid:alice").status in [200, 201]
+
+    text =
+      "<@uid:alice> played <consumableId:c-456>"
+
+    chat_message_envelope = %{
+      "type" => "room",
+      "songs" => [
+        %{
+          "type" => "ChatMusicInfo",
+          "song" => %{"spotifyId" => "sp-12345", "title" => "Hangout Anthem"}
+        }
+      ],
+      "consumable" => %{"id" => "c-456", "kind" => "takeover"}
+    }
+
+    body = %{
+      "type" => "text",
+      "receiverType" => "group",
+      "category" => "message",
+      "receiver" => room,
+      "data" => %{
+        "text" => text,
+        "metadata" => %{"chatMessage" => chat_message_envelope}
+      }
+    }
+
+    conn = admin_conn(:post, "/v3/messages", body)
+    assert conn.status in [200, 201]
+
+    sent = json(conn)["data"]
+    assert sent["receiver"] == room
+    assert sent["data"]["text"] == text
+
+    assert get_in(sent, ["data", "metadata", "chatMessage", "songs"]) ==
+             chat_message_envelope["songs"]
+
+    assert get_in(sent, ["data", "metadata", "chatMessage", "consumable"]) ==
+             chat_message_envelope["consumable"]
+
+    # Member fetches the same message via the SDK-shaped GET route and the wire
+    # round-trips unchanged — mentions intact, envelope intact.
+    fetch_conn = auth_conn(:get, "/v3.0/groups/#{room}/messages?limit=10", %{}, "uid:alice")
+    assert fetch_conn.status == 200
+    [fetched | _rest] = json(fetch_conn)["data"]
+    assert fetched["data"]["text"] == text
+    assert get_in(fetched, ["data", "metadata", "chatMessage", "type"]) == "room"
+
+    assert get_in(fetched, ["data", "metadata", "chatMessage", "songs"]) ==
+             chat_message_envelope["songs"]
+  end
+
+  test "user-service admin flow: create user, mint auth token, /me round-trips, then delete via admin" do
+    # Mirrors hangout/user-service/src/comet-chat/comet-chat.service.ts createCometChatUser
+    # + createAuthToken + isAuthTokenValid + downstream cleanup. Each step uses the same
+    # endpoint shape the production service hits against the real CometChat API.
+    create =
+      admin_conn(:post, "/v3/users", %{
+        "uid" => "ttfm-user-svc-1",
+        "name" => "TTFM User One",
+        "role" => "default",
+        "metadata" => Jason.encode!(%{"avatarId" => "av-1", "color" => "#abcdef"})
+      })
+
+    assert create.status == 201
+    assert json(create)["data"]["uid"] == "ttfm-user-svc-1"
+
+    mint = admin_conn(:post, "/v3/users/ttfm-user-svc-1/auth_tokens")
+    assert mint.status == 200
+    token = json(mint)["data"]["authToken"]
+    assert is_binary(token)
+    assert String.length(token) > 0
+
+    me = auth_conn(:get, "/v3.0/me", %{}, token)
+    assert me.status == 200
+    assert json(me)["data"]["uid"] == "ttfm-user-svc-1"
+
+    update =
+      admin_conn(:put, "/v3/users/ttfm-user-svc-1", %{
+        "name" => "TTFM User Renamed",
+        "metadata" => Jason.encode!(%{"avatarId" => "av-2", "color" => "#fedcba"})
+      })
+
+    assert update.status == 200
+    assert json(update)["data"]["name"] == "TTFM User Renamed"
+
+    revoke = admin_conn(:delete, "/v3/admin/users/auth/#{token}")
+    assert revoke.status == 200
+
+    stale = auth_conn(:get, "/v3.0/me", %{}, token)
+    assert stale.status == 401
+  end
+
+  test "rooms-service admin flow: create group, set scopes (admins+moderators+participants), list by scope, ban/unban" do
+    # Mirrors hangout/rooms-service/src/comet-chat/comet-chat.service.ts createGroupForRoom,
+    # setUsersScope, getUsersWithScope, banUser, unBanUser, deleteRoomConversation.
+    room = "ttfm-rooms-svc-1"
+
+    create =
+      admin_conn(:post, "/v3/groups", %{
+        "guid" => room,
+        "name" => "da:#{room}",
+        "type" => "public"
+      })
+
+    assert create.status == 201
+
+    scope_payload = %{
+      "admins" => ["rooms-admin-1"],
+      "moderators" => ["rooms-mod-1", "rooms-mod-2"],
+      "participants" => ["rooms-participant-1"]
+    }
+
+    scopes = admin_conn(:post, "/v3/groups/#{room}/members", scope_payload)
+    assert scopes.status == 200
+
+    list = admin_conn(:get, "/v3/groups/#{room}/members?scope=admin,moderator")
+    assert list.status == 200
+
+    member_uids =
+      json(list)["data"]
+      |> Enum.map(& &1["uid"])
+      |> Enum.sort()
+
+    assert "rooms-admin-1" in member_uids
+    assert "rooms-mod-1" in member_uids
+    assert "rooms-mod-2" in member_uids
+    refute "rooms-participant-1" in member_uids
+
+    ban = admin_conn(:post, "/v3/groups/#{room}/bannedusers/rooms-bad-actor")
+    assert ban.status == 200
+
+    banned = admin_conn(:get, "/v3/groups/#{room}/bannedusers")
+    assert banned.status == 200
+    assert Enum.any?(json(banned)["data"], &(&1["uid"] == "rooms-bad-actor"))
+
+    unban = admin_conn(:delete, "/v3/groups/#{room}/bannedusers/rooms-bad-actor")
+    assert unban.status == 200
+
+    # rooms-service deleteRoomConversation hits DELETE /v3/conversations/:guid.
+    cleanup = admin_conn(:delete, "/v3/conversations/#{room}")
+    assert cleanup.status == 200
+
+    deleted = admin_conn(:delete, "/v3/groups/#{room}")
+    assert deleted.status == 200
+  end
+
+  test "socket remove-group-member: admin DELETE /v3/groups/:guid/members/:uid succeeds and is idempotent on 404" do
+    # Mirrors hangout/socket/src/initializers/cometChat.ts removeGroupMember which
+    # tolerates a 404 (already not a member) without escalating.
+    room = "ttfm-socket-room-2"
+    assert admin_conn(:post, "/v3/groups", %{"guid" => room, "type" => "public"}).status == 201
+
+    assert admin_conn(:post, "/v3/groups/#{room}/members", %{"participants" => ["socket-user-1"]}).status ==
+             200
+
+    removed = admin_conn(:delete, "/v3/groups/#{room}/members/socket-user-1")
+    assert removed.status == 200
+
+    # Removing the same user twice does not crash — the production socket initializer
+    # explicitly suppresses captureException when status != 404, so 200 OR 404 here is
+    # fine. OpenChat returns 200 with success=true even when the user is already gone.
+    second = admin_conn(:delete, "/v3/groups/#{room}/members/socket-user-1")
+    assert second.status in [200, 404]
+  end
 end
