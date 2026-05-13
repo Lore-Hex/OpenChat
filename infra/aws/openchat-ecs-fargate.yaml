@@ -38,6 +38,26 @@ Parameters:
   RedisNodeType:
     Type: String
     Default: cache.t4g.micro
+  RedisSnapshotRetentionDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 35
+  RedisSnapshottingClusterId:
+    Type: String
+    Default: ""
+    Description: Existing Redis member cluster id to use for backups when enabling snapshots on an existing replication group.
+  GroupMaxMessages:
+    Type: Number
+    Default: 1000
+    MinValue: 1
+  GroupMessageRetentionDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+
+Conditions:
+  HasRedisSnapshottingClusterId: !Not [!Equals [!Ref RedisSnapshottingClusterId, ""]]
 
 Resources:
   Cluster:
@@ -145,17 +165,34 @@ Resources:
         - !Ref PublicSubnet1
         - !Ref PublicSubnet2
 
+  RedisParameterGroup:
+    Type: AWS::ElastiCache::ParameterGroup
+    Properties:
+      CacheParameterGroupFamily: redis7
+      Description: !Sub OpenChat ${EnvironmentName} Redis parameters
+      Properties:
+        maxmemory-policy: noeviction
+
   Redis:
     Type: AWS::ElastiCache::ReplicationGroup
     Properties:
       ReplicationGroupDescription: !Sub OpenChat ${EnvironmentName}
       Engine: redis
       CacheNodeType: !Ref RedisNodeType
+      CacheParameterGroupName: !Ref RedisParameterGroup
       NumNodeGroups: 1
       ReplicasPerNodeGroup: 1
       AutomaticFailoverEnabled: true
       MultiAZEnabled: true
       AtRestEncryptionEnabled: true
+      SnapshotRetentionLimit: !If
+        - HasRedisSnapshottingClusterId
+        - !Ref RedisSnapshotRetentionDays
+        - !Ref AWS::NoValue
+      SnapshottingClusterId: !If
+        - HasRedisSnapshottingClusterId
+        - !Ref RedisSnapshottingClusterId
+        - !Ref AWS::NoValue
       CacheSubnetGroupName: !Ref RedisSubnetGroup
       SecurityGroupIds:
         - !Ref RedisSecurityGroup
@@ -327,6 +364,10 @@ Resources:
                 - Host: !GetAtt Redis.PrimaryEndPoint.Address
             - Name: REDIS_KEY_PREFIX
               Value: !Sub open_chat:${EnvironmentName}
+            - Name: GROUP_MAX_MESSAGES
+              Value: !Ref GroupMaxMessages
+            - Name: GROUP_MESSAGE_RETENTION_DAYS
+              Value: !Ref GroupMessageRetentionDays
             - Name: UPLOAD_DIR
               Value: /app/priv/static/uploads
             - Name: EXTENSION_DOMAIN
