@@ -10,6 +10,16 @@ defmodule OpenChatWeb.ApiTest do
     assert body["data"]["settings"]["CHAT_HOST"] == "localhost"
   end
 
+  test "auth accepts standard bearer tokens" do
+    conn =
+      conn(:get, "/v3.0/me")
+      |> Plug.Conn.put_req_header("authorization", "Bearer uid:alice")
+      |> OpenChatWeb.Endpoint.call([])
+
+    assert conn.status == 200
+    assert json(conn)["data"]["uid"] == "alice"
+  end
+
   test "admin token generation then login" do
     conn = admin_conn(:post, "/v3/users/dave/auth_tokens")
     assert conn.status == 200

@@ -9,6 +9,7 @@ defmodule OpenChat.Config do
   def extension_domain, do: Application.fetch_env!(:open_chat, :extension_domain)
   def upload_dir, do: Application.fetch_env!(:open_chat, :upload_dir)
   def redis_url, do: Application.get_env(:open_chat, :redis_url)
+  def redis_key_prefix, do: Application.fetch_env!(:open_chat, :redis_key_prefix)
   def redis_snapshot_key, do: Application.fetch_env!(:open_chat, :redis_snapshot_key)
   def seed_users_json, do: Application.fetch_env!(:open_chat, :seed_users_json)
   def seed_groups_json, do: Application.fetch_env!(:open_chat, :seed_groups_json)

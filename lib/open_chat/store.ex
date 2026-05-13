@@ -3,9 +3,8 @@ defmodule OpenChat.Store do
   Small CometChat-compatible data store.
 
   The default backend is in-memory OTP state. If `REDIS_URL` is set, this GenServer
-  snapshots the whole state into one Redis JSON value after each mutation. That is
-  intentionally simple: it keeps the replacement drop-in and easy to audit for AGPL
-  use while still allowing durable storage on AWS ElastiCache/Redis.
+  also persists records into Redis under per-entity keys and index sets. That keeps
+  the replacement drop-in while avoiding one large whole-state JSON value.
   """
 
   use GenServer
@@ -28,6 +27,22 @@ defmodule OpenChat.Store do
     "next_id" => 1,
     "next_reaction_id" => 1
   }
+
+  @redis_buckets [
+    "users",
+    "tokens",
+    "groups",
+    "members",
+    "messages",
+    "conversation_messages",
+    "thread_messages",
+    "reads",
+    "reactions",
+    "blocks",
+    "banned"
+  ]
+
+  @redis_counters ["next_id", "next_reaction_id"]
 
   # Public API
 
@@ -569,24 +584,7 @@ defmodule OpenChat.Store do
         {:reply, {:error, error}, state}
 
       {:ok, message, state} ->
-        id_key = to_s(message["id"])
-        conv_id = message["conversationId"]
-        state = put_in(state, ["messages", id_key], message)
-
-        state =
-          update_in(state, ["conversation_messages", conv_id], fn ids ->
-            (ids || []) ++ [id_key]
-          end)
-
-        state =
-          if parent_id = message["parentId"] || message["parentMessageId"] do
-            update_in(state, ["thread_messages", to_s(parent_id)], fn ids ->
-              (ids || []) ++ [id_key]
-            end)
-          else
-            state
-          end
-
+        state = store_message_in_state(state, message)
         publish_message(state, message)
         persist(state)
         {:reply, {:ok, message}, state}
@@ -612,7 +610,8 @@ defmodule OpenChat.Store do
           |> Map.put("updatedAt", now)
 
         state = put_in(state, ["messages", id], message)
-        action = message_action(state, uid, message, "edited")
+        {action, state} = message_action(state, uid, message, "edited")
+        state = store_message_in_state(state, action)
         publish_message(state, action)
         persist(state)
         {:reply, {:ok, action}, state}
@@ -634,7 +633,8 @@ defmodule OpenChat.Store do
           |> Map.put("updatedAt", now)
 
         state = put_in(state, ["messages", id], message)
-        action = message_action(state, uid, message, "deleted")
+        {action, state} = message_action(state, uid, message, "deleted")
+        state = store_message_in_state(state, action)
         publish_message(state, action)
         persist(state)
         {:reply, {:ok, action}, state}
@@ -829,12 +829,7 @@ defmodule OpenChat.Store do
             "reactedBy" => public_user(state["users"][uid] || normalise_user(%{"uid" => uid}))
           }
 
-      state =
-        update_in(state, ["reactions", id], fn reaction_map ->
-          Map.update(reaction_map || %{}, reaction, %{}, fn by_uid ->
-            Map.delete(by_uid || %{}, uid)
-          end)
-        end)
+      state = remove_reaction_from_state(state, id, reaction, uid)
 
       message = refresh_message_reactions(state, message, uid)
       state = put_in(state, ["messages", id], message)
@@ -871,21 +866,9 @@ defmodule OpenChat.Store do
         seed_state()
 
       url ->
-        case Redix.start_link(url, name: OpenChat.Redis) do
+        case ensure_redis_started(url) do
           {:ok, _pid} ->
-            case Redix.command(OpenChat.Redis, ["GET", Config.redis_snapshot_key()]) do
-              {:ok, nil} ->
-                state = seed_state()
-                persist(state)
-                state
-
-              {:ok, json} ->
-                Jason.decode!(json)
-
-              {:error, reason} ->
-                Logger.warning("Redis snapshot load failed: #{inspect(reason)}; using seeds")
-                seed_state()
-            end
+            load_redis_state()
 
           {:error, reason} ->
             Logger.warning("Redis connection failed: #{inspect(reason)}; using in-memory store")
@@ -894,17 +877,170 @@ defmodule OpenChat.Store do
     end
   end
 
+  defp ensure_redis_started(url) do
+    case Process.whereis(OpenChat.Redis) do
+      nil ->
+        case Redix.start_link(url, name: OpenChat.Redis) do
+          {:ok, pid} -> {:ok, pid}
+          {:error, {:already_started, pid}} -> {:ok, pid}
+          error -> error
+        end
+
+      pid ->
+        {:ok, pid}
+    end
+  end
+
+  defp load_redis_state do
+    case redis_command(["GET", redis_meta_key()]) do
+      {:ok, nil} ->
+        load_legacy_snapshot_or_seed()
+
+      {:ok, _version} ->
+        read_per_key_state()
+
+      {:error, reason} ->
+        Logger.warning("Redis key load failed: #{inspect(reason)}; using seeds")
+        seed_state()
+    end
+  end
+
+  defp load_legacy_snapshot_or_seed do
+    case redis_command(["GET", Config.redis_snapshot_key()]) do
+      {:ok, nil} ->
+        state = seed_state()
+        persist(state)
+        state
+
+      {:ok, json} ->
+        case Jason.decode(json) do
+          {:ok, state} ->
+            state = Map.merge(@default_state, state)
+            persist(state)
+            state
+
+          {:error, reason} ->
+            Logger.warning("Redis legacy snapshot decode failed: #{inspect(reason)}; using seeds")
+            seed_state()
+        end
+
+      {:error, reason} ->
+        Logger.warning("Redis legacy snapshot load failed: #{inspect(reason)}; using seeds")
+        seed_state()
+    end
+  end
+
+  defp read_per_key_state do
+    state =
+      Enum.reduce(@redis_buckets, @default_state, fn bucket, acc ->
+        Map.put(acc, bucket, read_redis_bucket(bucket))
+      end)
+
+    Enum.reduce(@redis_counters, state, fn counter, acc ->
+      case redis_command(["GET", redis_counter_key(counter)]) do
+        {:ok, nil} -> acc
+        {:ok, value} -> Map.put(acc, counter, max(to_int(value), @default_state[counter]))
+        {:error, _reason} -> acc
+      end
+    end)
+  end
+
+  defp read_redis_bucket(bucket) do
+    with {:ok, ids} <- redis_command(["SMEMBERS", redis_index_key(bucket)]) do
+      Enum.reduce(ids, %{}, fn id, acc ->
+        case redis_command(["GET", redis_record_key(bucket, id)]) do
+          {:ok, nil} ->
+            acc
+
+          {:ok, json} ->
+            case Jason.decode(json) do
+              {:ok, value} -> Map.put(acc, id, value)
+              {:error, _reason} -> acc
+            end
+
+          {:error, _reason} ->
+            acc
+        end
+      end)
+    else
+      _ -> %{}
+    end
+  end
+
   defp persist(state) do
     if Process.whereis(OpenChat.Redis) do
-      Redix.command(OpenChat.Redis, ["SET", Config.redis_snapshot_key(), Jason.encode!(state)])
+      persist_per_key(state)
     end
 
     :ok
   rescue
     e ->
-      Logger.warning("Redis snapshot persist failed: #{Exception.message(e)}")
+      Logger.warning("Redis per-key persist failed: #{Exception.message(e)}")
       :ok
   end
+
+  defp persist_per_key(state) do
+    @redis_buckets
+    |> Enum.flat_map(fn bucket -> sync_bucket_commands(bucket, Map.get(state, bucket, %{})) end)
+    |> Kernel.++(counter_commands(state))
+    |> Kernel.++([["SET", redis_meta_key(), "2"]])
+    |> run_redis_pipeline()
+  end
+
+  defp sync_bucket_commands(bucket, values) do
+    current_ids = values |> Map.keys() |> Enum.map(&to_s/1)
+    old_ids = redis_set_members(redis_index_key(bucket))
+    removed_ids = old_ids -- current_ids
+
+    delete_commands =
+      Enum.flat_map(removed_ids, fn id ->
+        [["DEL", redis_record_key(bucket, id)], ["SREM", redis_index_key(bucket), id]]
+      end)
+
+    upsert_commands =
+      Enum.flat_map(values, fn {id, value} ->
+        id = to_s(id)
+
+        [
+          ["SET", redis_record_key(bucket, id), Jason.encode!(value)],
+          ["SADD", redis_index_key(bucket), id]
+        ]
+      end)
+
+    delete_commands ++ upsert_commands
+  end
+
+  defp counter_commands(state) do
+    Enum.map(@redis_counters, fn counter ->
+      ["SET", redis_counter_key(counter), to_s(Map.get(state, counter, @default_state[counter]))]
+    end)
+  end
+
+  defp run_redis_pipeline([]), do: :ok
+
+  defp run_redis_pipeline(commands) do
+    case Redix.pipeline(OpenChat.Redis, commands) do
+      {:ok, _results} -> :ok
+      {:error, reason} -> Logger.warning("Redis pipeline failed: #{inspect(reason)}")
+    end
+  end
+
+  defp redis_set_members(key) do
+    case redis_command(["SMEMBERS", key]) do
+      {:ok, ids} -> ids
+      _ -> []
+    end
+  end
+
+  defp redis_command(args), do: Redix.command(OpenChat.Redis, args)
+
+  defp redis_key(parts),
+    do: [Config.redis_key_prefix() | parts] |> Enum.map(&to_s/1) |> Enum.join(":")
+
+  defp redis_meta_key, do: redis_key(["meta", "version"])
+  defp redis_index_key(bucket), do: redis_key(["index", bucket])
+  defp redis_record_key(bucket, id), do: redis_key([bucket, id])
+  defp redis_counter_key(counter), do: redis_key(["counter", counter])
 
   defp seed_state do
     users = decode_seed(Config.seed_users_json(), default_users()) |> Enum.map(&normalise_user/1)
@@ -992,6 +1128,24 @@ defmodule OpenChat.Store do
         message = Map.put(message, "data", data)
         state = Map.put(state, "next_id", id + 1)
         {:ok, message, state}
+    end
+  end
+
+  defp store_message_in_state(state, message) do
+    id_key = to_s(message["id"])
+    conv_id = message["conversationId"]
+
+    state =
+      state
+      |> put_in(["messages", id_key], message)
+      |> update_in(["conversation_messages", conv_id], fn ids -> (ids || []) ++ [id_key] end)
+
+    if parent_id = message["parentId"] || message["parentMessageId"] do
+      update_in(state, ["thread_messages", to_s(parent_id)], fn ids ->
+        (ids || []) ++ [id_key]
+      end)
+    else
+      state
     end
   end
 
@@ -1193,27 +1347,30 @@ defmodule OpenChat.Store do
     limit = clamp(to_int(params["per_page"] || params["limit"] || 30), 1, 100)
     affix = params["cursorAffix"] || params["affix"] || "prepend"
 
-    messages = Enum.sort_by(messages, &to_int(&1["sentAt"]))
+    messages =
+      Enum.sort_by(messages, fn message ->
+        {to_int(message["sentAt"]), to_int(message["id"])}
+      end)
+
     messages = if affix == "append", do: messages, else: Enum.reverse(messages)
     Enum.take(messages, limit)
   end
 
   defp previous_message_id(state, conv_id, message_id) do
     ids = Map.get(state["conversation_messages"], conv_id, [])
-    idx = Enum.find_index(ids, &(&1 == to_s(message_id))) || 0
-    Enum.at(ids, max(idx - 1, 0), "0")
+
+    case Enum.find_index(ids, &(&1 == to_s(message_id))) do
+      nil -> "0"
+      0 -> "0"
+      idx -> Enum.at(ids, idx - 1, "0")
+    end
   end
 
   defp all_conversation_ids_for_user(state, uid) do
     direct =
       state["conversation_messages"]
       |> Map.keys()
-      |> Enum.filter(fn conv_id ->
-        case String.split(conv_id, "_") do
-          ["user", a, b] -> a == uid or b == uid
-          _ -> false
-        end
-      end)
+      |> Enum.filter(&user_conversation_for?(state, uid, &1))
 
     groups =
       state["members"]
@@ -1224,11 +1381,25 @@ defmodule OpenChat.Store do
     Enum.uniq(direct ++ groups)
   end
 
+  defp user_conversation_for?(state, uid, "user_" <> _ = conv_id) do
+    case latest_conversation_message(state, conv_id) do
+      %{"sender" => sender, "receiver" => receiver} ->
+        uid in [to_s(sender), to_s(receiver)]
+
+      _ ->
+        case String.split(conv_id, "_") do
+          ["user", a, b] -> uid in [a, b]
+          _ -> false
+        end
+    end
+  end
+
+  defp user_conversation_for?(_state, _uid, _conv_id), do: false
+
   defp build_conversation(_state, _uid, nil), do: nil
 
   defp build_conversation(state, uid, conv_id) do
-    ids = Map.get(state["conversation_messages"], conv_id, [])
-    last = ids |> Enum.reverse() |> Enum.map(&state["messages"][&1]) |> Enum.find(& &1)
+    last = latest_conversation_message(state, conv_id)
 
     if is_nil(last) do
       nil
@@ -1252,6 +1423,14 @@ defmodule OpenChat.Store do
     end
   end
 
+  defp latest_conversation_message(state, conv_id) do
+    state["conversation_messages"]
+    |> Map.get(conv_id, [])
+    |> Enum.reverse()
+    |> Enum.map(&state["messages"][&1])
+    |> Enum.find(& &1)
+  end
+
   defp conversation_with(state, _uid, "group_" <> guid),
     do:
       with_members_count(
@@ -1259,10 +1438,31 @@ defmodule OpenChat.Store do
         state
       )
 
-  defp conversation_with(state, uid, "user_" <> rest) do
-    [a, b] = String.split(rest, "_", parts: 2)
-    peer = if a == uid, do: b, else: a
+  defp conversation_with(state, uid, "user_" <> _rest = conv_id) do
+    peer = user_peer_uid(state, uid, conv_id)
     public_user(state["users"][peer] || normalise_user(%{"uid" => peer}))
+  end
+
+  defp user_peer_uid(state, uid, conv_id) do
+    case latest_conversation_message(state, conv_id) do
+      %{"sender" => sender, "receiver" => receiver} ->
+        sender = to_s(sender)
+        receiver = to_s(receiver)
+
+        if sender == uid, do: receiver, else: sender
+
+      _ ->
+        fallback_user_peer_uid(uid, conv_id)
+    end
+  end
+
+  defp fallback_user_peer_uid(uid, "user_" <> rest) do
+    case String.split(rest, "_", parts: 2) do
+      [^uid, peer] -> peer
+      [peer, ^uid] -> peer
+      [_first, peer] -> peer
+      [peer] -> peer
+    end
   end
 
   defp unread_count(state, uid, conv_id) do
@@ -1289,8 +1489,7 @@ defmodule OpenChat.Store do
         }
 
       "user_" <> rest ->
-        [a, b] = String.split(rest, "_", parts: 2)
-        peer = if a == uid, do: b, else: a
+        peer = user_peer_uid(state, uid, "user_" <> rest)
 
         %{
           "entity" => public_user(state["users"][peer] || normalise_user(%{"uid" => peer})),
@@ -1331,7 +1530,9 @@ defmodule OpenChat.Store do
           []
 
         reaction_map ->
-          Enum.map(reaction_map, fn {reaction, by_uid} ->
+          reaction_map
+          |> Enum.reject(fn {_reaction, by_uid} -> map_size(by_uid) == 0 end)
+          |> Enum.map(fn {reaction, by_uid} ->
             %{
               "reaction" => reaction,
               "count" => map_size(by_uid),
@@ -1344,30 +1545,46 @@ defmodule OpenChat.Store do
     Map.put(message, "data", data)
   end
 
+  defp remove_reaction_from_state(state, id, reaction, uid) do
+    update_in(state, ["reactions", id], fn reaction_map ->
+      reaction_map = reaction_map || %{}
+      by_uid = reaction_map |> Map.get(reaction, %{}) |> Map.delete(uid)
+
+      if map_size(by_uid) == 0 do
+        Map.delete(reaction_map, reaction)
+      else
+        Map.put(reaction_map, reaction, by_uid)
+      end
+    end)
+  end
+
   defp message_action(state, actor_uid, message, action) do
-    id = state["next_id"] || Time.now_ms()
+    id = to_int(state["next_id"] || Time.now_ms())
     actor = public_user(state["users"][actor_uid] || normalise_user(%{"uid" => actor_uid}))
 
     receiver_entity =
       elem(ensure_receiver_entity(state, message["receiverType"], message["receiver"]), 1)
 
-    %{
-      "id" => id,
-      "sender" => actor_uid,
-      "receiver" => message["receiver"],
-      "receiverType" => message["receiverType"],
-      "type" => "message",
-      "category" => "action",
-      "sentAt" => Time.now(),
-      "conversationId" => message["conversationId"],
-      "data" => %{
-        "action" => action,
-        "entities" => %{
-          "by" => %{"entityType" => "user", "entity" => actor},
-          "for" => %{"entityType" => message["receiverType"], "entity" => receiver_entity},
-          "on" => %{"entityType" => "message", "entity" => message}
+    {
+      %{
+        "id" => id,
+        "sender" => actor_uid,
+        "receiver" => message["receiver"],
+        "receiverType" => message["receiverType"],
+        "type" => "message",
+        "category" => "action",
+        "sentAt" => Time.now(),
+        "conversationId" => message["conversationId"],
+        "data" => %{
+          "action" => action,
+          "entities" => %{
+            "by" => %{"entityType" => "user", "entity" => actor},
+            "for" => %{"entityType" => message["receiverType"], "entity" => receiver_entity},
+            "on" => %{"entityType" => "message", "entity" => message}
+          }
         }
-      }
+      },
+      Map.put(state, "next_id", id + 1)
     }
   end
 

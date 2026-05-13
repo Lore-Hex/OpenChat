@@ -1,0 +1,372 @@
+defmodule OpenChatWeb.ApiRegressionTest do
+  use OpenChat.HttpCase, async: false
+
+  test "auth, admin, route fallback, and CORS failures are explicit" do
+    conn = conn(:get, "/v3.0/users") |> OpenChatWeb.Endpoint.call([])
+    assert conn.status == 401
+    assert json(conn)["error"]["code"] == "ERR_NO_AUTH"
+
+    conn =
+      conn(:post, "/v3/users", Jason.encode!(%{"uid" => "mallory"}))
+      |> Plug.Conn.put_req_header("content-type", "application/json")
+      |> Plug.Conn.put_req_header("apikey", "wrong-key")
+      |> OpenChatWeb.Endpoint.call([])
+
+    assert conn.status == 403
+    assert json(conn)["error"]["code"] == "ERR_FORBIDDEN"
+
+    conn = admin_conn(:post, "/v3/admin/users/auth", %{})
+    assert conn.status == 400
+    assert json(conn)["error"]["code"] == "MISSING_PARAMETERS"
+
+    conn = conn(:get, "/v3.0/does-not-exist") |> OpenChatWeb.Endpoint.call([])
+    assert conn.status == 404
+    assert json(conn)["error"]["code"] == "ERR_ROUTE_NOT_FOUND"
+
+    conn = conn(:options, "/v3.0/users") |> OpenChatWeb.Endpoint.call([])
+    assert conn.status == 204
+    assert Plug.Conn.get_resp_header(conn, "access-control-allow-origin") == ["*"]
+  end
+
+  test "user admin and client routes support search, pagination, update, delete, and reactivation" do
+    for uid <- ["test-a", "test-b", "test-c"] do
+      assert admin_conn(:post, "/v3/users", %{"uid" => uid, "name" => "Search #{uid}"}).status ==
+               201
+    end
+
+    conn = auth_conn(:get, "/v3.0/users?search=test-&limit=2&page=2")
+    assert [%{"uid" => "test-c"}] = json(conn)["data"]
+
+    conn =
+      admin_conn(:put, "/v3/users/test-a", %{
+        "name" => "Test A Updated",
+        "metadata" => Jason.encode!(%{"avatarId" => "12"})
+      })
+
+    assert conn.status == 200
+    assert json(conn)["data"]["metadata"] == %{"avatarId" => "12"}
+
+    conn = auth_conn(:get, "/v3.0/users/test-a")
+    assert json(conn)["data"]["name"] == "Test A Updated"
+
+    assert admin_conn(:delete, "/v3/users/test-a").status == 200
+    assert admin_conn(:put, "/v3/users", %{"uidsToActivate" => ["test-a"]}).status == 200
+
+    conn = auth_conn(:get, "/v3.0/users/test-a")
+    assert json(conn)["data"]["status"] == "available"
+  end
+
+  test "group APIs enforce join rules, scope filters, and admin-only single member mutations" do
+    assert admin_conn(:post, "/v3/groups", %{
+             "guid" => "api-private",
+             "type" => "private"
+           }).status == 201
+
+    conn = auth_conn(:post, "/v3.0/groups/api-private/members", %{}, "uid:alice")
+    assert conn.status == 400
+    assert json(conn)["error"]["code"] == "ERR_FORBIDDEN"
+
+    assert admin_conn(:post, "/v3/groups", %{
+             "guid" => "api-password",
+             "type" => "password",
+             "password" => "secret"
+           }).status == 201
+
+    conn = auth_conn(:post, "/v3.0/groups/api-password/members", %{"password" => "wrong"})
+    assert conn.status == 400
+    assert json(conn)["error"]["code"] == "INVALID_PASSWORD"
+
+    conn = auth_conn(:post, "/v3.0/groups/api-password/members", %{"password" => "secret"})
+    assert conn.status == 200
+    assert json(conn)["data"]["hasJoined"] == true
+
+    assert admin_conn(:post, "/v3/groups", %{"guid" => "api-scopes", "type" => "public"}).status ==
+             201
+
+    assert admin_conn(:post, "/v3/groups/api-scopes/members", %{
+             "participants" => ["alice"],
+             "moderators" => ["bob"],
+             "admins" => ["carol"]
+           }).status == 200
+
+    conn = admin_conn(:get, "/v3/groups/api-scopes/members?scope=admin,moderator")
+
+    assert Enum.map(json(conn)["data"], &{&1["uid"], &1["scope"]}) == [
+             {"bob", "moderator"},
+             {"carol", "admin"}
+           ]
+
+    conn =
+      conn(:delete, "/v3/groups/api-scopes/members/bob")
+      |> OpenChatWeb.Endpoint.call([])
+
+    assert conn.status == 403
+
+    assert admin_conn(:delete, "/v3/groups/api-scopes/members/bob").status == 200
+
+    assert admin_conn(:put, "/v3/groups/api-scopes/members/bob", %{"scope" => "moderator"}).status ==
+             200
+  end
+
+  test "message APIs cover errors, thread fetches, muid lookup, cursor metadata, and unread rewind" do
+    conn = auth_conn(:post, "/v3.0/messages", %{"receiverType" => "user"})
+    assert conn.status == 400
+    assert json(conn)["error"]["code"] == "MISSING_PARAMETERS"
+
+    parent =
+      auth_conn(:post, "/v3.0/messages", %{
+        "receiver" => "bob",
+        "receiverType" => "user",
+        "muid" => "api-muid",
+        "type" => "text",
+        "data" => %{"text" => "parent"}
+      })
+      |> json()
+      |> get_in(["data"])
+
+    reply =
+      auth_conn(
+        :post,
+        "/v3.0/messages/#{parent["id"]}/thread",
+        %{
+          "receiver" => "alice",
+          "receiverType" => "user",
+          "type" => "text",
+          "data" => %{"text" => "reply"}
+        },
+        "uid:bob"
+      )
+      |> json()
+      |> get_in(["data"])
+
+    conn = auth_conn(:get, "/v3.0/messages/#{parent["id"]}/thread", %{}, "uid:alice")
+    assert [%{"id" => reply_id}] = json(conn)["data"]
+    assert reply_id == reply["id"]
+
+    conn = auth_conn(:get, "/v3.0/user/messages/api-muid")
+    assert json(conn)["data"]["id"] == parent["id"]
+
+    conn = auth_conn(:get, "/v3.0/users/alice/messages?limit=1", %{}, "uid:bob")
+    assert [%{"id" => fetched_id}] = json(conn)["data"]
+    assert fetched_id == reply["id"]
+    assert get_in(json(conn), ["meta", "cursor", "id"]) == reply["id"]
+
+    assert auth_conn(
+             :post,
+             "/v3.0/users/alice/conversation/read",
+             %{"messageId" => parent["id"]},
+             "uid:bob"
+           ).status == 200
+
+    conn =
+      auth_conn(
+        :delete,
+        "/v3.0/users/alice/conversation/read",
+        %{"messageId" => parent["id"]},
+        "uid:bob"
+      )
+
+    assert get_in(json(conn), ["data", "conversation", "lastReadMessageId"]) == "0"
+
+    conn = auth_conn(:get, "/v3.0/messages?receiverType=user&unread=1&count=1", %{}, "uid:bob")
+    assert [%{"entityId" => "alice", "count" => 1}] = json(conn)["data"]
+  end
+
+  test "native and extension reaction routes support list, filter, add, and remove" do
+    message =
+      auth_conn(:post, "/v3.0/messages", %{
+        "receiver" => "bob",
+        "receiverType" => "user",
+        "type" => "text",
+        "data" => %{"text" => "reactable"}
+      })
+      |> json()
+      |> get_in(["data"])
+
+    conn =
+      auth_conn(:post, "/v3.0/messages/#{message["id"]}/reactions/%F0%9F%91%8D", %{}, "uid:bob")
+
+    assert [%{"reaction" => "👍", "count" => 1}] =
+             get_in(json(conn), ["data", "data", "reactions"])
+
+    conn = auth_conn(:get, "/v3.0/messages/#{message["id"]}/reactions", %{}, "uid:bob")
+    assert [%{"uid" => "bob", "reaction" => "👍", "reactedByMe" => true}] = json(conn)["data"]
+
+    conn =
+      auth_conn(
+        :post,
+        "/v3.0/extensions/reactions/v1/react",
+        %{
+          "messageId" => message["id"],
+          "reaction" => "🔥",
+          "action" => "add"
+        },
+        "uid:carol"
+      )
+
+    assert Enum.any?(get_in(json(conn), ["data", "data", "reactions"]), &(&1["reaction"] == "🔥"))
+
+    conn =
+      auth_conn(
+        :post,
+        "/v3.0/extensions/reactions/v1/react",
+        %{
+          "messageId" => message["id"],
+          "reaction" => "🔥",
+          "action" => "remove"
+        },
+        "uid:carol"
+      )
+
+    refute Enum.any?(get_in(json(conn), ["data", "data", "reactions"]), &(&1["reaction"] == "🔥"))
+
+    conn =
+      auth_conn(:delete, "/v3.0/messages/#{message["id"]}/reactions/%F0%9F%91%8D", %{}, "uid:bob")
+
+    assert get_in(json(conn), ["data", "data", "reactions"]) == []
+  end
+
+  test "media upload route stores files, serves them, and returns 404 for missing media" do
+    old_upload_dir = Application.get_env(:open_chat, :upload_dir)
+
+    upload_dir =
+      Path.join(System.tmp_dir!(), "open-chat-api-test-#{System.unique_integer([:positive])}")
+
+    source_path =
+      Path.join(
+        System.tmp_dir!(),
+        "open-chat-api-source-#{System.unique_integer([:positive])}.txt"
+      )
+
+    File.mkdir_p!(upload_dir)
+    File.write!(source_path, "uploaded text")
+    Application.put_env(:open_chat, :upload_dir, upload_dir)
+
+    on_exit(fn ->
+      Application.put_env(:open_chat, :upload_dir, old_upload_dir)
+      File.rm_rf!(upload_dir)
+      File.rm(source_path)
+    end)
+
+    conn =
+      conn(:post, "/v3.0/messages", %{
+        "receiver" => "bob",
+        "receiverType" => "user",
+        "caption" => "uploaded caption",
+        "file" => %Plug.Upload{
+          path: source_path,
+          filename: "note.txt",
+          content_type: "text/plain"
+        }
+      })
+      |> Plug.Conn.put_req_header("authtoken", "uid:alice")
+      |> OpenChatWeb.Endpoint.call([])
+
+    assert conn.status == 201
+    attachment = json(conn)["data"]["data"]["attachments"] |> List.first()
+    assert attachment["mimeType"] == "text/plain"
+    assert attachment["url"] =~ ~r(^/media/)
+
+    media_path = URI.parse(attachment["url"]).path
+    conn = conn(:get, "/v3.0#{media_path}") |> OpenChatWeb.Endpoint.call([])
+    assert conn.status == 200
+    assert conn.resp_body == "uploaded text"
+
+    conn = conn(:get, "/v3.0/media/missing.txt") |> OpenChatWeb.Endpoint.call([])
+    assert conn.status == 404
+    assert json(conn)["error"]["code"] == "ERR_MEDIA_NOT_FOUND"
+  end
+
+  test "settings, JWT, user sessions, and logout token revocation routes work together" do
+    conn = conn(:get, "/v3.0/settings") |> OpenChatWeb.Endpoint.call([])
+    assert conn.status == 200
+    assert get_in(json(conn), ["data", "CHAT_API_VERSION"]) == "v3.0"
+
+    token =
+      admin_conn(:post, "/v3/users/session-user/auth_tokens")
+      |> json()
+      |> get_in(["data", "authToken"])
+
+    conn = auth_conn(:post, "/v3.0/me/jwt", %{}, token)
+    assert conn.status == 200
+    jwt = json(conn)["data"]["jwt"]
+
+    conn = auth_conn(:get, "/v3.0/me", %{}, jwt)
+    assert json(conn)["data"]["uid"] == "session-user"
+
+    conn = auth_conn(:post, "/v3.0/user_sessions", %{"deviceId" => "ios-1"}, token)
+    assert json(conn)["data"]["uid"] == "session-user"
+    assert json(conn)["data"]["sessionId"] == "ios-1"
+
+    assert auth_conn(:delete, "/v3.0/me", %{}, token).status == 200
+
+    conn = auth_conn(:get, "/v3.0/me", %{}, token)
+    assert conn.status == 401
+    assert json(conn)["error"]["code"] == "ERR_NO_AUTH"
+  end
+
+  test "group search, banned-user search, block directions, and delivered routes return SDK shapes" do
+    for guid <- ["api-list-a", "api-list-b", "api-other"] do
+      assert admin_conn(:post, "/v3/groups", %{"guid" => guid, "name" => guid}).status == 201
+    end
+
+    conn = auth_conn(:get, "/v3.0/groups?search=api-list&limit=1&page=2")
+    assert [%{"guid" => "api-list-b"}] = json(conn)["data"]
+
+    assert admin_conn(:post, "/v3/groups/api-list-a/bannedusers/bob").status == 200
+    assert admin_conn(:post, "/v3/groups/api-list-a/bannedusers/carol").status == 200
+
+    conn = admin_conn(:get, "/v3/groups/api-list-a/bannedusers?search=bo")
+    assert [%{"uid" => "bob"}] = json(conn)["data"]
+
+    assert auth_conn(:post, "/v3.0/blockedusers", %{"blockedUids" => ["bob"]}, "uid:alice").status ==
+             200
+
+    assert auth_conn(:post, "/v3.0/blockedusers", %{"blockedUids" => ["alice"]}, "uid:bob").status ==
+             200
+
+    conn = auth_conn(:get, "/v3.0/blockedusers?direction=hasBlockedMe", %{}, "uid:alice")
+    assert [%{"uid" => "bob", "hasBlockedMe" => true}] = json(conn)["data"]
+
+    assert auth_conn(:post, "/v3.0/users/bob/conversation/delivered", %{}, "uid:alice").status ==
+             200
+
+    assert auth_conn(:post, "/v3.0/groups/api-list-a/conversation/delivered", %{}, "uid:alice").status ==
+             200
+
+    assert auth_conn(:delete, "/v3.0/users/bob/conversation", %{}, "uid:alice").status == 200
+
+    assert auth_conn(:delete, "/v3.0/groups/api-list-a/conversation", %{}, "uid:alice").status ==
+             200
+  end
+
+  test "missing message and extension parameter paths return explicit API errors" do
+    conn = auth_conn(:get, "/v3.0/messages/404")
+    assert conn.status == 404
+    assert json(conn)["error"]["code"] == "ERR_MESSAGE_NOT_FOUND"
+
+    conn = auth_conn(:get, "/v3.0/user/messages/not-a-muid")
+    assert conn.status == 404
+    assert json(conn)["error"]["code"] == "ERR_MESSAGE_NOT_FOUND"
+
+    conn = auth_conn(:put, "/v3.0/messages/404", %{"data" => %{"text" => "nope"}})
+    assert conn.status == 400
+    assert json(conn)["error"]["code"] == "ERR_MESSAGE_NOT_FOUND"
+
+    conn = auth_conn(:delete, "/v3.0/messages/404")
+    assert conn.status == 400
+    assert json(conn)["error"]["code"] == "ERR_MESSAGE_NOT_FOUND"
+
+    conn = auth_conn(:post, "/v3.0/messages/404/reactions/%F0%9F%91%8D")
+    assert conn.status == 400
+    assert json(conn)["error"]["code"] == "ERR_MESSAGE_NOT_FOUND"
+
+    conn = auth_conn(:post, "/v3.0/extensions/reactions/v1/react", %{"reaction" => "👍"})
+    assert conn.status == 400
+    assert json(conn)["error"]["details"] == %{"parameter" => "messageId"}
+
+    conn = auth_conn(:post, "/v3.0/extensions/reactions/v1/react", %{"messageId" => "1"})
+    assert conn.status == 400
+    assert json(conn)["error"]["details"] == %{"parameter" => "reaction"}
+  end
+end

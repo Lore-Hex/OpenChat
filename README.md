@@ -134,8 +134,9 @@ For a literal zero-code swizzle, deploy TLS and DNS so the SDK's existing CometC
 | `COMETCHAT_API_KEY` | `local-api-key` | Optional admin API key if you choose to enforce it |
 | `COMETCHAT_REGION` | `us` | Region returned to SDK settings |
 | `EXTENSION_DOMAIN` | `PUBLIC_HOST` | Extension domain used by `callExtension` URL generation |
-| `REDIS_URL` | unset | Optional Redis URL for durable whole-state snapshots |
-| `REDIS_SNAPSHOT_KEY` | `open_chat:snapshot:v1` | Redis key used for the JSON snapshot |
+| `REDIS_URL` | unset | Optional Redis URL for durable per-record storage |
+| `REDIS_KEY_PREFIX` | `open_chat` | Redis namespace prefix for record keys, indexes, and counters |
+| `REDIS_SNAPSHOT_KEY` | `open_chat:snapshot:v1` | Legacy import key for older single-snapshot deployments |
 | `SEED_USERS_JSON` | built-in Alice/Bob/Carol | Initial users. List or map. Users may include `authToken`. |
 | `SEED_GROUPS_JSON` | built-in public `lobby` | Initial groups. List or map. |
 | `ACCEPT_UID_TOKENS` | `true` | Accept `uid:<uid>` tokens for local/dev and contract tests |
@@ -144,9 +145,25 @@ For a literal zero-code swizzle, deploy TLS and DNS so the SDK's existing CometC
 
 ## Persistence strategy
 
-By default all state is in one OTP GenServer. If `REDIS_URL` is set, each mutation snapshots the entire state to Redis as JSON. This keeps the implementation minimal and durable enough for small/medium workloads or a first AGPL release.
+By default all state is in one OTP GenServer. If `REDIS_URL` is set, each mutation is also persisted into Redis as per-record keys under `REDIS_KEY_PREFIX`:
 
-For high-scale production, evolve the storage behavior into normalized Redis keys or Postgres tables, but preserve the same route/test contract.
+- `open_chat:users:<uid>`
+- `open_chat:tokens:<authToken>`
+- `open_chat:groups:<guid>`
+- `open_chat:members:<guid>`
+- `open_chat:messages:<messageId>`
+- `open_chat:conversation_messages:<conversationId>`
+- `open_chat:thread_messages:<parentMessageId>`
+- `open_chat:reads:<uid>`
+- `open_chat:reactions:<messageId>`
+- `open_chat:blocks:<uid>`
+- `open_chat:banned:<guid>`
+- `open_chat:counter:<counterName>`
+- `open_chat:index:<bucket>` sets for reloadable key discovery
+
+On startup, OpenChat reloads state from those Redis keys. If no per-key namespace has been initialized but `REDIS_SNAPSHOT_KEY` exists, OpenChat imports that legacy JSON snapshot into the per-key layout.
+
+For high-scale production, evolve this into operation-specific writes or Postgres tables, but preserve the same route/test contract.
 
 ## AWS deployment sketch
 
@@ -155,7 +172,7 @@ Use one of these patterns:
 1. **ECS/Fargate + ALB + ElastiCache Redis**
    - ALB terminates TLS for `chat.example.com` and, if using `callExtension`, `*.chat.example.com`.
    - ALB forwards HTTP and WebSocket upgrades to the service on `PORT=4000`.
-   - ElastiCache Redis set as `REDIS_URL` for durable snapshots.
+  - ElastiCache Redis set as `REDIS_URL` for durable per-record storage.
 
 2. **EC2/ASG + Caddy/Nginx + Redis**
    - Caddy/Nginx terminates TLS and proxies `/v3.0/*`, `/media/*`, and `/` WebSocket traffic to the BEAM app.

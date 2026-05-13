@@ -12,7 +12,7 @@
 - ACM certificate:
   - `chat.example.com`
   - Optional `*.chat.example.com`
-- ElastiCache Redis if durable snapshots are desired.
+- ElastiCache Redis if durable per-record storage is desired.
 
 ## Environment
 
@@ -25,6 +25,7 @@ COMETCHAT_API_KEY=<admin key for server-side token minting>
 COMETCHAT_REGION=us
 EXTENSION_DOMAIN=chat.example.com
 REDIS_URL=redis://<elasticache-primary-endpoint>:6379/0
+REDIS_KEY_PREFIX=open_chat
 UPLOAD_DIR=/app/priv/static/uploads
 PUBLIC_MEDIA_BASE_URL=https://chat.example.com
 ```
@@ -41,4 +42,4 @@ Use `GET /v3.0/settings` as a simple health check. It does not require auth.
 - Replace `uid:<uid>` development tokens with server-minted auth tokens or signed JWT verification.
 - Put AWS WAF/rate limiting in front of public endpoints.
 - Use S3/CloudFront for media files.
-- Replace the Redis whole-state snapshot with normalized Redis/Postgres storage if high concurrency or multi-region operation is needed.
+- Move from GenServer-mediated writes to operation-specific Redis commands or Postgres if high concurrency or multi-region operation is needed.

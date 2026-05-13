@@ -200,18 +200,10 @@ defmodule OpenChatWeb.ApiRouter do
   get "/groups/:guid/members" do
     with_admin_or_user(
       conn,
-      fn conn ->
-        case Store.group_members(guid, conn.query_params) do
-          {:ok, members} -> JSON.ok(conn, members)
-          {:error, e} -> JSON.error(conn, e, 404)
-        end
-      end,
+      fn conn -> group_members_response(conn, guid) end,
       fn conn ->
         with_user(conn, fn conn, _user, _token ->
-          case Store.group_members(guid, conn.query_params) do
-            {:ok, members} -> JSON.ok(conn, members)
-            {:error, e} -> JSON.error(conn, e, 404)
-          end
+          group_members_response(conn, guid)
         end)
       end
     )
@@ -220,12 +212,7 @@ defmodule OpenChatWeb.ApiRouter do
   post "/groups/:guid/members" do
     with_admin_or_user(
       conn,
-      fn conn ->
-        case Store.set_group_scopes(guid, conn.body_params || %{}) do
-          {:ok, data} -> JSON.ok(conn, data)
-          {:error, e} -> JSON.error(conn, e, 400)
-        end
-      end,
+      fn conn -> set_group_scopes_response(conn, guid) end,
       fn conn ->
         with_user(conn, fn conn, user, _token ->
           params = Map.merge(conn.body_params || %{}, conn.params || %{})
@@ -242,12 +229,7 @@ defmodule OpenChatWeb.ApiRouter do
   put "/groups/:guid/members" do
     with_admin_or_user(
       conn,
-      fn conn ->
-        case Store.set_group_scopes(guid, conn.body_params || %{}) do
-          {:ok, data} -> JSON.ok(conn, data)
-          {:error, e} -> JSON.error(conn, e, 400)
-        end
-      end,
+      fn conn -> set_group_scopes_response(conn, guid) end,
       fn conn ->
         with_user(conn, fn conn, _user, _token ->
           uids = conn.body_params["uids"] || conn.body_params["participants"] || []
@@ -270,17 +252,21 @@ defmodule OpenChatWeb.ApiRouter do
   end
 
   delete "/groups/:guid/members/:uid" do
-    {:ok, data} = Store.leave_group(guid, uid)
-    JSON.ok(conn, data)
+    with_admin_or_open(conn, fn conn ->
+      {:ok, data} = Store.leave_group(guid, uid)
+      JSON.ok(conn, data)
+    end)
   end
 
   put "/groups/:guid/members/:uid" do
-    scope = conn.body_params["scope"] || "participant"
+    with_admin_or_open(conn, fn conn ->
+      scope = conn.body_params["scope"] || "participant"
 
-    case Store.add_group_members(guid, [uid], scope) do
-      {:ok, data} -> JSON.ok(conn, data)
-      {:error, e} -> JSON.error(conn, e, 400)
-    end
+      case Store.add_group_members(guid, [uid], scope) do
+        {:ok, data} -> JSON.ok(conn, data)
+        {:error, e} -> JSON.error(conn, e, 400)
+      end
+    end)
   end
 
   get "/groups/:guid/bannedusers" do
@@ -332,11 +318,7 @@ defmodule OpenChatWeb.ApiRouter do
   post "/messages/:parent_id/thread" do
     with_user(conn, fn conn, user, _token ->
       params = conn.body_params |> Map.put("parentId", parent_id)
-
-      case Store.send_message(user["uid"], params, uploads_from_params(conn.params)) do
-        {:ok, message} -> JSON.ok(conn, message)
-        {:error, e} -> JSON.error(conn, e, 400)
-      end
+      send_message_response(conn, user["uid"], params)
     end)
   end
 
@@ -356,19 +338,13 @@ defmodule OpenChatWeb.ApiRouter do
 
   post "/messages/:message_id/reactions/:reaction" do
     with_user(conn, fn conn, user, _token ->
-      case Store.add_reaction(user["uid"], message_id, reaction) do
-        {:ok, message} -> JSON.ok(conn, message)
-        {:error, e} -> JSON.error(conn, e, 400)
-      end
+      reaction_response(conn, :add, user["uid"], message_id, reaction)
     end)
   end
 
   delete "/messages/:message_id/reactions/:reaction" do
     with_user(conn, fn conn, user, _token ->
-      case Store.remove_reaction(user["uid"], message_id, reaction) do
-        {:ok, message} -> JSON.ok(conn, message)
-        {:error, e} -> JSON.error(conn, e, 400)
-      end
+      reaction_response(conn, :remove, user["uid"], message_id, reaction)
     end)
   end
 
@@ -390,20 +366,11 @@ defmodule OpenChatWeb.ApiRouter do
       conn,
       fn conn ->
         sender_uid = conn.body_params["sender"] || conn.body_params["senderUid"] || "system"
-
-        case Store.send_message(sender_uid, conn.body_params, uploads_from_params(conn.params),
-               admin?: true
-             ) do
-          {:ok, message} -> JSON.ok(conn, message, 201)
-          {:error, e} -> JSON.error(conn, e, 400)
-        end
+        send_message_response(conn, sender_uid, conn.body_params, 201, admin?: true)
       end,
       fn conn ->
         with_user(conn, fn conn, user, _token ->
-          case Store.send_message(user["uid"], conn.body_params, uploads_from_params(conn.params)) do
-            {:ok, message} -> JSON.ok(conn, message, 201)
-            {:error, e} -> JSON.error(conn, e, 400)
-          end
+          send_message_response(conn, user["uid"], conn.body_params, 201)
         end)
       end
     )
@@ -537,23 +504,49 @@ defmodule OpenChatWeb.ApiRouter do
   end
 
   defp mark_conversation_read(conn, receiver_type, receiver_id) do
+    mark_conversation_receipt(conn, receiver_type, receiver_id, &Store.mark_read/4)
+  end
+
+  defp mark_conversation_unread(conn, receiver_type, receiver_id) do
+    mark_conversation_receipt(conn, receiver_type, receiver_id, &Store.mark_unread/4)
+  end
+
+  defp mark_conversation_receipt(conn, receiver_type, receiver_id, marker) do
     with_user(conn, fn conn, user, _token ->
       message_id =
         conn.body_params["messageId"] || conn.body_params["id"] || conn.params["messageId"] || "0"
 
-      {:ok, data} = Store.mark_read(user["uid"], receiver_type, receiver_id, message_id)
+      {:ok, data} = marker.(user["uid"], receiver_type, receiver_id, message_id)
       JSON.ok(conn, data)
     end)
   end
 
-  defp mark_conversation_unread(conn, receiver_type, receiver_id) do
-    with_user(conn, fn conn, user, _token ->
-      message_id =
-        conn.body_params["messageId"] || conn.body_params["id"] || conn.params["messageId"] || "0"
+  defp group_members_response(conn, guid) do
+    store_response(conn, Store.group_members(guid, conn.query_params), 200, 404)
+  end
 
-      {:ok, data} = Store.mark_unread(user["uid"], receiver_type, receiver_id, message_id)
-      JSON.ok(conn, data)
-    end)
+  defp set_group_scopes_response(conn, guid) do
+    store_response(conn, Store.set_group_scopes(guid, conn.body_params || %{}))
+  end
+
+  defp send_message_response(conn, sender_uid, params, status \\ 200, opts \\ []) do
+    result = Store.send_message(sender_uid, params, uploads_from_params(conn.params), opts)
+    store_response(conn, result, status)
+  end
+
+  defp reaction_response(conn, :add, uid, message_id, reaction) do
+    store_response(conn, Store.add_reaction(uid, message_id, reaction))
+  end
+
+  defp reaction_response(conn, :remove, uid, message_id, reaction) do
+    store_response(conn, Store.remove_reaction(uid, message_id, reaction))
+  end
+
+  defp store_response(conn, result, success_status \\ 200, error_status \\ 400) do
+    case result do
+      {:ok, data} -> JSON.ok(conn, data, success_status)
+      {:error, error} -> JSON.error(conn, error, error_status)
+    end
   end
 
   defp handle_extension(conn, _name, _path) do
@@ -571,16 +564,10 @@ defmodule OpenChatWeb.ApiRouter do
           JSON.error(conn, Errors.missing("reaction"), 400)
 
         action in ["delete", "remove", "removed", "unreact"] ->
-          case Store.remove_reaction(user["uid"], message_id, reaction) do
-            {:ok, message} -> JSON.ok(conn, message)
-            {:error, e} -> JSON.error(conn, e, 400)
-          end
+          reaction_response(conn, :remove, user["uid"], message_id, reaction)
 
         true ->
-          case Store.add_reaction(user["uid"], message_id, reaction) do
-            {:ok, message} -> JSON.ok(conn, message)
-            {:error, e} -> JSON.error(conn, e, 400)
-          end
+          reaction_response(conn, :add, user["uid"], message_id, reaction)
       end
     end)
   end
@@ -633,7 +620,17 @@ defmodule OpenChatWeb.ApiRouter do
   end
 
   defp auth_token(conn),
-    do: header(conn, "authtoken") || header(conn, "authToken") || conn.params["authToken"]
+    do:
+      header(conn, "authtoken") || header(conn, "authToken") || bearer_token(conn) ||
+        conn.params["authToken"]
+
+  defp bearer_token(conn) do
+    case header(conn, "authorization") do
+      "Bearer " <> token -> token
+      "bearer " <> token -> token
+      _other -> nil
+    end
+  end
 
   defp header(conn, key), do: conn |> get_req_header(String.downcase(key)) |> List.first()
 
