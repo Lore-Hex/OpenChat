@@ -182,7 +182,7 @@ REDIS_URL=redis://<elasticache-endpoint>:6379/0
 
 ### Load and performance tests
 
-Load tests are excluded from the default `mix test` suite. Run them explicitly:
+Load tests are excluded from the default `mix test` suite. They include sequential baselines and concurrent Store, Plug HTTP, Redis write-through, and receipt fanout pressure. Run them explicitly:
 
 ```bash
 mix test.load
@@ -198,10 +198,21 @@ Useful knobs:
 | `OPENCHAT_LOAD_GROUP_MESSAGES` | `600` | Group messages |
 | `OPENCHAT_LOAD_HTTP_MESSAGES` | `500` | Plug HTTP message sends |
 | `OPENCHAT_LOAD_REDIS_MESSAGES` | `300` | Redis-backed message sends |
+| `OPENCHAT_LOAD_CONCURRENCY` | `16` | Concurrent Store writer tasks |
+| `OPENCHAT_LOAD_WORKER_MESSAGES` | `150` | Messages per concurrent Store writer |
+| `OPENCHAT_LOAD_HTTP_CONCURRENCY` | `12` | Concurrent Plug HTTP writer tasks |
+| `OPENCHAT_LOAD_HTTP_WORKER_MESSAGES` | `50` | Messages per concurrent HTTP writer |
+| `OPENCHAT_LOAD_REDIS_CONCURRENCY` | `8` | Concurrent Redis-backed writer tasks |
+| `OPENCHAT_LOAD_REDIS_WORKER_MESSAGES` | `60` | Messages per concurrent Redis writer |
+| `OPENCHAT_LOAD_RECEIPT_CONCURRENCY` | `16` | Concurrent receipt writer tasks |
 | `OPENCHAT_MIN_STORE_MSG_PER_SEC` | `300` | Minimum direct Store throughput |
 | `OPENCHAT_MIN_GROUP_MSG_PER_SEC` | `100` | Minimum group-message throughput |
 | `OPENCHAT_MIN_HTTP_MSG_PER_SEC` | `100` | Minimum Plug HTTP throughput |
 | `OPENCHAT_MIN_REDIS_MSG_PER_SEC` | `20` | Minimum Redis-backed throughput |
+| `OPENCHAT_MIN_CONCURRENT_STORE_MSG_PER_SEC` | `200` | Minimum concurrent Store throughput |
+| `OPENCHAT_MIN_CONCURRENT_HTTP_MSG_PER_SEC` | `100` | Minimum concurrent Plug HTTP throughput |
+| `OPENCHAT_MIN_CONCURRENT_REDIS_MSG_PER_SEC` | `20` | Minimum concurrent Redis throughput |
+| `OPENCHAT_MIN_RECEIPT_PER_SEC` | `100` | Minimum concurrent receipt throughput |
 | `REDIS_TEST_URL` | `redis://localhost:6379/15` | Redis URL for Redis load/persistence tests |
 
 ### Playwright contract tests against the real SDK

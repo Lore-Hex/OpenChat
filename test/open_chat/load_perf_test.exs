@@ -52,6 +52,34 @@ defmodule OpenChat.LoadPerfTest do
     assert {:ok, [_ | _]} = Store.conversations(load_user(1, users), %{"limit" => 50})
   end
 
+  test "concurrent Store writers preserve monotonic IDs under same-conversation contention" do
+    concurrency = env_int("OPENCHAT_LOAD_CONCURRENCY", 16)
+    per_worker = env_int("OPENCHAT_LOAD_WORKER_MESSAGES", 150)
+    total = concurrency * per_worker
+    minimum = env_int("OPENCHAT_MIN_CONCURRENT_STORE_MSG_PER_SEC", 200)
+
+    {ids, seconds} =
+      timed(fn ->
+        concurrent_map(1..total, concurrency, fn i ->
+          assert {:ok, message} =
+                   Store.send_message("concurrent-store-a", %{
+                     "receiver" => "concurrent-store-b",
+                     "receiverType" => "user",
+                     "type" => "text",
+                     "data" => %{"text" => "concurrent store #{i}"}
+                   })
+
+          message["id"]
+        end)
+      end)
+
+    assert length(ids) == total
+    assert ids |> MapSet.new() |> MapSet.size() == total
+    assert Enum.min(ids) == 1
+    assert Enum.max(ids) == total
+    assert_rate("concurrent store messages", total, seconds, minimum)
+  end
+
   test "group fanout plus read and delivered receipts keep conversation cursors stable" do
     members = env_int("OPENCHAT_LOAD_GROUP_MEMBERS", 150)
     messages = env_int("OPENCHAT_LOAD_GROUP_MESSAGES", 600)
@@ -82,10 +110,23 @@ defmodule OpenChat.LoadPerfTest do
     assert_rate("group messages", messages, seconds, minimum)
     last_id = List.last(sent)["id"]
 
-    Enum.each(Enum.take(uids, min(members, 100)), fn uid ->
-      assert {:ok, _receipt} = Store.mark_delivered(uid, "group", guid, last_id)
-      assert {:ok, _receipt} = Store.mark_read(uid, "group", guid, last_id)
-    end)
+    receipt_users = Enum.take(uids, min(members, 100))
+
+    {_receipts, receipt_seconds} =
+      timed(fn ->
+        concurrent_map(receipt_users, env_int("OPENCHAT_LOAD_RECEIPT_CONCURRENCY", 16), fn uid ->
+          assert {:ok, delivered} = Store.mark_delivered(uid, "group", guid, last_id)
+          assert {:ok, read} = Store.mark_read(uid, "group", guid, last_id)
+          {delivered, read}
+        end)
+      end)
+
+    assert_rate(
+      "group receipt writes",
+      length(receipt_users) * 2,
+      receipt_seconds,
+      env_int("OPENCHAT_MIN_RECEIPT_PER_SEC", 100)
+    )
 
     assert {:ok, conversation} = Store.conversation(List.first(uids), "group", guid)
     assert conversation["lastDeliveredMessageId"] == to_string(last_id)
@@ -128,6 +169,38 @@ defmodule OpenChat.LoadPerfTest do
     assert %{"data" => [_ | _]} = Jason.decode!(response.resp_body)
   end
 
+  test "concurrent HTTP endpoint load preserves unique message IDs" do
+    concurrency = env_int("OPENCHAT_LOAD_HTTP_CONCURRENCY", 12)
+    per_worker = env_int("OPENCHAT_LOAD_HTTP_WORKER_MESSAGES", 50)
+    total = concurrency * per_worker
+    minimum = env_int("OPENCHAT_MIN_CONCURRENT_HTTP_MSG_PER_SEC", 100)
+
+    {ids, seconds} =
+      timed(fn ->
+        concurrent_map(1..total, concurrency, fn i ->
+          body = %{
+            "receiver" => "http-concurrent-b",
+            "receiverType" => "user",
+            "type" => "text",
+            "data" => %{"text" => "http concurrent #{i}"}
+          }
+
+          response =
+            conn(:post, "/v3.0/messages", Jason.encode!(body))
+            |> Plug.Conn.put_req_header("content-type", "application/json")
+            |> Plug.Conn.put_req_header("authtoken", "uid:http-concurrent-a")
+            |> Endpoint.call([])
+
+          assert response.status == 201
+          get_in(Jason.decode!(response.resp_body), ["data", "id"])
+        end)
+      end)
+
+    assert length(ids) == total
+    assert ids |> MapSet.new() |> MapSet.size() == total
+    assert_rate("concurrent HTTP messages", total, seconds, minimum)
+  end
+
   test "Redis write-through load uses scoped refresh and monotonic counters" do
     with_redis(fn context ->
       messages = env_int("OPENCHAT_LOAD_REDIS_MESSAGES", 300)
@@ -157,6 +230,41 @@ defmodule OpenChat.LoadPerfTest do
       assert Enum.min(ids) >= 10
       assert redis_get(context, "counter", "next_id") == to_string(Enum.max(ids) + 1)
       assert_rate("Redis messages", messages, seconds, minimum)
+    end)
+  end
+
+  test "concurrent Redis write-through load preserves counters and per-key indexes" do
+    with_redis(fn context ->
+      concurrency = env_int("OPENCHAT_LOAD_REDIS_CONCURRENCY", 8)
+      per_worker = env_int("OPENCHAT_LOAD_REDIS_WORKER_MESSAGES", 60)
+      total = concurrency * per_worker
+      minimum = env_int("OPENCHAT_MIN_CONCURRENT_REDIS_MSG_PER_SEC", 20)
+
+      Redix.command!(context.redis, ["SET", redis_key(context, "counter", "next_id"), "100"])
+
+      {ids, seconds} =
+        timed(fn ->
+          concurrent_map(1..total, concurrency, fn i ->
+            lane = rem(i, concurrency)
+
+            assert {:ok, message} =
+                     Store.send_message("redis-concurrent-#{lane}-a", %{
+                       "receiver" => "redis-concurrent-#{lane}-b",
+                       "receiverType" => "user",
+                       "type" => "text",
+                       "data" => %{"text" => "redis concurrent #{i}"}
+                     })
+
+            message["id"]
+          end)
+        end)
+
+      assert length(ids) == total
+      assert ids |> MapSet.new() |> MapSet.size() == total
+      assert Enum.min(ids) >= 100
+      assert redis_get(context, "counter", "next_id") == to_string(Enum.max(ids) + 1)
+      assert length(redis_members(context, "index", "messages")) == total
+      assert_rate("concurrent Redis messages", total, seconds, minimum)
     end)
   end
 
@@ -201,6 +309,22 @@ defmodule OpenChat.LoadPerfTest do
     per_second = count / max(seconds, 0.001)
     IO.puts("#{label}: #{Float.round(per_second, 1)}/s over #{count} ops")
     assert per_second >= minimum
+  end
+
+  defp concurrent_map(inputs, concurrency, fun) do
+    inputs
+    |> Task.async_stream(fun,
+      max_concurrency: concurrency,
+      ordered: false,
+      timeout: :infinity
+    )
+    |> Enum.map(fn
+      {:ok, value} ->
+        value
+
+      {:exit, reason} ->
+        flunk("concurrent load task failed: #{Exception.format_exit(reason)}")
+    end)
   end
 
   defp env_int(name, default) do
@@ -257,6 +381,13 @@ defmodule OpenChat.LoadPerfTest do
     {:ok, value} = Redix.command(context.redis, ["GET", key])
     value
   end
+
+  defp redis_members(context, parts) when is_list(parts) do
+    {:ok, members} = Redix.command(context.redis, ["SMEMBERS", redis_key(context, parts)])
+    members
+  end
+
+  defp redis_members(context, part_a, part_b), do: redis_members(context, [part_a, part_b])
 
   defp redis_key(context, parts) when is_list(parts), do: Enum.join([context.prefix | parts], ":")
   defp redis_key(context, part_a, part_b), do: redis_key(context, [part_a, part_b])
