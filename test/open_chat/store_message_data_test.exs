@@ -1,0 +1,120 @@
+defmodule OpenChat.StoreMessageDataTest do
+  use ExUnit.Case, async: false
+
+  alias OpenChat.Store.MessageData
+
+  test "infer_type follows custom, upload, url, and text precedence" do
+    assert MessageData.infer_type(%{"category" => "custom"}, []) == "custom"
+    assert MessageData.infer_type(%{"category" => "custom", "type" => "poll"}, []) == "poll"
+    assert MessageData.infer_type(%{"data" => ~s({"customData":{"kind":"poll"}})}, []) == "custom"
+    assert MessageData.infer_type(%{"data" => %{"url" => "/media/a.png"}}, []) == "file"
+    assert MessageData.infer_type(%{"type" => "image"}, [%{}]) == "image"
+    assert MessageData.infer_type(%{"data" => %{"text" => "hi"}}, []) == "text"
+  end
+
+  test "normalise merges top-level compatibility fields without replacing explicit data" do
+    assert {:ok, data} =
+             MessageData.normalise(
+               %{
+                 "data" => %{
+                   text: "from data",
+                   metadata: %{existing: true}
+                 },
+                 "text" => "from top",
+                 "caption" => "caption",
+                 "metadata" => ~s({"from":"top"}),
+                 "customData" => %{kind: "notice"}
+               },
+               []
+             )
+
+    assert data["text"] == "from data"
+    assert data["metadata"] == %{"existing" => true}
+    assert data["customData"] == %{"kind" => "notice"}
+  end
+
+  test "normalise uses caption and metadata aliases when data omits them" do
+    assert {:ok, data} =
+             MessageData.normalise(
+               %{
+                 "data" => %{},
+                 "caption" => "photo caption",
+                 "metadata" => ~s({"album":"summer"})
+               },
+               []
+             )
+
+    assert data == %{"text" => "photo caption", "metadata" => %{"album" => "summer"}}
+  end
+
+  test "normalise persists uploads and returns stable attachment fields" do
+    previous_upload_dir = Application.get_env(:open_chat, :upload_dir)
+    upload_dir = Path.join(System.tmp_dir!(), "openchat-message-data-#{System.unique_integer()}")
+    source = Path.join(System.tmp_dir!(), "openchat-source-#{System.unique_integer()}.txt")
+
+    File.write!(source, "hello")
+    Application.put_env(:open_chat, :upload_dir, upload_dir)
+
+    try do
+      assert {:ok, data} =
+               MessageData.normalise(
+                 %{"data" => %{}, "text" => "with upload"},
+                 [
+                   %Plug.Upload{
+                     path: source,
+                     filename: "../unsafe file.txt",
+                     content_type: "text/plain; charset=utf-8"
+                   }
+                 ]
+               )
+
+      assert data["text"] == "with upload"
+
+      assert [%{"name" => "unsafe_file.txt", "mimeType" => "text/plain"} = attachment] =
+               data["attachments"]
+
+      assert data["url"] == attachment["url"]
+      assert File.exists?(Path.join(upload_dir, Path.basename(attachment["url"])))
+    after
+      if previous_upload_dir,
+        do: Application.put_env(:open_chat, :upload_dir, previous_upload_dir),
+        else: Application.delete_env(:open_chat, :upload_dir)
+
+      File.rm_rf(upload_dir)
+      File.rm(source)
+    end
+  end
+
+  test "normalise returns upload validation errors" do
+    assert {:error, %{"code" => "INVALID_FILE"}} =
+             MessageData.normalise(%{"data" => %{}}, [%{"not" => "an upload"}])
+  end
+
+  test "merge accepts nested data wrappers, bare maps, and scalar no-ops" do
+    old = %{"text" => "old", "metadata" => %{"a" => 1}}
+
+    assert MessageData.merge(old, %{"data" => %{text: "new"}}) == %{
+             "text" => "new",
+             "metadata" => %{"a" => 1}
+           }
+
+    assert MessageData.merge(old, %{metadata: %{b: 2}}) == %{
+             "text" => "old",
+             "metadata" => %{"b" => 2}
+           }
+
+    assert MessageData.merge(old, "ignore") == old
+  end
+
+  test "put_entity adds and updates entity slots without dropping existing entries" do
+    data =
+      %{"entities" => %{"sender" => %{"entityType" => "user", "entity" => %{"uid" => "alice"}}}}
+      |> MessageData.put_entity("receiver", "group", %{"guid" => "room"})
+      |> MessageData.put_entity("sender", "user", %{"uid" => "bob"})
+
+    assert data["entities"] == %{
+             "sender" => %{"entityType" => "user", "entity" => %{"uid" => "bob"}},
+             "receiver" => %{"entityType" => "group", "entity" => %{"guid" => "room"}}
+           }
+  end
+end

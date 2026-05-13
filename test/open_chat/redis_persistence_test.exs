@@ -141,6 +141,39 @@ defmodule OpenChat.RedisPersistenceTest do
     end)
   end
 
+  test "redis no-op writes do not bump revisions", context do
+    with_redis(context, fn ->
+      before_revision = redis_get(context, "meta", "revision")
+
+      assert :ok = RedisPersistence.write([])
+      assert redis_get(context, "meta", "revision") == before_revision
+    end)
+  end
+
+  test "redis atomic counter writes never move counters backwards", context do
+    with_redis(context, fn ->
+      Redix.command!(context.redis, ["SET", redis_key(context, "counter", "next_id"), "1000"])
+      before_revision = redis_get(context, "meta", "revision") |> to_int()
+
+      assert :ok =
+               RedisPersistence.write([
+                 RedisPersistence.counter("next_id", 10),
+                 RedisPersistence.put("users", "counter-atomic-user", %{
+                   "uid" => "counter-atomic-user"
+                 })
+               ])
+
+      assert redis_get(context, "counter", "next_id") == "1000"
+
+      assert redis_json(context, "users", "counter-atomic-user") == %{
+               "uid" => "counter-atomic-user"
+             }
+
+      assert "counter-atomic-user" in redis_members(context, "index", "users")
+      assert redis_get(context, "meta", "revision") |> to_int() == before_revision + 1
+    end)
+  end
+
   test "auth token lookups refresh mapped users without stale writeback", context do
     with_redis(context, fn ->
       assert {:ok, _user} =
@@ -1025,6 +1058,51 @@ defmodule OpenChat.RedisPersistenceTest do
 
         assert {:ok, [%{"entityId" => "peer-race-a", "count" => 20}]} =
                  Store.call_on(peer, {:unread_counts, "peer-race-b", %{}})
+      after
+        stop_peer_store(peer)
+      end
+    end)
+  end
+
+  test "concurrent peer Store group member writes keep member and user indexes consistent",
+       context do
+    with_redis(context, fn ->
+      peer = start_peer_store!()
+
+      try do
+        guid = "peer-members-room"
+        uids = Enum.map(1..24, &"peer-member-#{&1}")
+
+        assert {:ok, _group} = Store.upsert_group(%{"guid" => guid, "type" => "public"})
+
+        results =
+          uids
+          |> Task.async_stream(
+            fn uid ->
+              if String.ends_with?(uid, ["1", "3", "5", "7", "9"]) do
+                Store.call_on(peer, {:add_group_members, guid, [uid], "participant", []})
+              else
+                Store.add_group_members(guid, [uid], "participant")
+              end
+            end,
+            max_concurrency: 10,
+            ordered: false,
+            timeout: :infinity
+          )
+          |> Enum.map(fn {:ok, result} -> result end)
+
+        assert Enum.all?(results, fn {:ok, %{"success" => by_uid}} ->
+                 Enum.all?(by_uid, fn {_uid, row} -> row["success"] == true end)
+               end)
+
+        assert redis_json(context, "members", guid) |> Map.keys() |> Enum.sort() ==
+                 Enum.sort(uids)
+
+        for uid <- uids do
+          assert redis_json(context, "user_groups", uid) == [guid]
+          assert {:ok, [%{"guid" => ^guid}]} = Store.groups_for_user(uid)
+          assert {:ok, [%{"guid" => ^guid}]} = Store.call_on(peer, {:groups_for_user, uid})
+        end
       after
         stop_peer_store(peer)
       end
