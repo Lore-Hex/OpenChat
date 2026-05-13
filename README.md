@@ -22,7 +22,7 @@ OpenChat is a BEAM/Elixir replacement for the covered subset of CometChat. It is
 | Unread and receipt state | Unread count fetches, mark read, mark unread, delivered cursors, read cursor rewind | `GET /messages?unread=1&count=1`, `POST /users/:uid/conversation/read`, `POST /groups/:guid/conversation/read`, `DELETE /users/:uid/conversation/read`, `DELETE /groups/:guid/conversation/read`, `POST /users/:uid/conversation/delivered`, `POST /groups/:guid/conversation/delivered` | Covered by store/API/Redis tests and WebSocket receipt tests. SDK v4 can also send read/delivered receipts over WebSocket, which update receipt state. |
 | Conversations | List conversations, fetch user/group conversation, hide a conversation for the current user, delete a conversation by canonical conversation id | `GET /conversations`, `GET /users/:uid/conversation`, `GET /groups/:guid/conversation`, `DELETE /users/:uid/conversation`, `DELETE /groups/:guid/conversation`, `DELETE /conversations/:conversationId` | Covered by store/API/Redis tests and SDK conversation contract tests. |
 | Reactions | Native reaction add/remove/list/filter and `callExtension("reactions", ...)` fallback | `POST /messages/:messageId/reactions/:reaction`, `DELETE /messages/:messageId/reactions/:reaction`, `GET /messages/:messageId/reactions`, `GET /messages/:messageId/reactions/:reaction`, `MATCH /extensions/:name/*path`, `MATCH /v1/*path` | Covered by store/API tests. The real SDK extension contract is optional and requires wildcard HTTPS DNS. |
-| Media serving | Serve uploaded media files | `GET /media/:file` | Covered by API regression tests. |
+| Media serving | Serve allowlisted uploaded media files with size limits and sanitized storage names | `GET /media/:file` | Covered by API and store regression tests. |
 | WebSocket | SDK auth event, message/action/reaction broadcasts, read receipts, ping/malformed frame handling | `/`, `/ws`, `/socket` | Covered by WebSocket handler tests. |
 
 ### Partial, stubbed, or not-done APIs
@@ -99,6 +99,7 @@ For a literal zero-code swizzle, deploy TLS and DNS so the SDK's existing CometC
 | `COMETCHAT_API_KEY` | `local-api-key` outside prod, blank in prod | Admin API key for server-side routes. Blank disables admin API-key access rather than opening routes. |
 | `LOCAL_JWT_SECRET` | `COMETCHAT_API_KEY` fallback, runtime random if neither is set in prod | HMAC secret for local JWT compatibility tokens. Set this explicitly for stable multi-node deployments. |
 | `COMETCHAT_REGION` | `us` | Region returned to SDK settings |
+| `CORS_ALLOWED_ORIGINS` | `*` outside prod, empty in prod | Comma-separated browser origins allowed to call the API. Set this to your real app origins in production. |
 | `EXTENSION_DOMAIN` | `PUBLIC_HOST` | Extension domain used by `callExtension` URL generation |
 | `REDIS_URL` | unset | Optional Redis URL for durable per-record storage |
 | `REDIS_KEY_PREFIX` | `open_chat` | Redis namespace prefix for record keys, indexes, and counters |
@@ -107,6 +108,9 @@ For a literal zero-code swizzle, deploy TLS and DNS so the SDK's existing CometC
 | `SEED_GROUPS_JSON` | built-in public `lobby` | Initial groups. List or map. |
 | `ACCEPT_UID_TOKENS` | `false` outside tests | Accept `uid:<uid>` developer tokens. Enable only for local contract tests. |
 | `UPLOAD_DIR` | `priv/static/uploads` | Uploaded media storage directory |
+| `REQUEST_BODY_LIMIT` | `10000000` | Max parsed request body size in bytes |
+| `UPLOAD_MAX_BYTES` | `10000000` | Max single uploaded media file size in bytes |
+| `UPLOAD_ALLOWED_MIME_TYPES` | image/audio/video/pdf/text allowlist | Comma-separated allowlist for stored uploads |
 | `PUBLIC_MEDIA_BASE_URL` | unset | Absolute media URL base; otherwise `/media/<file>` |
 
 ## Admin moderation
@@ -166,7 +170,7 @@ When Redis is enabled, Store behaves as a local read-through/write-through cache
 - broad query paths use Redis index sets or secondary indexes rather than whole-state request refreshes: user/group lists read only their bucket indexes, unread and conversation lists read `user_conversations`/`user_groups`, MUID lookup reads `message_muids`, and destructive cleanup reads `conversation_users`;
 - reset and legacy imports remain namespace-wide operations.
 
-This keeps Redis as a high-scale write-through/read-through record store for the current API surface. PostgreSQL is not required for the covered CometChat-compatible paths; it would become useful for long-term analytics, audit retention, ad hoc moderation search, or relational reporting outside the hot chat path.
+This keeps Redis as a high-scale write-through/read-through record store for the current API surface, but the OTP Store process is still a per-instance serialization point. It scales horizontally for independent app instances only as far as Redis locks, counters, and per-request refreshes allow. For a larger production deployment, the next architecture step is PostgreSQL as the source of truth for users, groups, messages, receipts, moderation logs, and searchable audit history, with Redis kept for Pub/Sub, hot counters, ephemeral presence, rate limits, and short-lived caches.
 
 WebSocket events are also fanned out through Redis Pub/Sub so instances behind a load balancer can notify each other's connected clients.
 

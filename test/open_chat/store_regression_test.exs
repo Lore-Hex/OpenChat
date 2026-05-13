@@ -489,6 +489,8 @@ defmodule OpenChat.StoreRegressionTest do
   test "media uploads use configured upload dir and public media base URL" do
     old_upload_dir = Application.get_env(:open_chat, :upload_dir)
     old_media_base_url = Application.get_env(:open_chat, :public_media_base_url)
+    old_upload_max_bytes = Application.get_env(:open_chat, :upload_max_bytes)
+    old_allowed_mime_types = Application.get_env(:open_chat, :upload_allowed_mime_types)
 
     upload_dir =
       Path.join(System.tmp_dir!(), "open-chat-test-#{System.unique_integer([:positive])}")
@@ -501,10 +503,14 @@ defmodule OpenChat.StoreRegressionTest do
 
     Application.put_env(:open_chat, :upload_dir, upload_dir)
     Application.put_env(:open_chat, :public_media_base_url, "https://media.example")
+    Application.put_env(:open_chat, :upload_max_bytes, 1_000)
+    Application.put_env(:open_chat, :upload_allowed_mime_types, "image/png")
 
     on_exit(fn ->
       Application.put_env(:open_chat, :upload_dir, old_upload_dir)
       Application.put_env(:open_chat, :public_media_base_url, old_media_base_url)
+      Application.put_env(:open_chat, :upload_max_bytes, old_upload_max_bytes)
+      Application.put_env(:open_chat, :upload_allowed_mime_types, old_allowed_mime_types)
       File.rm_rf!(upload_dir)
       File.rm(source_path)
     end)
@@ -522,6 +528,77 @@ defmodule OpenChat.StoreRegressionTest do
     assert get_in(message, ["data", "text"]) == "tiny image"
     assert String.starts_with?(url, "https://media.example/media/")
     assert {:ok, [_uploaded_file]} = File.ls(upload_dir)
+  end
+
+  test "media uploads enforce size, mime type, and stored filename policy" do
+    old_upload_dir = Application.get_env(:open_chat, :upload_dir)
+    old_upload_max_bytes = Application.get_env(:open_chat, :upload_max_bytes)
+    old_allowed_mime_types = Application.get_env(:open_chat, :upload_allowed_mime_types)
+
+    upload_dir =
+      Path.join(System.tmp_dir!(), "open-chat-policy-#{System.unique_integer([:positive])}")
+
+    source_path =
+      Path.join(
+        System.tmp_dir!(),
+        "open-chat-policy-source-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(upload_dir)
+    File.write!(source_path, "123456789")
+
+    Application.put_env(:open_chat, :upload_dir, upload_dir)
+    Application.put_env(:open_chat, :upload_allowed_mime_types, "image/png,text/plain")
+
+    on_exit(fn ->
+      Application.put_env(:open_chat, :upload_dir, old_upload_dir)
+      Application.put_env(:open_chat, :upload_max_bytes, old_upload_max_bytes)
+      Application.put_env(:open_chat, :upload_allowed_mime_types, old_allowed_mime_types)
+      File.rm_rf!(upload_dir)
+      File.rm(source_path)
+    end)
+
+    Application.put_env(:open_chat, :upload_max_bytes, 4)
+
+    assert {:error, %{"code" => "ERR_UPLOAD_TOO_LARGE"}} =
+             Store.send_message(
+               "alice",
+               %{"receiver" => "bob", "receiverType" => "user"},
+               [%Plug.Upload{path: source_path, filename: "tiny.png", content_type: "image/png"}]
+             )
+
+    Application.put_env(:open_chat, :upload_max_bytes, 1_000)
+
+    assert {:error, %{"code" => "ERR_UPLOAD_TYPE_NOT_ALLOWED"}} =
+             Store.send_message(
+               "alice",
+               %{"receiver" => "bob", "receiverType" => "user"},
+               [
+                 %Plug.Upload{
+                   path: source_path,
+                   filename: "program.exe",
+                   content_type: "application/x-msdownload"
+                 }
+               ]
+             )
+
+    assert {:ok, message} =
+             Store.send_message(
+               "alice",
+               %{"receiver" => "bob", "receiverType" => "user"},
+               [
+                 %Plug.Upload{
+                   path: source_path,
+                   filename: "../risky name.png",
+                   content_type: "image/png"
+                 }
+               ]
+             )
+
+    assert [%{"name" => "risky_name.png", "url" => url}] =
+             get_in(message, ["data", "attachments"])
+
+    assert url =~ ~r(^/media/[A-Za-z0-9_-]+-risky_name\.png$)
   end
 
   test "direct conversations work when user IDs contain underscores" do

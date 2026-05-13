@@ -2,7 +2,7 @@ defmodule OpenChatWeb.ApiRouter do
   @moduledoc false
   use Plug.Router
   import Plug.Conn
-  alias OpenChat.{Config, Errors, Store, Time}
+  alias OpenChat.{Config, Errors, Media, Store, Time}
   alias OpenChat.Store.AuthTokens
   alias OpenChatWeb.{Auth, JSON}
 
@@ -604,9 +604,11 @@ defmodule OpenChatWeb.ApiRouter do
   end
 
   defp serve_media(conn, file) do
-    path = Path.join(Config.upload_dir(), Path.basename(URI.decode(file)))
+    decoded = URI.decode(file)
+    filename = Path.basename(decoded)
+    path = Path.join(Config.upload_dir(), filename)
 
-    if File.exists?(path) do
+    if decoded == filename and Media.stored_name?(filename) and File.exists?(path) do
       conn
       |> put_resp_content_type(MIME.from_path(path) || "application/octet-stream")
       |> send_file(200, path)

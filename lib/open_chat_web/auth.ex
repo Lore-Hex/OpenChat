@@ -47,7 +47,10 @@ defmodule OpenChatWeb.Auth do
 
   defp valid_api_key?(api_key) do
     configured = Config.api_key()
-    not blank?(configured) and not blank?(api_key) and api_key == configured
+
+    not blank?(configured) and not blank?(api_key) and
+      byte_size(api_key) == byte_size(configured) and
+      Plug.Crypto.secure_compare(api_key, configured)
   end
 
   defp api_key(conn), do: header(conn, "apikey") || header(conn, "apiKey")

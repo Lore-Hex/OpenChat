@@ -45,6 +45,38 @@ defmodule OpenChatWeb.ApiRegressionTest do
     assert json(conn)["error"]["code"] == "ERR_FORBIDDEN"
   end
 
+  test "CORS origin allowlist can be restricted" do
+    old_allowed_origins = Application.get_env(:open_chat, :cors_allowed_origins)
+    Application.put_env(:open_chat, :cors_allowed_origins, "https://chat.example")
+
+    on_exit(fn ->
+      Application.put_env(:open_chat, :cors_allowed_origins, old_allowed_origins)
+    end)
+
+    allowed =
+      conn(:options, "/v3.0/users")
+      |> Plug.Conn.put_req_header("origin", "https://chat.example")
+      |> OpenChatWeb.Endpoint.call([])
+
+    assert allowed.status == 204
+
+    assert Plug.Conn.get_resp_header(allowed, "access-control-allow-origin") == [
+             "https://chat.example"
+           ]
+
+    assert Plug.Conn.get_resp_header(allowed, "x-content-type-options") == ["nosniff"]
+    assert Plug.Conn.get_resp_header(allowed, "x-frame-options") == ["DENY"]
+    assert Plug.Conn.get_resp_header(allowed, "referrer-policy") == ["no-referrer"]
+
+    denied =
+      conn(:options, "/v3.0/users")
+      |> Plug.Conn.put_req_header("origin", "https://evil.example")
+      |> OpenChatWeb.Endpoint.call([])
+
+    assert denied.status == 204
+    assert Plug.Conn.get_resp_header(denied, "access-control-allow-origin") == []
+  end
+
   test "user admin and client routes support search, pagination, update, delete, and reactivation" do
     for uid <- ["test-a", "test-b", "test-c"] do
       assert admin_conn(:post, "/v3/users", %{"uid" => uid, "name" => "Search #{uid}"}).status ==
@@ -487,6 +519,28 @@ defmodule OpenChatWeb.ApiRegressionTest do
     conn = conn(:get, "/v3.0/media/missing.txt") |> OpenChatWeb.Endpoint.call([])
     assert conn.status == 404
     assert json(conn)["error"]["code"] == "ERR_MEDIA_NOT_FOUND"
+
+    uploaded_filename = Path.basename(media_path)
+    unsafe_media = "..%2F#{uploaded_filename}"
+    conn = conn(:get, "/v3.0/media/#{unsafe_media}") |> OpenChatWeb.Endpoint.call([])
+    assert conn.status == 404
+    assert json(conn)["error"]["code"] == "ERR_MEDIA_NOT_FOUND"
+
+    conn =
+      conn(:post, "/v3.0/messages", %{
+        "receiver" => "bob",
+        "receiverType" => "user",
+        "file" => %Plug.Upload{
+          path: source_path,
+          filename: "blocked.exe",
+          content_type: "application/x-msdownload"
+        }
+      })
+      |> Plug.Conn.put_req_header("authtoken", "uid:alice")
+      |> OpenChatWeb.Endpoint.call([])
+
+    assert conn.status == 400
+    assert json(conn)["error"]["code"] == "ERR_UPLOAD_TYPE_NOT_ALLOWED"
   end
 
   test "settings, JWT, user sessions, and logout token revocation routes work together" do

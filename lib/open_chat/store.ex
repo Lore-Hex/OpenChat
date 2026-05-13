@@ -9,7 +9,7 @@ defmodule OpenChat.Store do
 
   use GenServer
 
-  alias OpenChat.{Config, Errors, Time}
+  alias OpenChat.{Config, Errors, Media, Time}
 
   alias OpenChat.Store.{
     Access,
@@ -1176,41 +1176,46 @@ defmodule OpenChat.Store do
         now = Time.now()
         type = params["type"] || infer_type(params, uploads)
         category = params["category"] || "message"
-        data = normalise_message_data(params, uploads)
 
-        message = %{
-          "id" => id,
-          "muid" => params["muid"],
-          "sender" => sender["uid"],
-          "receiver" => to_s(receiver),
-          "receiverType" => receiver_type,
-          "type" => type,
-          "category" => category,
-          "data" => %{},
-          "sentAt" => now,
-          "updatedAt" => now,
-          "conversationId" => conversation_id_for(sender_uid, receiver_type, receiver),
-          "resource" => params["resource"]
-        }
+        case normalise_message_data(params, uploads) do
+          {:ok, data} ->
+            message = %{
+              "id" => id,
+              "muid" => params["muid"],
+              "sender" => sender["uid"],
+              "receiver" => to_s(receiver),
+              "receiverType" => receiver_type,
+              "type" => type,
+              "category" => category,
+              "data" => %{},
+              "sentAt" => now,
+              "updatedAt" => now,
+              "conversationId" => conversation_id_for(sender_uid, receiver_type, receiver),
+              "resource" => params["resource"]
+            }
 
-        message =
-          message
-          |> maybe_put("parentId", params["parentId"] || params["parentMessageId"])
-          |> maybe_put("tags", params["tags"])
+            message =
+              message
+              |> maybe_put("parentId", params["parentId"] || params["parentMessageId"])
+              |> maybe_put("tags", params["tags"])
 
-        parent_id = params["parentId"] || params["parentMessageId"]
+            parent_id = params["parentId"] || params["parentMessageId"]
 
-        case Access.parent_message(state, sender_uid, parent_id, message["conversationId"],
-               admin?: admin?
-             ) do
-          :ok ->
-            data =
-              data
-              |> Map.put_new("reactions", [])
-              |> put_entity("sender", "user", public_user(sender))
-              |> put_entity("receiver", receiver_type, receiver_entity)
+            case Access.parent_message(state, sender_uid, parent_id, message["conversationId"],
+                   admin?: admin?
+                 ) do
+              :ok ->
+                data =
+                  data
+                  |> Map.put_new("reactions", [])
+                  |> put_entity("sender", "user", public_user(sender))
+                  |> put_entity("receiver", receiver_type, receiver_entity)
 
-            {:ok, Map.put(message, "data", data), state}
+                {:ok, Map.put(message, "data", data), state}
+
+              {:error, error} ->
+                {:error, error}
+            end
 
           {:error, error} ->
             {:error, error}
@@ -1278,14 +1283,18 @@ defmodule OpenChat.Store do
         base
       end
 
-    attachments = upload_attachments(uploads)
+    case upload_attachments(uploads) do
+      {:ok, []} ->
+        {:ok, base}
 
-    if attachments == [] do
-      base
-    else
-      base
-      |> Map.put("attachments", attachments)
-      |> Map.put_new("url", List.first(attachments)["url"])
+      {:ok, attachments} ->
+        {:ok,
+         base
+         |> Map.put("attachments", attachments)
+         |> Map.put_new("url", List.first(attachments)["url"])}
+
+      {:error, error} ->
+        {:error, error}
     end
   end
 
@@ -1306,50 +1315,16 @@ defmodule OpenChat.Store do
     |> List.wrap()
     |> List.flatten()
     |> Enum.reject(&is_nil/1)
-    |> Enum.map(&persist_upload/1)
-  end
-
-  defp persist_upload(%Plug.Upload{} = upload) do
-    id = Base.url_encode64(:crypto.strong_rand_bytes(10), padding: false)
-    filename = Path.basename(upload.filename || id)
-    dest = Path.join(Config.upload_dir(), id <> "-" <> filename)
-    File.cp!(upload.path, dest)
-    stat = File.stat!(dest)
-    mime = upload.content_type || MIME.from_path(filename) || "application/octet-stream"
-
-    %{
-      "extension" => filename |> Path.extname() |> String.trim_leading("."),
-      "mimeType" => mime,
-      "name" => filename,
-      "size" => stat.size,
-      "url" => media_url(id <> "-" <> filename)
-    }
-  end
-
-  defp persist_upload(%{"path" => path, "filename" => filename} = upload) do
-    persist_upload(%Plug.Upload{
-      path: path,
-      filename: filename,
-      content_type: upload["content_type"]
-    })
-  end
-
-  defp persist_upload(other) do
-    %{
-      "extension" => "",
-      "mimeType" => "application/octet-stream",
-      "name" => to_s(other),
-      "size" => 0,
-      "url" => to_s(other)
-    }
-  end
-
-  defp media_url(filename) do
-    base = Application.get_env(:open_chat, :public_media_base_url)
-
-    if blank?(base),
-      do: "/media/#{URI.encode(filename)}",
-      else: String.trim_trailing(base, "/") <> "/media/#{URI.encode(filename)}"
+    |> Enum.reduce_while({:ok, []}, fn upload, {:ok, acc} ->
+      case Media.persist_upload(upload) do
+        {:ok, attachment} -> {:cont, {:ok, [attachment | acc]}}
+        {:error, error} -> {:halt, {:error, error}}
+      end
+    end)
+    |> case do
+      {:ok, attachments} -> {:ok, Enum.reverse(attachments)}
+      {:error, error} -> {:error, error}
+    end
   end
 
   defp merge_message_data(old, new) do

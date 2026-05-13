@@ -2,6 +2,12 @@ import Config
 
 default_api_key = if config_env() == :prod, do: "", else: "local-api-key"
 default_local_jwt_secret = if config_env() == :prod, do: "", else: "local-jwt-secret"
+default_cors_allowed_origins = if config_env() == :prod, do: "", else: "*"
+default_request_body_limit = 10_000_000
+default_upload_max_bytes = 10_000_000
+
+default_upload_allowed_mime_types =
+  "image/jpeg,image/png,image/gif,image/webp,video/mp4,video/webm,audio/mpeg,audio/mp4,audio/ogg,audio/webm,application/pdf,text/plain"
 
 accept_uid_tokens =
   case System.get_env("ACCEPT_UID_TOKENS") do
@@ -23,9 +29,16 @@ config :open_chat,
     System.get_env("LOCAL_JWT_SECRET") || System.get_env("COMETCHAT_API_KEY") ||
       default_local_jwt_secret,
   region: System.get_env("COMETCHAT_REGION") || "us",
+  cors_allowed_origins: System.get_env("CORS_ALLOWED_ORIGINS") || default_cors_allowed_origins,
   extension_domain:
     System.get_env("EXTENSION_DOMAIN") || System.get_env("PUBLIC_HOST") || "localhost",
   upload_dir: System.get_env("UPLOAD_DIR") || "priv/static/uploads",
+  request_body_limit:
+    String.to_integer(System.get_env("REQUEST_BODY_LIMIT") || "#{default_request_body_limit}"),
+  upload_max_bytes:
+    String.to_integer(System.get_env("UPLOAD_MAX_BYTES") || "#{default_upload_max_bytes}"),
+  upload_allowed_mime_types:
+    System.get_env("UPLOAD_ALLOWED_MIME_TYPES") || default_upload_allowed_mime_types,
   public_media_base_url: System.get_env("PUBLIC_MEDIA_BASE_URL"),
   redis_url: System.get_env("REDIS_URL"),
   redis_key_prefix: System.get_env("REDIS_KEY_PREFIX") || "open_chat",
