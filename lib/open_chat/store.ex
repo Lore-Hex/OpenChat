@@ -23,6 +23,7 @@ defmodule OpenChat.Store do
     PersistenceOps,
     RedisPersistence,
     RequestPlan,
+    Retention,
     Unread
   }
 
@@ -46,6 +47,7 @@ defmodule OpenChat.Store do
     "conversation_users" => %{},
     "user_groups" => %{},
     "unread_counts" => %{},
+    "presence" => %{},
     "next_id" => 1,
     "next_reaction_id" => 1
   }
@@ -481,6 +483,25 @@ defmodule OpenChat.Store do
           group["type"] == "password" and to_s(params["password"]) != to_s(group["password"]) ->
             {:reply, {:error, Errors.invalid("password", "Invalid group password.")}, state}
 
+          banned?(state, guid, uid) ->
+            {:reply, {:error, Errors.forbidden("You are banned from this group.")}, state}
+
+          transient_group_join?(state, group, guid, uid, params) ->
+            {_user, state} = ensure_user_in_state(state, uid)
+            state = mark_group_presence(state, guid, uid)
+
+            group =
+              state["groups"][guid]
+              |> Map.put("hasJoined", true)
+              |> Map.put("transient", true)
+              |> with_members_count(state)
+
+            persist_ops(PersistenceOps.user(state, [uid]))
+            {:reply, {:ok, group}, state}
+
+          group_member_limit_reached?(state, guid, uid) ->
+            {:reply, {:error, group_member_limit_error(guid)}, state}
+
           true ->
             {_user, state} = ensure_user_in_state(state, uid)
             state = add_member_to_state(state, guid, uid, "participant")
@@ -530,21 +551,30 @@ defmodule OpenChat.Store do
   def handle_call({:add_group_members, guid, uids, scope, opts}, _from, state) do
     with {:ok, group} <- Map.fetch(state["groups"], guid),
          :ok <- authorize_group_moderation(state, guid, opts) do
-      {state, result} =
-        Enum.reduce(List.wrap(uids), {state, %{}}, fn uid, {st, acc} ->
+      {state, result, touched_uids} =
+        Enum.reduce(List.wrap(uids), {state, %{}, []}, fn uid, {st, acc, touched} ->
           uid = to_s(uid)
-          {_user, st} = ensure_user_in_state(st, uid)
-          st = add_member_to_state(st, guid, uid, scope || "participant")
-          {st, Map.put(acc, uid, %{"success" => true, "message" => "Member added."})}
+
+          if group_member_limit_reached?(st, guid, uid) do
+            error = group_member_limit_error(guid)
+            {st, Map.put(acc, uid, member_failure(error)), touched}
+          else
+            {_user, st} = ensure_user_in_state(st, uid)
+            st = add_member_to_state(st, guid, uid, scope || "participant")
+
+            {st, Map.put(acc, uid, %{"success" => true, "message" => "Member added."}),
+             [uid | touched]}
+          end
         end)
 
       group = with_members_count(group, state)
+      touched_uids = Enum.uniq(touched_uids)
 
       persist_ops(
-        PersistenceOps.user(state, Map.keys(result)) ++
+        PersistenceOps.user(state, touched_uids) ++
           PersistenceOps.members(state, guid) ++
-          PersistenceOps.user_groups(state, Map.keys(result)) ++
-          PersistenceOps.unread_counts(state, Map.keys(result))
+          PersistenceOps.user_groups(state, touched_uids) ++
+          PersistenceOps.unread_counts(state, touched_uids)
       )
 
       {:reply, {:ok, %{"success" => result, "group" => group}}, state}
@@ -601,23 +631,28 @@ defmodule OpenChat.Store do
           {scope_map["scope"] || "participant", scope_map["uids"] || []}
         ]
 
-        {state, touched} =
-          Enum.reduce(assignments, {state, []}, fn {scope, uids}, {st, acc} ->
-            Enum.reduce(List.wrap(uids), {st, acc}, fn uid, {st2, acc2} ->
+        {state, touched, failed} =
+          Enum.reduce(assignments, {state, [], %{}}, fn {scope, uids}, {st, acc, failed} ->
+            Enum.reduce(List.wrap(uids), {st, acc, failed}, fn uid, {st2, acc2, failed2} ->
               uid = to_s(uid)
-              {_user, st2} = ensure_user_in_state(st2, uid)
-              st2 = add_member_to_state(st2, guid, uid, scope)
 
-              {st2,
-               [
-                 %{
-                   "uid" => uid,
-                   "scope" => normalise_scope(scope),
-                   "guid" => guid,
-                   "joinedAt" => Time.now()
-                 }
-                 | acc2
-               ]}
+              if group_member_limit_reached?(st2, guid, uid) do
+                {st2, acc2, Map.put(failed2, uid, member_failure(group_member_limit_error(guid)))}
+              else
+                {_user, st2} = ensure_user_in_state(st2, uid)
+                st2 = add_member_to_state(st2, guid, uid, scope)
+
+                {st2,
+                 [
+                   %{
+                     "uid" => uid,
+                     "scope" => normalise_scope(scope),
+                     "guid" => guid,
+                     "joinedAt" => Time.now()
+                   }
+                   | acc2
+                 ], failed2}
+              end
             end)
           end)
 
@@ -633,8 +668,15 @@ defmodule OpenChat.Store do
             PersistenceOps.unread_counts(state, touched_uids)
         )
 
-        {:reply,
-         {:ok, Map.merge(%{"success" => true, "members" => Enum.reverse(touched)}, first)}, state}
+        payload =
+          %{
+            "success" => map_size(failed) == 0,
+            "members" => Enum.reverse(touched),
+            "failed" => failed
+          }
+          |> Map.merge(first)
+
+        {:reply, {:ok, payload}, state}
 
       {:error, error} ->
         {:reply, {:error, error}, state}
@@ -717,9 +759,9 @@ defmodule OpenChat.Store do
         {:reply, {:error, error}, state}
 
       {:ok, message, state} ->
-        state = store_message_in_state(state, message)
+        {state, retention_ops} = store_message_with_retention(state, message)
         publish_message(state, message)
-        persist_ops(PersistenceOps.message_create(state, message))
+        persist_ops(PersistenceOps.message_create(state, message) ++ retention_ops)
         {:reply, {:ok, message}, state}
     end
   end
@@ -746,12 +788,13 @@ defmodule OpenChat.Store do
 
             state = put_in(state, ["messages", id], message)
             {action, state} = message_action(state, uid, message, "edited")
-            state = store_message_in_state(state, action)
+            {state, retention_ops} = store_message_with_retention(state, action)
             publish_message(state, action)
 
             persist_ops(
               [RedisPersistence.put("messages", id, message)] ++
-                PersistenceOps.stored_message(state, action) ++ PersistenceOps.next_id(state)
+                PersistenceOps.stored_message(state, action) ++
+                retention_ops ++ PersistenceOps.next_id(state)
             )
 
             {:reply, {:ok, action}, state}
@@ -782,12 +825,13 @@ defmodule OpenChat.Store do
 
             state = put_in(state, ["messages", id], message)
             {action, state} = message_action(state, uid, message, "deleted")
-            state = store_message_in_state(state, action)
+            {state, retention_ops} = store_message_with_retention(state, action)
             publish_message(state, action)
 
             persist_ops(
               [RedisPersistence.put("messages", id, message)] ++
                 PersistenceOps.stored_message(state, action) ++
+                retention_ops ++
                 PersistenceOps.unread_counts(state, original_participants) ++
                 PersistenceOps.next_id(state)
             )
@@ -887,7 +931,7 @@ defmodule OpenChat.Store do
   end
 
   def handle_call({:messages_for_group, uid, guid, params}, _from, state) do
-    if member?(state, guid, uid) do
+    if group_read_allowed?(state, guid, uid) do
       conv_id = group_conversation_id(guid)
       messages = ConversationView.messages(state, conv_id, params)
       {:reply, {:ok, messages}, state}
@@ -1267,6 +1311,12 @@ defmodule OpenChat.Store do
             {:error, error}
         end
     end
+  end
+
+  defp store_message_with_retention(state, message) do
+    state
+    |> store_message_in_state(message)
+    |> Retention.trim_group_history(message)
   end
 
   defp store_message_in_state(state, message) do
@@ -1657,23 +1707,13 @@ defmodule OpenChat.Store do
 
   defp recipient_keys(state, %{"receiverType" => "group"} = message) do
     sender = to_s(message["sender"])
-
-    state["members"]
-    |> Map.get(to_s(message["receiver"]), %{})
-    |> Map.keys()
-    |> Enum.reject(&(&1 == sender))
-    |> Enum.map(&{:user, &1})
+    group_recipient_keys(state, to_s(message["receiver"]), except: sender)
   end
 
   defp publish_to_group(state, guid, action, opts) do
     except = Keyword.get(opts, :except)
 
-    keys =
-      state["members"]
-      |> Map.get(guid, %{})
-      |> Map.keys()
-      |> Enum.reject(&(&1 == except))
-      |> Enum.map(&{:user, &1})
+    keys = group_recipient_keys(state, guid, except: except)
 
     event = %{
       "appId" => Config.app_id(),
@@ -1686,6 +1726,20 @@ defmodule OpenChat.Store do
     }
 
     OpenChat.PubSub.broadcast(keys, event)
+  end
+
+  defp group_recipient_keys(state, guid, opts) do
+    except = opts |> Keyword.get(:except) |> to_s()
+    members = state["members"] |> Map.get(guid, %{})
+
+    if map_size(members) > Config.group_unread_fanout_limit() do
+      [{:group, guid}]
+    else
+      members
+      |> Map.keys()
+      |> Enum.reject(&(to_s(&1) == except))
+      |> Enum.map(&{:user, &1})
+    end
   end
 
   # Auth/users/groups
@@ -1803,10 +1857,13 @@ defmodule OpenChat.Store do
   end
 
   defp add_member_to_state(state, guid, uid, scope) do
+    previous_count = map_size(get_in(state, ["members", guid]) || %{})
+
     state
     |> ensure_group_member_map(guid)
+    |> clear_group_presence(guid, uid)
     |> Indexes.put_member(guid, uid, scope)
-    |> Unread.sync(uid, group_conversation_id(guid))
+    |> sync_group_unread_after_member_add(guid, uid, previous_count)
   end
 
   defp remove_member_from_state(state, guid, uid) do
@@ -1834,7 +1891,118 @@ defmodule OpenChat.Store do
     end
   end
 
+  defp transient_group_join?(state, group, guid, uid, params) do
+    group["type"] == "public" and
+      not member?(state, guid, uid) and
+      not truthy?(params["durable"]) and
+      (truthy?(params["transient"]) or truthy?(params["visitor"]) or
+         truthy?(params["asVisitor"]) or Config.public_group_joins_as_visits?())
+  end
+
+  defp group_read_allowed?(state, guid, uid) do
+    case Map.fetch(state["groups"], guid) do
+      :error ->
+        false
+
+      {:ok, group} ->
+        not banned?(state, guid, uid) and
+          (member?(state, guid, uid) or
+             (not blank?(uid) and group["type"] == "public" and
+                Config.public_group_reads_enabled?()))
+    end
+  end
+
+  defp group_member_limit_reached?(state, guid, uid) do
+    not member?(state, guid, uid) and
+      map_size(get_in(state, ["members", guid]) || %{}) >= Config.group_max_members()
+  end
+
+  defp group_member_limit_error(guid) do
+    Errors.error("ERR_LIMIT_EXCEEDED", "Group #{guid} has reached its member limit.", %{
+      "guid" => guid,
+      "limit" => Config.group_max_members()
+    })
+  end
+
+  defp member_failure(error) do
+    %{
+      "success" => false,
+      "code" => error["code"],
+      "error" => error["message"],
+      "message" => error["message"]
+    }
+  end
+
+  defp sync_group_unread_after_member_add(state, guid, uid, previous_count) do
+    conv_id = group_conversation_id(guid)
+    member_count = map_size(get_in(state, ["members", guid]) || %{})
+
+    cond do
+      previous_count <= Config.group_unread_fanout_limit() and
+          member_count > Config.group_unread_fanout_limit() ->
+        clear_group_unread_counts(state, guid)
+
+      member_count > Config.group_unread_fanout_limit() ->
+        Unread.remove_conversation(state, uid, conv_id)
+
+      true ->
+        Unread.sync(state, uid, conv_id)
+    end
+  end
+
+  defp clear_group_unread_counts(state, guid) do
+    conv_id = group_conversation_id(guid)
+
+    state
+    |> get_in(["members", guid])
+    |> map_keys()
+    |> Enum.reduce(state, fn uid, acc ->
+      Unread.remove_conversation(acc, uid, conv_id)
+    end)
+  end
+
+  defp mark_group_presence(state, guid, uid) do
+    now = Time.now()
+    expires_at = now + Config.group_presence_ttl_seconds()
+
+    update_in(state, ["presence", guid], fn rows ->
+      rows
+      |> Kernel.||(%{})
+      |> Enum.reject(fn {_uid, presence} -> to_int(presence["expiresAt"]) <= now end)
+      |> Map.new()
+      |> Map.put(uid, %{
+        "uid" => uid,
+        "guid" => guid,
+        "lastSeenAt" => now,
+        "expiresAt" => expires_at
+      })
+      |> cap_presence()
+    end)
+  end
+
+  defp clear_group_presence(state, guid, uid) do
+    update_in(state, ["presence", guid], fn rows ->
+      rows = Map.delete(rows || %{}, uid)
+      if rows == %{}, do: nil, else: rows
+    end)
+  end
+
+  defp cap_presence(rows) do
+    limit = Config.group_max_presence()
+
+    if map_size(rows) <= limit do
+      rows
+    else
+      rows
+      |> Enum.sort_by(fn {_uid, presence} -> -to_int(presence["lastSeenAt"]) end)
+      |> Enum.take(limit)
+      |> Map.new()
+    end
+  end
+
   defp member?(state, guid, uid), do: Map.has_key?(get_in(state, ["members", guid]) || %{}, uid)
+
+  defp banned?(state, guid, uid), do: Map.has_key?(get_in(state, ["banned", guid]) || %{}, uid)
 
   defp blocked?(state, blocker_uid, blocked_uid),
     do: get_in(state, ["blocks", blocker_uid, blocked_uid]) == true
@@ -1872,6 +2040,7 @@ defmodule OpenChat.Store do
 
   defp to_int(value), do: value |> to_s() |> to_int()
 
+  defp truthy?(value), do: value in [true, 1, "1", "true", "TRUE", "yes", "YES"]
   defp blank?(value), do: value in [nil, "", false]
   defp contains?(a, b), do: String.contains?(String.downcase(to_s(a)), String.downcase(to_s(b)))
   defp clamp(value, lo, hi), do: value |> Kernel.max(lo) |> Kernel.min(hi)

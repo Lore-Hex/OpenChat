@@ -1,6 +1,7 @@
 defmodule OpenChat.Store.Indexes do
   @moduledoc false
 
+  alias OpenChat.Config
   alias OpenChat.Store.Conversations
   alias OpenChat.Time
 
@@ -155,11 +156,10 @@ defmodule OpenChat.Store.Indexes do
   def message_participants(state, %{"receiverType" => "group", "receiver" => guid} = message) do
     guid = to_s(guid)
     sender = to_s(message["sender"])
+    members = get_in(state, ["members", guid]) || %{}
 
-    state
-    |> get_in(["members", guid])
-    |> map_keys()
-    |> Kernel.++([sender])
+    members
+    |> fanout_member_keys(sender)
     |> Enum.reject(&blank?/1)
     |> Enum.uniq()
   end
@@ -241,6 +241,14 @@ defmodule OpenChat.Store.Indexes do
 
   defp map_keys(map) when is_map(map), do: Map.keys(map)
   defp map_keys(_other), do: []
+
+  defp fanout_member_keys(members, sender) do
+    if map_size(members) > Config.group_unread_fanout_limit() do
+      [sender]
+    else
+      map_keys(members) ++ [sender]
+    end
+  end
 
   defp normalise_scope("participants"), do: "participant"
   defp normalise_scope("members"), do: "participant"

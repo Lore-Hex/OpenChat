@@ -5,6 +5,12 @@ default_local_jwt_secret = if config_env() == :prod, do: "", else: "local-jwt-se
 default_cors_allowed_origins = if config_env() == :prod, do: "", else: "*"
 default_request_body_limit = 10_000_000
 default_upload_max_bytes = 10_000_000
+default_group_max_members = 1_000
+default_group_max_messages = 1_000
+default_group_message_retention_days = 30
+default_group_unread_fanout_limit = 1_000
+default_group_presence_ttl_seconds = 1_800
+default_group_max_presence = 5_000
 
 default_upload_allowed_mime_types =
   "image/jpeg,image/png,image/gif,image/webp,video/mp4,video/webm,audio/mpeg,audio/mp4,audio/ogg,audio/webm,application/pdf,text/plain"
@@ -14,6 +20,15 @@ integer_env = fn name, default ->
     nil -> default
     "" -> default
     value -> String.to_integer(value)
+  end
+end
+
+boolean_env = fn name, default ->
+  case System.get_env(name) do
+    value when value in [nil, ""] -> default
+    value when value in ["true", "TRUE", "1", "yes", "YES"] -> true
+    value when value in ["false", "FALSE", "0", "no", "NO"] -> false
+    _other -> default
   end
 end
 
@@ -45,6 +60,17 @@ config :open_chat,
   upload_max_bytes: integer_env.("UPLOAD_MAX_BYTES", default_upload_max_bytes),
   upload_allowed_mime_types:
     System.get_env("UPLOAD_ALLOWED_MIME_TYPES") || default_upload_allowed_mime_types,
+  group_max_members: integer_env.("GROUP_MAX_MEMBERS", default_group_max_members),
+  group_max_messages: integer_env.("GROUP_MAX_MESSAGES", default_group_max_messages),
+  group_message_retention_days:
+    integer_env.("GROUP_MESSAGE_RETENTION_DAYS", default_group_message_retention_days),
+  group_unread_fanout_limit:
+    integer_env.("GROUP_UNREAD_FANOUT_LIMIT", default_group_unread_fanout_limit),
+  group_presence_ttl_seconds:
+    integer_env.("GROUP_PRESENCE_TTL_SECONDS", default_group_presence_ttl_seconds),
+  group_max_presence: integer_env.("GROUP_MAX_PRESENCE", default_group_max_presence),
+  public_group_reads_enabled: boolean_env.("PUBLIC_GROUP_READS_ENABLED", true),
+  public_group_joins_as_visits: boolean_env.("PUBLIC_GROUP_JOINS_AS_VISITS", false),
   public_media_base_url: System.get_env("PUBLIC_MEDIA_BASE_URL"),
   redis_url: System.get_env("REDIS_URL"),
   redis_key_prefix: System.get_env("REDIS_KEY_PREFIX") || "open_chat",

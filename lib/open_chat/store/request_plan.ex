@@ -1,6 +1,7 @@
 defmodule OpenChat.Store.RequestPlan do
   @moduledoc false
 
+  alias OpenChat.Config
   alias OpenChat.Store.{AuthTokens, Conversations}
 
   defstruct mutating?: false, locks: [], refresh: []
@@ -291,12 +292,14 @@ defmodule OpenChat.Store.RequestPlan do
   defp unread_count_keys(_sender_uid, _receiver_type, _receiver_id), do: []
 
   defp unread_count_keys(sender_uid, "group", receiver_id, state) do
-    state
-    |> get_in(["members", to_s(receiver_id)])
-    |> case do
-      members when is_map(members) -> Map.keys(members)
-      _other -> []
-    end
+    members = get_in(state, ["members", to_s(receiver_id)]) || %{}
+
+    member_uids =
+      if map_size(members) > Config.group_unread_fanout_limit(),
+        do: [],
+        else: Map.keys(members)
+
+    member_uids
     |> Kernel.++([sender_uid])
     |> Enum.map(&to_s/1)
     |> Enum.reject(&blank?/1)

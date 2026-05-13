@@ -5,6 +5,12 @@ default_local_jwt_secret = if config_env() == :prod, do: "", else: "local-jwt-se
 default_cors_allowed_origins = if config_env() == :prod, do: "", else: "*"
 default_request_body_limit = 10_000_000
 default_upload_max_bytes = 10_000_000
+default_group_max_members = 1_000
+default_group_max_messages = 1_000
+default_group_message_retention_days = 30
+default_group_unread_fanout_limit = 1_000
+default_group_presence_ttl_seconds = 1_800
+default_group_max_presence = 5_000
 
 default_upload_allowed_mime_types =
   "image/jpeg,image/png,image/gif,image/webp,video/mp4,video/webm,audio/mpeg,audio/mp4,audio/ogg,audio/webm,application/pdf,text/plain"
@@ -25,6 +31,14 @@ config :open_chat,
   request_body_limit: default_request_body_limit,
   upload_max_bytes: default_upload_max_bytes,
   upload_allowed_mime_types: default_upload_allowed_mime_types,
+  group_max_members: default_group_max_members,
+  group_max_messages: default_group_max_messages,
+  group_message_retention_days: default_group_message_retention_days,
+  group_unread_fanout_limit: default_group_unread_fanout_limit,
+  group_presence_ttl_seconds: default_group_presence_ttl_seconds,
+  group_max_presence: default_group_max_presence,
+  public_group_reads_enabled: true,
+  public_group_joins_as_visits: false,
   public_media_base_url: nil,
   redis_url: nil,
   redis_key_prefix: "open_chat",

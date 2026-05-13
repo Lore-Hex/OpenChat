@@ -3,6 +3,12 @@ defmodule OpenChat.Config do
 
   @default_request_body_limit 10_000_000
   @default_upload_max_bytes 10_000_000
+  @default_group_max_members 1_000
+  @default_group_max_messages 1_000
+  @default_group_message_retention_days 30
+  @default_group_unread_fanout_limit 1_000
+  @default_group_presence_ttl_seconds 1_800
+  @default_group_max_presence 5_000
   @default_upload_allowed_mime_types ~w(
     image/jpeg
     image/png
@@ -50,6 +56,30 @@ defmodule OpenChat.Config do
   def seed_users_json, do: Application.fetch_env!(:open_chat, :seed_users_json)
   def seed_groups_json, do: Application.fetch_env!(:open_chat, :seed_groups_json)
   def accept_uid_tokens?, do: Application.fetch_env!(:open_chat, :accept_uid_tokens)
+
+  def group_max_members,
+    do: integer_env(:group_max_members, @default_group_max_members)
+
+  def group_max_messages,
+    do: integer_env(:group_max_messages, @default_group_max_messages)
+
+  def group_message_retention_days,
+    do: integer_env(:group_message_retention_days, @default_group_message_retention_days)
+
+  def group_unread_fanout_limit,
+    do: integer_env(:group_unread_fanout_limit, @default_group_unread_fanout_limit)
+
+  def group_presence_ttl_seconds,
+    do: integer_env(:group_presence_ttl_seconds, @default_group_presence_ttl_seconds)
+
+  def group_max_presence,
+    do: integer_env(:group_max_presence, @default_group_max_presence)
+
+  def public_group_reads_enabled?,
+    do: boolean_env(:public_group_reads_enabled, true)
+
+  def public_group_joins_as_visits?,
+    do: boolean_env(:public_group_joins_as_visits, false)
 
   def cors_allowed_origin(origin) do
     allowed = cors_allowed_origins()
@@ -117,6 +147,27 @@ defmodule OpenChat.Config do
         |> String.split(",", trim: true)
         |> Enum.map(&String.trim/1)
         |> Enum.reject(&(&1 == ""))
+    end
+  end
+
+  defp integer_env(key, fallback) do
+    case Application.get_env(:open_chat, key, fallback) do
+      value when is_integer(value) and value > 0 ->
+        value
+
+      value ->
+        case Integer.parse(to_string(value)) do
+          {int, _rest} when int > 0 -> int
+          _other -> fallback
+        end
+    end
+  end
+
+  defp boolean_env(key, fallback) do
+    case Application.get_env(:open_chat, key, fallback) do
+      value when value in [true, "true", "TRUE", "1", 1, "yes", "YES"] -> true
+      value when value in [false, "false", "FALSE", "0", 0, "no", "NO"] -> false
+      _other -> fallback
     end
   end
 
