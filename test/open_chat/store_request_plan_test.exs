@@ -73,6 +73,51 @@ defmodule OpenChat.StoreRequestPlanTest do
            ]
   end
 
+  test "actor-aware read and receipt plans refresh access-control records by key" do
+    direct_conversation = Conversations.user_conversation_id("alice", "bob")
+
+    assert RequestPlan.build({:messages_for_thread, "alice", "55", %{}}).refresh == [
+             {"messages", "55"},
+             {"thread_messages", "55"}
+           ]
+
+    assert RequestPlan.build({:find_message_by_muid_for, "alice", "client-muid", []}).refresh == [
+             {"message_muids", "client-muid"}
+           ]
+
+    assert RequestPlan.build({:mark_read, "alice", "user", "bob", "55"}).refresh == [
+             {"conversation_messages", direct_conversation},
+             {"users", "bob"},
+             {"messages", "55"},
+             {"reads", "alice"}
+           ]
+
+    assert RequestPlan.build({:mark_delivered, "alice", "group", "room", "77"}).refresh == [
+             {"conversation_messages", "group_room"},
+             {"groups", "room"},
+             {"members", "room"},
+             {"banned", "room"},
+             {"messages", "77"},
+             {"delivered", "alice"}
+           ]
+
+    assert RequestPlan.build(
+             {:send_message, "alice",
+              %{
+                "receiver" => "bob",
+                "receiverType" => "user",
+                "parentId" => "55",
+                "data" => %{"text" => "reply"}
+              }, [], []}
+           ).refresh == [
+             {"users", "alice"},
+             {:counter, "next_id"},
+             {"conversation_messages", direct_conversation},
+             {"messages", "55"},
+             {"users", "bob"}
+           ]
+  end
+
   test "broad store requests use indexed refreshes instead of whole-state refreshes" do
     requests = [
       {:list_users, %{}},

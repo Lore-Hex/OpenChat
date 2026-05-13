@@ -436,15 +436,19 @@ defmodule OpenChatWeb.ApiRouter do
 
   get "/users/:uid/conversation" do
     with_user(conn, fn conn, user, _token ->
-      {:ok, conversation} = Store.conversation(user["uid"], "user", uid)
-      JSON.ok(conn, conversation || %{})
+      case Store.conversation(user["uid"], "user", uid) do
+        {:ok, conversation} -> JSON.ok(conn, conversation || %{})
+        {:error, e} -> JSON.error(conn, e, error_status(e, 400))
+      end
     end)
   end
 
   get "/groups/:guid/conversation" do
     with_user(conn, fn conn, user, _token ->
-      {:ok, conversation} = Store.conversation(user["uid"], "group", guid)
-      JSON.ok(conn, conversation || %{})
+      case Store.conversation(user["uid"], "group", guid) do
+        {:ok, conversation} -> JSON.ok(conn, conversation || %{})
+        {:error, e} -> JSON.error(conn, e, error_status(e, 400))
+      end
     end)
   end
 
@@ -474,15 +478,19 @@ defmodule OpenChatWeb.ApiRouter do
 
   delete "/users/:uid/conversation" do
     with_user(conn, fn conn, user, _token ->
-      {:ok, data} = Store.hide_conversation(user["uid"], "user", uid)
-      JSON.ok(conn, Map.put(data, "uid", uid))
+      case Store.hide_conversation(user["uid"], "user", uid) do
+        {:ok, data} -> JSON.ok(conn, Map.put(data, "uid", uid))
+        {:error, e} -> JSON.error(conn, e, error_status(e, 400))
+      end
     end)
   end
 
   delete "/groups/:guid/conversation" do
     with_user(conn, fn conn, user, _token ->
-      {:ok, data} = Store.hide_conversation(user["uid"], "group", guid)
-      JSON.ok(conn, Map.put(data, "guid", guid))
+      case Store.hide_conversation(user["uid"], "group", guid) do
+        {:ok, data} -> JSON.ok(conn, Map.put(data, "guid", guid))
+        {:error, e} -> JSON.error(conn, e, error_status(e, 400))
+      end
     end)
   end
 

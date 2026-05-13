@@ -2,6 +2,7 @@ defmodule OpenChat.RedisPersistenceTest do
   use ExUnit.Case, async: false
 
   alias OpenChat.Store
+  alias OpenChat.Store.Conversations
 
   @redis_url System.get_env("REDIS_TEST_URL") || "redis://localhost:6379/15"
 
@@ -554,6 +555,116 @@ defmodule OpenChat.RedisPersistenceTest do
     end)
   end
 
+  test "targeted Redis refreshes enforce actor-aware message and group access", context do
+    with_redis(context, fn ->
+      now = OpenChat.Time.now()
+      conv_id = Conversations.user_conversation_id("redis-index-a", "redis-index-b")
+
+      parent = %{
+        "id" => 9001,
+        "muid" => "redis-index-parent",
+        "sender" => "redis-index-a",
+        "receiver" => "redis-index-b",
+        "receiverType" => "user",
+        "type" => "text",
+        "category" => "message",
+        "data" => %{"text" => "external parent", "reactions" => []},
+        "sentAt" => now,
+        "updatedAt" => now,
+        "conversationId" => conv_id
+      }
+
+      reply =
+        parent
+        |> Map.merge(%{
+          "id" => 9002,
+          "muid" => "redis-index-reply",
+          "sender" => "redis-index-b",
+          "receiver" => "redis-index-a",
+          "parentId" => "9001"
+        })
+        |> put_in(["data", "text"], "external reply")
+
+      redis_put_json(context, ["messages", "9001"], parent)
+      redis_put_json(context, ["messages", "9002"], reply)
+      redis_put_json(context, ["message_muids", "redis-index-parent"], "9001")
+      redis_put_json(context, ["thread_messages", "9001"], ["9002"])
+      redis_put_json(context, ["conversation_messages", conv_id], ["9001", "9002"])
+      redis_put_json(context, ["conversation_users", conv_id], ["redis-index-a", "redis-index-b"])
+      redis_put_json(context, ["user_conversations", "redis-index-a"], [conv_id])
+      redis_put_json(context, ["user_conversations", "redis-index-b"], [conv_id])
+
+      for {bucket, id} <- [
+            {"messages", "9001"},
+            {"messages", "9002"},
+            {"message_muids", "redis-index-parent"},
+            {"thread_messages", "9001"},
+            {"conversation_messages", conv_id},
+            {"conversation_users", conv_id},
+            {"user_conversations", "redis-index-a"},
+            {"user_conversations", "redis-index-b"}
+          ] do
+        redis_index!(context, bucket, id)
+      end
+
+      assert {:ok, fetched} =
+               Store.find_message_by_muid_for("redis-index-b", "redis-index-parent")
+
+      assert fetched["id"] == 9001
+
+      assert {:error, %{"code" => "ERR_FORBIDDEN"}} =
+               Store.find_message_by_muid_for("redis-outsider", "redis-index-parent")
+
+      assert {:ok, [thread_reply]} = Store.messages_for_thread("redis-index-a", "9001")
+      assert thread_reply["id"] == 9002
+
+      assert {:error, %{"code" => "ERR_FORBIDDEN"}} =
+               Store.messages_for_thread("redis-outsider", "9001")
+
+      assert {:error, %{"code" => "ERR_FORBIDDEN"}} =
+               Store.mark_read("redis-outsider", "user", "redis-index-a", "9001")
+
+      group_message = %{
+        "id" => 9010,
+        "sender" => "redis-member",
+        "receiver" => "redis-secure-room",
+        "receiverType" => "group",
+        "type" => "text",
+        "category" => "message",
+        "data" => %{"text" => "group external", "reactions" => []},
+        "sentAt" => now,
+        "updatedAt" => now,
+        "conversationId" => "group_redis-secure-room"
+      }
+
+      redis_put_json(context, ["groups", "redis-secure-room"], %{
+        "guid" => "redis-secure-room",
+        "name" => "Redis Secure Room",
+        "type" => "public"
+      })
+
+      redis_put_json(context, ["members", "redis-secure-room"], %{
+        "redis-member" => %{"uid" => "redis-member", "scope" => "participant"}
+      })
+
+      redis_put_json(context, ["messages", "9010"], group_message)
+
+      for {bucket, id} <- [
+            {"groups", "redis-secure-room"},
+            {"members", "redis-secure-room"},
+            {"messages", "9010"}
+          ] do
+        redis_index!(context, bucket, id)
+      end
+
+      assert {:ok, fetched_group} = Store.get_message_for("redis-member", "9010")
+      assert fetched_group["id"] == 9010
+
+      assert {:error, %{"code" => "ERR_FORBIDDEN"}} =
+               Store.get_message_for("redis-outsider", "9010")
+    end)
+  end
+
   test "Redis counter allocation ignores stale local next_id", context do
     with_redis(context, fn ->
       Redix.command!(context.redis, ["SET", redis_key(context, "counter", "next_id"), "1000"])
@@ -627,6 +738,10 @@ defmodule OpenChat.RedisPersistenceTest do
 
   defp redis_put_json(context, parts, value) do
     Redix.command!(context.redis, ["SET", redis_key(context, parts), Jason.encode!(value)])
+  end
+
+  defp redis_index!(context, bucket, id) do
+    Redix.command!(context.redis, ["SADD", redis_key(context, "index", bucket), to_string(id)])
   end
 
   defp redis_members(context, parts) when is_list(parts) do

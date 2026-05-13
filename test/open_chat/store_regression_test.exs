@@ -62,6 +62,52 @@ defmodule OpenChat.StoreRegressionTest do
     assert {:error, %{"code" => "ERR_NO_AUTH"}} = Store.me(jwt)
   end
 
+  test "local JWTs reject legacy unsigned, malformed, tampered, and rotated-secret tokens" do
+    old_secret = Application.get_env(:open_chat, :local_jwt_secret)
+
+    on_exit(fn ->
+      Application.put_env(:open_chat, :local_jwt_secret, old_secret)
+    end)
+
+    Application.put_env(:open_chat, :local_jwt_secret, "jwt-secret-a")
+
+    assert {:ok, payload} = Store.create_auth_token("jwt-edge")
+    token = payload["authToken"]
+    jwt = payload["jwt"]
+
+    assert {:ok, ^token} = AuthTokens.local_jwt_token(jwt)
+
+    ["local", encoded_payload, signature] = String.split(jwt, ".", parts: 3)
+    assert signature != "unsigned"
+
+    payload_map = encoded_payload |> Base.url_decode64!(padding: false) |> Jason.decode!()
+    assert payload_map["uid"] == "jwt-edge"
+    assert payload_map["token"] == token
+    assert payload_map["exp"] > payload_map["iat"]
+
+    legacy_unsigned =
+      "local." <>
+        Base.url_encode64(
+          Jason.encode!(%{"uid" => "jwt-edge", "token" => token, "iat" => Time.now()}),
+          padding: false
+        ) <> ".unsigned"
+
+    assert :error = AuthTokens.local_jwt_token(legacy_unsigned)
+    assert :error = AuthTokens.local_jwt_token("local.not-base64.signature")
+
+    tampered_payload =
+      payload_map
+      |> Map.put("token", "uid:alice")
+      |> Jason.encode!()
+      |> Base.url_encode64(padding: false)
+
+    assert :error = AuthTokens.local_jwt_token("local." <> tampered_payload <> "." <> signature)
+
+    Application.put_env(:open_chat, :local_jwt_secret, "jwt-secret-b")
+    assert :error = AuthTokens.local_jwt_token(jwt)
+    assert {:error, %{"code" => "ERR_NO_AUTH"}} = Store.me(jwt)
+  end
+
   test "uid developer tokens are runtime gated and not embedded in default seed users" do
     old_accept_uid_tokens = Application.fetch_env!(:open_chat, :accept_uid_tokens)
 
@@ -555,6 +601,55 @@ defmodule OpenChat.StoreRegressionTest do
                "receiverType" => "user",
                "parentId" => parent["id"],
                "data" => %{"text" => "snoop reply"}
+             })
+  end
+
+  test "access policy protects group conversations and validates receipt and thread conversations" do
+    assert {:ok, _group} = Store.upsert_group(%{"guid" => "policy-room", "type" => "public"})
+    assert {:ok, _members} = Store.add_group_members("policy-room", ["alice", "bob"])
+
+    assert {:ok, group_message} =
+             Store.send_message("alice", %{
+               "receiver" => "policy-room",
+               "receiverType" => "group",
+               "data" => %{"text" => "group private"}
+             })
+
+    assert {:ok, _message} = Store.get_message_for("bob", group_message["id"])
+    assert {:ok, _conversation} = Store.conversation("bob", "group", "policy-room")
+    assert {:ok, _reaction} = Store.add_reaction("bob", group_message["id"], "👍")
+
+    for result <- [
+          Store.get_message_for("carol", group_message["id"]),
+          Store.conversation("carol", "group", "policy-room"),
+          Store.hide_conversation("carol", "group", "policy-room"),
+          Store.mark_read("carol", "group", "policy-room", group_message["id"]),
+          Store.mark_unread("carol", "group", "policy-room", group_message["id"]),
+          Store.mark_delivered("carol", "group", "policy-room", group_message["id"]),
+          Store.remove_reaction("carol", group_message["id"], "👍")
+        ] do
+      assert {:error, %{"code" => "ERR_FORBIDDEN"}} = result
+    end
+
+    assert {:ok, direct_parent} =
+             Store.send_message("alice", %{
+               "receiver" => "bob",
+               "receiverType" => "user",
+               "data" => %{"text" => "direct private"}
+             })
+
+    assert {:error, %{"code" => "ERR_FORBIDDEN"}} =
+             Store.mark_read("alice", "user", "carol", direct_parent["id"])
+
+    assert {:error, %{"code" => "ERR_FORBIDDEN"}} =
+             Store.mark_delivered("bob", "user", "carol", direct_parent["id"])
+
+    assert {:error, %{"code" => "ERR_FORBIDDEN"}} =
+             Store.send_message("bob", %{
+               "receiver" => "carol",
+               "receiverType" => "user",
+               "parentId" => direct_parent["id"],
+               "data" => %{"text" => "wrong conversation reply"}
              })
   end
 

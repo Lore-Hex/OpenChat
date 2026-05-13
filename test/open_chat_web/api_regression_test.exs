@@ -311,6 +311,68 @@ defmodule OpenChatWeb.ApiRegressionTest do
     assert auth_conn(:get, "/v3.0/messages/#{parent["id"]}", %{}, "uid:bob").status == 200
   end
 
+  test "conversation APIs forbid group nonmembers and mismatched receipt targets" do
+    assert admin_conn(:post, "/v3/groups", %{
+             "guid" => "api-policy-room",
+             "type" => "public"
+           }).status == 201
+
+    assert admin_conn(:post, "/v3/groups/api-policy-room/members", %{
+             "participants" => ["alice", "bob"]
+           }).status == 200
+
+    group_message =
+      auth_conn(
+        :post,
+        "/v3.0/messages",
+        %{
+          "receiver" => "api-policy-room",
+          "receiverType" => "group",
+          "data" => %{"text" => "group-private"}
+        },
+        "uid:alice"
+      )
+      |> json()
+      |> get_in(["data"])
+
+    for {method, path, body} <- [
+          {:get, "/v3.0/groups/api-policy-room/conversation", %{}},
+          {:delete, "/v3.0/groups/api-policy-room/conversation", %{}},
+          {:post, "/v3.0/groups/api-policy-room/conversation/read",
+           %{"messageId" => group_message["id"]}},
+          {:delete, "/v3.0/groups/api-policy-room/conversation/read",
+           %{"messageId" => group_message["id"]}},
+          {:post, "/v3.0/groups/api-policy-room/conversation/delivered",
+           %{"messageId" => group_message["id"]}}
+        ] do
+      conn = auth_conn(method, path, body, "uid:carol")
+      assert conn.status == 403
+      assert json(conn)["error"]["code"] == "ERR_FORBIDDEN"
+    end
+
+    assert auth_conn(:get, "/v3.0/groups/api-policy-room/conversation", %{}, "uid:bob").status ==
+             200
+
+    direct_message =
+      auth_conn(:post, "/v3.0/messages", %{
+        "receiver" => "bob",
+        "receiverType" => "user",
+        "data" => %{"text" => "direct-private"}
+      })
+      |> json()
+      |> get_in(["data"])
+
+    for {method, path} <- [
+          {:post, "/v3.0/users/carol/conversation/read"},
+          {:delete, "/v3.0/users/carol/conversation/read"},
+          {:post, "/v3.0/users/carol/conversation/delivered"}
+        ] do
+      conn = auth_conn(method, path, %{"messageId" => direct_message["id"]}, "uid:alice")
+      assert conn.status == 403
+      assert json(conn)["error"]["code"] == "ERR_FORBIDDEN"
+    end
+  end
+
   test "native and extension reaction routes support list, filter, add, and remove" do
     message =
       auth_conn(:post, "/v3.0/messages", %{
