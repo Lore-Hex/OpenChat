@@ -387,6 +387,90 @@ defmodule OpenChat.StoreRegressionTest do
     )
   end
 
+  test "banned users cannot read a public group even when public reads are enabled" do
+    with_open_chat_env(%{public_group_reads_enabled: true}, fn ->
+      guid = "banned-public-room"
+
+      assert {:ok, _group} = Store.upsert_group(%{"guid" => guid, "type" => "public"})
+      assert {:ok, _members} = Store.add_group_members(guid, ["alice"])
+
+      assert {:ok, _message} =
+               Store.send_message("alice", %{
+                 "receiver" => guid,
+                 "receiverType" => "group",
+                 "data" => %{"text" => "public broadcast"}
+               })
+
+      # Non-member can read because public reads are enabled.
+      assert {:ok, [_]} = Store.messages_for_group("banned-stranger", guid)
+
+      # Once banned, the same user is denied the public-read fallback.
+      assert {:ok, _} = Store.ban_group_member(guid, "banned-stranger")
+
+      assert {:error, %{"code" => "ERR_NOT_A_MEMBER"}} =
+               Store.messages_for_group("banned-stranger", guid)
+    end)
+  end
+
+  test "public_group_reads_enabled=false denies non-member message reads" do
+    with_open_chat_env(%{public_group_reads_enabled: false}, fn ->
+      guid = "private-public-room"
+
+      assert {:ok, _group} = Store.upsert_group(%{"guid" => guid, "type" => "public"})
+      assert {:ok, _members} = Store.add_group_members(guid, ["alice"])
+
+      assert {:ok, _message} =
+               Store.send_message("alice", %{
+                 "receiver" => guid,
+                 "receiverType" => "group",
+                 "data" => %{"text" => "members only"}
+               })
+
+      # Members still see messages.
+      assert {:ok, [_]} = Store.messages_for_group("alice", guid)
+
+      # Non-members are blocked when the public-read toggle is off.
+      assert {:error, %{"code" => "ERR_NOT_A_MEMBER"}} =
+               Store.messages_for_group("private-public-stranger", guid)
+    end)
+  end
+
+  test "deleting messages keeps materialised unread counts accurate" do
+    assert {:ok, read_msg} =
+             Store.send_message("alice", %{
+               "receiver" => "bob",
+               "receiverType" => "user",
+               "data" => %{"text" => "first"}
+             })
+
+    assert {:ok, unread_msg} =
+             Store.send_message("alice", %{
+               "receiver" => "bob",
+               "receiverType" => "user",
+               "data" => %{"text" => "second"}
+             })
+
+    # Bob reads the first message but not the second.
+    assert {:ok, _} = Store.mark_read("bob", "user", "alice", read_msg["id"])
+
+    assert {:ok, [%{"entityId" => "alice", "count" => 1}]} =
+             Store.unread_counts("bob", %{"receiverType" => "user"})
+
+    # Deleting the already-read message keeps the count at 1 plus the new
+    # delete-action message (which the recipient also has not seen).
+    assert {:ok, %{"category" => "action"}} = Store.delete_message("alice", read_msg["id"])
+
+    assert {:ok, [%{"entityId" => "alice", "count" => 2}]} =
+             Store.unread_counts("bob", %{"receiverType" => "user"})
+
+    # Deleting the still-unread message decrements the original unread; only
+    # the two action messages remain on Bob's unread ledger.
+    assert {:ok, %{"category" => "action"}} = Store.delete_message("alice", unread_msg["id"])
+
+    assert {:ok, [%{"entityId" => "alice", "count" => 2}]} =
+             Store.unread_counts("bob", %{"receiverType" => "user"})
+  end
+
   test "message validation, deterministic pagination, cursor filters, and hidden deletes" do
     assert {:error, %{"code" => "MISSING_PARAMETERS"}} =
              Store.send_message("alice", %{"receiverType" => "user"})
