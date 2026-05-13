@@ -15,6 +15,9 @@ PRODUCTION_ACCOUNT="829838608284"
 STAGING_DOMAIN="openchat.staging.tt.fm"
 PRODUCTION_DOMAIN="openchat.prod.tt.fm"
 
+STAGING_CORS_ALLOWED_ORIGINS="${OPENCHAT_STAGING_CORS_ALLOWED_ORIGINS:-https://staging.hang.fm,https://staging.tt.live,https://staging.hangout.fm,http://localhost:3000,http://localhost:4173,http://localhost:5173}"
+PRODUCTION_CORS_ALLOWED_ORIGINS="${OPENCHAT_PRODUCTION_CORS_ALLOWED_ORIGINS:-https://hang.fm,https://www.hang.fm,https://hangout.fm,https://www.hangout.fm,https://tt.live,https://www.tt.live}"
+
 STAGING_HOSTED_ZONE_ID="Z012303725HTFF0I5JI42"
 PRODUCTION_HOSTED_ZONE_ID="Z10095773LLWNGK1FKJ1Q"
 
@@ -133,6 +136,7 @@ deploy_env() {
   local subnet_1="$7"
   local subnet_2="$8"
   local admin_api_key="$9"
+  local cors_allowed_origins="${10}"
   local image_uri="$account.dkr.ecr.$REGION.amazonaws.com/openchat:$TAG"
 
   aws cloudformation deploy \
@@ -149,7 +153,8 @@ deploy_env() {
       PublicSubnet1="$subnet_1" \
       PublicSubnet2="$subnet_2" \
       ImageUri="$image_uri" \
-      AdminApiKey="$admin_api_key"
+      AdminApiKey="$admin_api_key" \
+      CorsAllowedOrigins="$cors_allowed_origins"
 }
 
 verify_env() {
@@ -191,11 +196,11 @@ main() {
 
   echo "Deploying staging"
   deploy_env staging "$STAGING_PROFILE" "$STAGING_ACCOUNT" "$STAGING_DOMAIN" "$STAGING_HOSTED_ZONE_ID" \
-    "$STAGING_VPC_ID" "$STAGING_SUBNET_1" "$STAGING_SUBNET_2" "$staging_key"
+    "$STAGING_VPC_ID" "$STAGING_SUBNET_1" "$STAGING_SUBNET_2" "$staging_key" "$STAGING_CORS_ALLOWED_ORIGINS"
 
   echo "Deploying production"
   deploy_env production "$PRODUCTION_PROFILE" "$PRODUCTION_ACCOUNT" "$PRODUCTION_DOMAIN" "$PRODUCTION_HOSTED_ZONE_ID" \
-    "$PRODUCTION_VPC_ID" "$PRODUCTION_SUBNET_1" "$PRODUCTION_SUBNET_2" "$production_key"
+    "$PRODUCTION_VPC_ID" "$PRODUCTION_SUBNET_1" "$PRODUCTION_SUBNET_2" "$production_key" "$PRODUCTION_CORS_ALLOWED_ORIGINS"
 
   echo "Verifying staging"
   verify_env "$STAGING_PROFILE" openchat-staging openchat-staging "$STAGING_DOMAIN" "$STAGING_ACCOUNT"
